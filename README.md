@@ -21,3 +21,4 @@ Open **https://lbecker17.github.io/note-by-note/** in Safari on your iPhone, the
 - Works offline once it has loaded.
 
 Plain HTML, CSS and JavaScript. No build step.
+Tests for the tune engine (`js/tune.js`) run with `node --test tests/` (Node 22 or later, nothing to install).
