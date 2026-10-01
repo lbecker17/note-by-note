@@ -160,6 +160,21 @@ function pickLyrics(midi, fileName) {
   return best ? { ...best, kar, title } : { kar, title, events: [], track: -1, type: 0 };
 }
 
+// "sun-shine" -> ["sun-", "shine"]: split after a hyphen with a letter on each side.
+// Written as a loop because Safari before 16.4 can't parse regex lookbehind.
+function splitHyphens(w) {
+  const out = [];
+  let start = 0;
+  for (let i = 1; i < w.length - 1; i++) {
+    if (w[i] === '-' && !/[-\s]/.test(w[i - 1]) && !/[-\s]/.test(w[i + 1])) {
+      out.push(w.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  out.push(w.slice(start));
+  return out;
+}
+
 const cleanSyl = (t) => t.replace(UNSAFE_CHARS_G, '').trim().replace(/\s+/g, '‿');
 
 // Karaoke text events -> syllables { beat, text, joinNext, line, para, follow }.
@@ -211,7 +226,7 @@ export function karaokeSyllables(events, max = MAX_SYLLABLES) {
       pendWord = pendWord || lead || trail || line;
       continue;
     }
-    const words = lineMode ? t.split(/\s+/).flatMap((w) => w.split(/(?<=[^-\s])-(?=[^-\s])/).map((s, i, a) => (i < a.length - 1 ? s + '-' : s))) : [t];
+    const words = lineMode ? t.split(/\s+/).flatMap((w) => splitHyphens(w)) : [t];
     words.slice(0, max - out.length).forEach((w, i) => {
       let hy = false;
       if (w.length > 1 && w.endsWith('-')) {
