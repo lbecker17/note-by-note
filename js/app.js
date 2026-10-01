@@ -267,6 +267,7 @@ function closeSheet(silent = false) {
 }
 
 function micSheet(then) {
+  const owner = current; // the screen that asked
   const blocked = audio.micState === 'denied';
   const failed = audio.micState === 'error' || audio.micState === 'unsupported';
   const html = blocked
@@ -294,10 +295,12 @@ function micSheet(then) {
         btn.textContent = 'Waiting for permission…';
         try {
           await audio.startMic();
+          // Gone back while the permission prompt was up: the mic is on, but nothing starts.
+          if (current !== owner) return;
           closeSheet(true);
           if (then) then();
         } catch (e) {
-          micSheet(then);
+          if (current === owner) micSheet(then);
         }
       },
     },
@@ -713,6 +716,8 @@ document.addEventListener('keydown', (e) => {
 });
 
 async function requestWake() {
+  // Still held? The browser lets go of it whenever the page is hidden, so then ask again.
+  if (wakeLock && wakeLock.released === false) return;
   try {
     if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen');
   } catch (e) {
@@ -2308,10 +2313,14 @@ function rangeCtrl() {
 
 const TAKE_MAX = 180; // seconds of singing one take keeps
 const QUIET = 0.3; // seconds after the app's own playback before the mic counts as singing again
+const SETTLE = 0.8; // seconds after Start, Done or Sing again before the buttons in that spot work
+const GAP_MAX = 1.5; // seconds: a longer silence inside a take (stopping to think) ...
+const GAP_KEEP = 1; // ... is heard back, and drawn, this long
 const FREE_SUB = 'Make up a song. Hear it back.';
-const FREE_CUE = 'Sing any tune you like, then tap Done to see and hear it.';
+const FREE_CUE = 'Tap Start, then sing any tune you like.';
 const FREE_RUN = 'Sing your tune. Tap Done at the end.';
 const FREE_FULL = 'That’s a long song! Tap Done to hear it.';
+const FREE_KEEP = 'Tap Start so I can keep it';
 // Song starters: a picture and a few words for children who freeze at "sing anything". They
 // only change the cue.
 const STARTERS = [
@@ -2323,11 +2332,11 @@ const STARTERS = [
 ];
 // describe()'s shapes in a child's words, each with a picture.
 const SHAPE_WORDS = {
-  'up-down': ['siren', 'Your tune went up and down like a roller-coaster.'],
-  'down-up': ['wave', 'Your tune went down and back up, like a roller-coaster.'],
+  'up-down': ['siren', 'Your tune went up and back down, like a hill.'],
+  'down-up': ['dip', 'Your tune dipped down and came back up.'],
   wave: ['wave', 'You sang a wavy tune, up and down and up again.'],
   up: ['scale', 'Your tune went climbing up.'],
-  down: ['oodown', 'Your tune went sliding down.'],
+  down: ['oodown', 'Your tune stepped down.'],
   flat: ['hold', 'Your tune stayed nice and steady.'],
 };
 const SONG_STYLES = [['pop', 'Pop with drums'], ['gentle', 'Gentle']];
@@ -2338,21 +2347,56 @@ let songSpeed = 'medium';
 
 const clock = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
+// A long silence inside a take (stopping to think, or a look around) is heard back and drawn
+// as about a second, so the song doesn't run on for bars of drums with no tune. The middle of
+// the silence goes, and everything after it moves earlier.
+function closeGaps(frames) {
+  const out = [];
+  let shift = 0;
+  let last = null; // the last voiced frame's time, as sung
+  let quiet = []; // the silent frames since then
+  const keep = (f) => out.push(shift ? { ...f, t: f.t - shift } : f);
+  for (const f of frames) {
+    if (f.m == null) {
+      quiet.push(f);
+      continue;
+    }
+    if (last != null && f.t - last > GAP_MAX) {
+      const a = last + GAP_KEEP / 2;
+      const b = f.t - GAP_KEEP / 2;
+      for (const x of quiet) if (x.t <= a) keep(x);
+      shift += b - a;
+      for (const x of quiet) if (x.t >= b) keep(x);
+    } else quiet.forEach(keep);
+    quiet = [];
+    keep(f);
+    last = f.t;
+  }
+  quiet.forEach(keep);
+  return out;
+}
+
 // The take, heard: its notes, key, beats and chords, and the plain facts for the feedback card.
-function hearTake(frames) {
+// The blocks show the notes that play back: a motif sung twice plays (and shows) the same notes
+// both times. A take that is mostly slides says nothing about a key.
+function hearTake(take) {
+  const frames = closeGaps(take);
   const found = findNotes(frames);
-  const key = findKey(found.notes);
   const q = quantize(found.notes, { bpm: TEMPOS.medium });
-  return { frames, found, notes: found.notes, key, q, chords: harmonize(q, key), facts: describe(found.notes, key) };
+  const notes = q.notes.length === found.notes.length ? found.notes.map((n, i) => ({ ...n, p: q.notes[i].p })) : found.notes;
+  const key = findKey(notes);
+  const glides = found.glideShare >= 0.5 && found.sungSeconds >= 1;
+  return { frames, found, notes, key, sure: !!key.enough && !glides, glides, q, chords: harmonize(q, key), facts: describe(notes, key) };
 }
 
 const keyFlats = (key) => !!key.enough && prefersFlats(key.tonic, key.mode === 'minor');
 const keyName = (key) => `${letterName(key.tonic, { flats: keyFlats(key), octave: false })} ${key.mode}`;
 
-// The note grid in words: its text alternative, and the caption under it.
+// The note grid in words: its text alternative, and the caption under it. Notes are named the
+// way the blocks name them.
 function songSummary(res) {
-  const { notes, facts } = res;
-  const nm = (m) => letterName(m, { flats: keyFlats(res.key) });
+  const { notes, facts, key, sure } = res;
+  const nm = (m) => label(m, { tonic: sure ? key.tonic : null, flats: sure && keyFlats(key), names: sure ? S().names : 'letters', octave: false });
   if (!notes.length) return 'Your pitch line, with no held notes';
   if (notes.length === 1) return `1 note, ${nm(notes[0].p)}`;
   if (facts.low === facts.high) return `${notes.length} notes, all ${nm(facts.low)}`;
@@ -2361,14 +2405,18 @@ function songSummary(res) {
 
 // The feedback card: plain facts and kind words, never a grade or a percentage. The key is
 // named only when findKey is sure; a take that is mostly slides gets praise for sliding.
+// Plenty of voice with no notes held at all is most likely talking, not too quiet or too short.
 function songWords(res) {
-  const { notes, found, facts, key } = res;
+  const { notes, found, facts, key, glides, sure } = res;
   const n = notes.length;
-  const glides = found.glideShare >= 0.5 && found.sungSeconds >= 1;
-  if (!n && !glides) return { stats: [], lines: [['mic', 'I couldn’t hear a tune. Try singing a bit louder, or longer.']] };
+  if (!n && !glides) {
+    const talk = found.sungSeconds >= 3;
+    return { stats: [], lines: [talk ? ['hold', 'That sounded like talking. Try holding some long notes.'] : ['mic', 'I couldn’t hear a tune. Try singing a bit louder, or longer.']] };
+  }
   const secs = Math.max(1, Math.round(n ? facts.seconds : found.sungSeconds));
   const stats = [[String(secs), secs === 1 ? 'second of singing' : 'seconds of singing']];
-  if (n) stats.push([String(facts.distinct), facts.distinct === 1 ? 'note' : 'different notes']);
+  if (n > 1 && facts.distinct === 1) stats.push([String(n), 'notes, all the same']);
+  else if (n) stats.push([String(facts.distinct), facts.distinct === 1 ? 'note' : 'different notes']);
   const lines = [];
   if (glides) lines.push(['slide', 'Great sliding! Try some notes you can hold too.']);
   else if (n < 3) lines.push(['hold', 'A short tune. Try a few more notes next time.']);
@@ -2376,7 +2424,7 @@ function songWords(res) {
     lines.push(SHAPE_WORDS[facts.shape] || SHAPE_WORDS.flat);
     // One exclamation mark per screen: sliding praise already has it.
     if (facts.endsHome && !glides) lines.push(['home', 'Your tune came home!']);
-    if (key.enough) lines.push(['songs', `Your song is in ${keyName(key)}.`]);
+    if (sure) lines.push(['songs', `Your song is in ${keyName(key)}.`]);
   }
   return { stats, lines };
 }
@@ -2397,6 +2445,9 @@ function freeCtrl() {
   let draws = 0; // lane draws, and what the last one showed (for tests)
   let drawn = { frames: 0, live: false };
   let ro = null;
+  // Done and Sing again sit where Done and Start were a moment before, so a double tap (or a
+  // second tap a little late) would throw the song away. Until then, taps there do nothing.
+  let settled = 0;
   document.body.dataset.screen = 'player';
   root.innerHTML = `<section class="player free-screen" data-state="ready">
     <header class="p-head">
@@ -2438,10 +2489,13 @@ function freeCtrl() {
   const setState = (s) => {
     state = s;
     el.player.dataset.state = s;
+    settled = performance.now() + SETTLE * 1000;
   };
+  const settling = () => performance.now() < settled;
 
-  // A new take. Anything still playing stops first, and the mic waits QUIET seconds after it.
-  function begin() {
+  // Throw the last take and its song away. Anything still playing stops first, and the mic
+  // waits QUIET seconds after it.
+  function clear() {
     stopPlay();
     if (ro) ro.disconnect();
     ro = null;
@@ -2449,13 +2503,28 @@ function freeCtrl() {
     lit = -1;
     take = [];
     full = false;
+    el.view.innerHTML = '';
+  }
+
+  // Sing again: back to Start, with the song-starter ideas, so the next take can have a new one.
+  function ready() {
+    clear();
+    setState('ready');
+    setBtn(el.start, 'start');
+    setText(el.sub, FREE_SUB);
+    setCue(cueText(), '');
+    el.player.scrollTop = 0;
+  }
+
+  // A new take.
+  function begin() {
+    clear();
     T0 = audio.now();
     lastSecs = -1;
-    el.view.innerHTML = '';
     setState('running');
     setBtn(el.start, 'done');
     setCue(cueText(), 'sing');
-    if (!wakeLock) requestWake();
+    requestWake();
   }
 
   function finish() {
@@ -2468,7 +2537,8 @@ function freeCtrl() {
   function renderSong() {
     const words = songWords(res);
     const has = res.notes.length > 0;
-    const line = res.frames.some((f) => f.m != null);
+    // A grid only for notes, or the slides that the card praises.
+    const shown = has || res.glides;
     const summary = songSummary(res);
     const seg = (name, value, opts) =>
       `<div class="seg" role="radiogroup" aria-labelledby="f-${name}-h">${opts
@@ -2477,22 +2547,23 @@ function freeCtrl() {
     const stats = words.stats.length
       ? `<div class="stats ${words.stats.length === 2 ? 'two' : 'one'}">${words.stats.map(([b, s]) => `<div><b>${esc(b)}</b><span>${s}</span></div>`).join('')}</div>`
       : '';
+    // Play my tune sits right under the grid, so it's in sight on the smallest phone too.
     el.view.innerHTML = `
-      <h2 class="song-title" tabindex="-1">${has || line ? 'Your song' : 'Let’s sing again'}</h2>
+      <h2 class="song-title" tabindex="-1">${shown ? 'Your song' : 'Let’s sing again'}</h2>
       ${
-        has || line
+        shown
           ? `<div class="song-grid" id="songGrid" role="group" aria-label="Note blocks"><canvas role="img" aria-label="${esc(summary)}"></canvas></div>
-             <p class="song-cap" aria-hidden="true">${esc(summary)}${res.key.enough && has ? ` · ${esc(keyName(res.key))}` : ''}</p>`
+             <p class="song-cap" aria-hidden="true">${esc(summary)}</p>`
           : ''
       }
+      ${has ? '<button class="btn primary big wide" data-act="f-tune" id="tuneBtn"></button>' : ''}
       <div class="card song-card">
         ${stats}
         <ul class="song-facts">${words.lines.map(([ic, t]) => `<li><i>${ICON[ic]}</i><span>${esc(t)}</span></li>`).join('')}</ul>
       </div>
       ${
         has
-          ? `<button class="btn primary big wide" data-act="f-tune" id="tuneBtn"></button>
-             <div class="card song-maker">
+          ? `<div class="card song-maker">
                <h3>Make it a song</h3>
                <p class="seg-h" id="f-style-h">Style</p>
                ${seg('style', songStyle, SONG_STYLES)}
@@ -2522,7 +2593,7 @@ function freeCtrl() {
   function drawGrid() {
     const box = state === 'song' && el.view.querySelector('#songGrid');
     if (!box || !res) return;
-    xs = drawSong(box.querySelector('canvas'), { notes: res.notes, frames: res.frames, key: res.key, names: S().names, lit, width: box.clientWidth });
+    xs = drawSong(box.querySelector('canvas'), { notes: res.notes, frames: res.frames, key: { ...res.key, enough: res.sure }, names: S().names, lit, width: box.clientWidth });
     // A grid wider than the screen scrolls, so it needs to be reachable from the keyboard.
     if (box.scrollWidth > box.clientWidth + 1) box.setAttribute('tabindex', '0');
     else box.removeAttribute('tabindex');
@@ -2542,10 +2613,11 @@ function freeCtrl() {
 
   const PLAY_LOOK = {
     tune: ['btn primary big wide', 'btn quiet big wide', `${ICON.play}Play my tune`],
-    song: ['btn secondary wide', 'btn quiet wide', `${ICON.songs}Make it a song`],
+    song: ['btn secondary wide', 'btn quiet wide', `${ICON.songs}Play my song`],
   };
-  // While a button's playback runs, it becomes its Stop button.
+  // While a button's playback runs, it becomes its Stop button, and the grid stays in sight.
   function playButtons() {
+    el.view.classList.toggle('playing', !!play);
     for (const kind of ['tune', 'song']) {
       const b = el.view.querySelector(kind === 'tune' ? '#tuneBtn' : '#songBtn');
       if (!b) continue;
@@ -2612,6 +2684,7 @@ function freeCtrl() {
   }
 
   setState('ready');
+  settled = 0;
   setBtn(el.start, 'start');
   setText(el.sub, FREE_SUB);
   setCue(cueText(), '');
@@ -2620,6 +2693,7 @@ function freeCtrl() {
     name: 'free',
     actions: {
       'f-start': () => {
+        if (settling()) return;
         if (state === 'running') return finish();
         audio.unlock();
         if (!audio.micOn) return micSheet(begin);
@@ -2635,23 +2709,30 @@ function freeCtrl() {
       'f-style': (btn) => pick('style', btn.dataset.v),
       'f-speed': (btn) => pick('speed', btn.dataset.v),
       'f-again': () => {
-        audio.unlock();
-        if (!audio.micOn) {
-          stopPlay();
-          return micSheet(begin);
-        }
-        begin();
+        if (settling()) return;
+        ready();
         el.start.focus({ preventScroll: true });
       },
-      'f-done': () => goBack(),
+      'f-done': () => {
+        if (!settling()) goBack();
+      },
     },
     frame() {
       const now = audio.now();
       if (state === 'song') {
         // Nothing from the mic here: just follow the playback with the highlight.
         if (!play) return;
-        if (now >= play.h.end) return endPlay();
-        const t = now - play.h.at;
+        // Sound that won't start again (an iPhone in a phone call) never reaches its end.
+        if (audio.ctx.state !== 'running') {
+          if (!play.down) play.down = performance.now();
+          else if (performance.now() - play.down > 1000) stopPlay();
+          return;
+        }
+        play.down = 0;
+        // What is heard now left the app a moment ago (Bluetooth headphones add a lot).
+        const lag = Math.min(0.5, Math.max(0, audio.ctx.outputLatency || audio.ctx.baseLatency || 0));
+        if (now - lag >= play.h.end) return endPlay();
+        const t = now - lag - play.h.at;
         const mel = play.mel;
         while (play.k + 1 < mel.length && mel[play.k + 1].t <= t) play.k++;
         const k = play.k;
@@ -2681,10 +2762,11 @@ function freeCtrl() {
         setTune('tune', 'Tap Done to hear it');
       } else if (heard && heard.m != null) {
         setText(el.note, letterName(heard.m));
-        setTune('tune', nearestWords(heard.m));
+        // Before Start, singing shows but isn't kept: say so.
+        setTune('tune', state === 'ready' ? FREE_KEEP : nearestWords(heard.m));
       } else {
         setText(el.note, audio.micOn ? '–' : '');
-        setTune('tune', audio.micOn ? 'Listening…' : 'Tap Start to turn on the mic');
+        setTune('tune', !audio.micOn ? 'Tap Start to turn on the mic' : state === 'ready' ? 'Tap Start to begin' : 'Listening…');
       }
       const lv = full ? 0 : levelOf(heard);
       if (Math.abs(lv - lastLevel) > 0.02) {
@@ -2692,9 +2774,11 @@ function freeCtrl() {
         el.level.style.width = `${Math.round(lv * 100)}%`;
       }
     },
-    // The app went to the background, or the sound dropped: stop playback. A take keeps what it has.
+    // The app went to the background, or the sound dropped: stop playback. A take ends there with
+    // what it has, so time away never becomes part of the song; back in the app, it's ready to hear.
     pause() {
       stopPlay();
+      if (state === 'running') finish();
     },
     probe() {
       const kinds = {};

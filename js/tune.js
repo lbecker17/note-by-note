@@ -1708,30 +1708,42 @@ function recurs(s, bar) {
 }
 
 // A motif sung again (the same rhythm from the same first note, every other note within a
-// semitone) is played the same both times: where the two differ, each gets the semitone
-// nearest the average of what was sung in all its repeats, so a small child's wobble doesn't
-// turn one tune into two. Needs the measured pitches (m); notes without them are kept.
+// semitone) is played the same each time: where its repeats differ, they all get the semitone
+// nearest the average of what was sung in all of them, so a small child's wobble doesn't turn
+// one tune into two. Each note's repeats are gathered into one group and averaged once (adding
+// up pairs counted overlapping matches twice, and two notes could swap semitones). Needs the
+// measured pitches (m); notes without them are kept.
 function evenRepeats(list, s, ps) {
   const N = list.length;
   const x = list.map((n) => (Number.isFinite(n.m) ? n.m - (Number.isFinite(n.tune) ? n.tune : 0) : NaN));
-  const sum = x.map((v) => v);
-  const count = x.map(() => 1);
+  const root = list.map((n, i) => i);
+  const find = (i) => {
+    while (root[i] !== i) i = root[i] = root[root[i]];
+    return i;
+  };
   for (let i = 0; i + 2 < N; i++) {
     for (let j = i + 3; j + 2 < N && j < i + 64; j++) {
       if (ps[j] !== ps[i]) continue;
       let L = 1;
       while (L < 8 && i + L < j && j + L < N && s[i + L] - s[i + L - 1] === s[j + L] - s[j + L - 1] && Math.abs(ps[i + L] - ps[j + L]) <= 1) L++;
       if (L < 3) continue;
-      for (let t = 1; t < L; t++) {
-        if (ps[i + t] === ps[j + t] || !Number.isFinite(x[i + t]) || !Number.isFinite(x[j + t])) continue;
-        sum[i + t] += x[j + t];
-        count[i + t]++;
-        sum[j + t] += x[i + t];
-        count[j + t]++;
-      }
+      for (let t = 1; t < L; t++) if (Number.isFinite(x[i + t]) && Number.isFinite(x[j + t])) root[find(i + t)] = find(j + t);
     }
   }
-  return ps.map((p, i) => (count[i] > 1 ? Math.min(p + 1, Math.max(p - 1, Math.round(sum[i] / count[i]))) : p));
+  const groups = new Map();
+  ps.forEach((p, i) => {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(i);
+  });
+  const out = ps.slice();
+  for (const g of groups.values()) {
+    // Repeats that already agree keep the notes they were given.
+    if (g.every((i) => ps[i] === ps[g[0]])) continue;
+    const avg = g.reduce((sum, i) => sum + x[i], 0) / g.length;
+    for (const i of g) out[i] = Math.min(ps[i] + 1, Math.max(ps[i] - 1, Math.round(avg)));
+  }
+  return out;
 }
 
 // The length of an eighth note (seconds) that the note starts fit best: the coarsest pulse

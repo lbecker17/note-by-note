@@ -549,10 +549,15 @@ export function drawSong(canvas, { notes, frames = [], key = null, names = 'lett
   canvas.style.width = `${Math.round(W)}px`;
   const H = Math.max(60, canvas.getBoundingClientRect().height);
   const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.round(W * dpr);
-  canvas.height = Math.round(H * dpr);
+  // Sizing a canvas rebuilds its memory (megabytes for a long take), so only when the size
+  // changes: lighting the next block during playback just draws again.
+  const cw = Math.round(W * dpr);
+  const ch = Math.round(H * dpr);
+  if (canvas.width !== cw) canvas.width = cw;
+  if (canvas.height !== ch) canvas.height = ch;
   const g = canvas.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
   g.fillStyle = C['lane-bg'];
   g.fillRect(0, 0, W, H);
   const padX = 8, top = 10, bot = H - 10;

@@ -818,6 +818,20 @@ test('quantize: a dotted rhythm becomes two eighths rather than a squash', () =>
   assert.deepEqual(q.notes.map((n) => n.beat), [0, 0.5, 1, 2]);
 });
 
+test('quantize: a motif sung again with one note a semitone off plays the same note both times', () => {
+  // E G A G E, then again with the A sung near B-flat; and C E G E C three times, the G once
+  // sung as F-sharp. Overlapping matches of a motif once counted a pair twice, and they swapped.
+  const motif = (at, [a, b], top) => [[at, 1, a], [at + 1, 1, b], [at + 2, 1, top], [at + 3, 1, b], [at + 4, 2, a]];
+  for (const [low, sung] of [[[64, 67], [68.98, 69.99]], [[64, 67], [69.33, 69.64]], [[60, 64], [66.98, 65.99, 67]]]) {
+    const rhythm = sung.flatMap((m, k) => motif(7 * k, low, Math.round(m)));
+    const notes = played(rhythm, 96, { loose: 0 });
+    sung.forEach((m, k) => (notes[5 * k + 2].m = m));
+    const tops = quantize(notes, { bpm: 96 }).notes.filter((n, i) => i % 5 === 2).map((n) => n.p);
+    const avg = Math.round(sung.reduce((a, b) => a + b, 0) / sung.length);
+    assert.deepEqual(tops, sung.map(() => avg), `sung ${sung}`);
+  }
+});
+
 // ---------- harmonize ----------
 
 const qOf = (src, bpb = 4) => ({

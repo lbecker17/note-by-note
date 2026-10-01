@@ -785,7 +785,7 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
 .starters-h { text-align: center; }
 .starters {
   display: flex; gap: 8px; overflow-x: auto; margin: -4px -16px 2px; padding: 6px 16px;
-  scroll-snap-type: x proximity; scrollbar-width: none; overscroll-behavior-x: contain;
+  scroll-snap-type: x proximity; scroll-padding-inline: 16px; scrollbar-width: none; overscroll-behavior-x: contain;
 }
 .starters::-webkit-scrollbar { display: none; }
 .starter {
@@ -809,6 +809,9 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
   border-radius: var(--r-lg); background: var(--lane-bg); border: 1px solid var(--line); box-shadow: var(--shadow);
 }
 .song-grid canvas { display: block; height: 168px; min-width: 100%; }
+/* While a tune plays, the grid (and its lit block) stays in sight when the view is scrolled down
+   to "Make it a song". */
+.song-view.playing .song-grid { position: sticky; top: var(--safe-top); z-index: 1; }
 .song-cap { margin-top: -6px; font-size: 14px; font-weight: 700; color: var(--muted); text-align: center; }
 .stats.one { grid-template-columns: 1fr; }
 .song-facts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
