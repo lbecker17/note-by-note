@@ -1,5 +1,5 @@
 // Network first, so updates show up straight away; the cache keeps the app working offline.
-const CACHE = 'note-by-note-v3';
+const CACHE = 'note-by-note-v4';
 const ASSETS = [
   './',
   'index.html',

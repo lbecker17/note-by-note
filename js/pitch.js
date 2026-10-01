@@ -79,12 +79,24 @@ export function createDetector(sampleRate, { minHz = 60, maxHz = 1250, threshold
   return { detect, need, sampleRate, W, tauMin, tauMax };
 }
 
+// A pitched sound that holds one pitch within STEADY_CENTS and one level within STEADY_LEVEL
+// (both against its running average) for STEADY_SECS is a machine: a fridge or fan hum, or a
+// tone from a speaker. Voices always wobble more than that, even on a straight-tone hold.
+// Measured with this detector on synthetic sound: a hum or a speaker tone stays inside that band,
+// so it turns into background about 3 s after it starts (one so quiet that room noise blurs its
+// pitch may not). A straight-tone voice with just 3 cents of jitter and 5 cents of slow drift
+// never stayed inside it for more than 1.5 s in 60 twelve-second holds.
+const STEADY_CENTS = 5;
+const STEADY_LEVEL = 0.12;
+const STEADY_SECS = 3;
+
 // Turns raw detections into a sung pitch (MIDI float) or null for silence.
 export class Tracker {
   constructor() {
     this.floor = 0.002;
     this.lastPitched = -Infinity;
     this.recent = [];
+    this.run = null; // the steady stretch under way: { m, rms, n, t } (running averages, start time)
   }
 
   reset() {
@@ -95,17 +107,37 @@ export class Tracker {
     return Math.min(0.03, Math.max(0.0035, this.floor * 3.5));
   }
 
+  // True while a pitched sound has been machine-steady for STEADY_SECS.
+  steady(r, time) {
+    const m = hzToMidi(r.hz);
+    const s = this.run;
+    if (!s || Math.abs(m - s.m) * 100 > STEADY_CENTS || Math.abs(r.rms / s.rms - 1) > STEADY_LEVEL) {
+      this.run = { m, rms: r.rms, n: 1, t: time };
+      return false;
+    }
+    s.n++;
+    s.m += (m - s.m) / s.n;
+    s.rms += (r.rms - s.rms) / s.n;
+    return time - s.t >= STEADY_SECS;
+  }
+
   push(r, time) {
     // The noise floor follows the room: it falls quickly in quiet moments and rises slowly,
     // but only after nothing has sounded like a pitch for a moment. Room noise has no clear
     // pitch, so the floor still rises with it. A held note, however quiet, never feeds the
     // floor, so the gate can't creep up and cut it off part way through.
+    // A machine-steady hum is the exception: the floor learns it at half its level, so the gate
+    // (3.5 times the floor) settles just above the hum and stays there when something else
+    // sounds over it for a moment. A voice louder than the hum still gets through.
     const pitched = r.hz >= 60 && r.hz <= 1250 && r.ap < 0.3;
-    if (pitched) this.lastPitched = time;
+    const hum = pitched && this.steady(r, time);
+    if (!pitched) this.run = null;
+    if (pitched && !hum) this.lastPitched = time;
     if (r.rms < this.floor) this.floor = this.floor * 0.7 + r.rms * 0.3;
+    else if (hum) this.floor = Math.max(this.floor, this.floor * 0.95 + r.rms * 0.5 * 0.05);
     else if (time - this.lastPitched > 0.3) this.floor = this.floor * 0.9985 + r.rms * 0.0015;
 
-    const voiced = pitched && r.rms > this.gate();
+    const voiced = pitched && !hum && r.rms > this.gate();
     this.recent = this.recent.filter((p) => time - p.t < 0.1);
     if (!voiced) return null;
 

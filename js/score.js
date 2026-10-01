@@ -167,8 +167,9 @@ export function wasHeard(sum) {
 
 // ---------- Did the daily warm-up count? ----------
 // It checks that the singer took part, not whether they were in tune:
-//   1. every sung step: at least half its notes and slides had a voiced frame near them, and
-//   2. the voice was heard for at least HEARD_MIN of the sung time (the same rule as practice days).
+//   1. every sung step: at least half its notes and slides had a voiced frame near them,
+//   2. the voice was heard for at least HEARD_MIN of the sung time (the same rule as practice days), and
+//   3. the pitch went up and down with the exercise (followed(), below).
 // Steps with nothing to sing (the move cards) are never checked.
 export const STEP_HEARD_MIN = 0.5;
 
@@ -177,7 +178,75 @@ function noteHeard(ev, frames) {
   return frames.some((f) => f.m != null && f.t >= a && f.t <= z);
 }
 
+// Being heard isn't enough: a fridge hum or a tone from a speaker is "heard" too. So the voice
+// must move with the exercise. Each sung step is compared on its own, so a singer an octave
+// away, or a whole step sung low, still counts. Across the steps:
+//   span:  the middle 80% of the sung pitch covers at least FOLLOW_SPAN semitones;
+//   r:     sung pitch and target pitch rise and fall together: their correlation in each step,
+//          averaged over the steps, is at least FOLLOW_R;
+//   exact: on long level notes the median miss is at least MACHINE_CENTS. A voice always
+//          wobbles; the app's own guide note played into the mic sits on the target.
+// The thresholds are loose on purpose. In simulated warm-ups (four control days, four ranges),
+// a 4-year-old who sings a third of each interval, misses by a semitone and drifts flat still
+// scored span 2.4+ and r 0.39+. A steady hum and a sung drone scored span under 1, and the guide
+// note played back sat within 0.2 cents of the target, where synthetic voices sat 4+ cents off.
+export const FOLLOW_SPAN = 1.2;
+export const FOLLOW_R = 0.2;
+export const MACHINE_CENTS = 1.5;
+
+function median(a) {
+  const s = a.slice().sort((x, y) => x - y);
+  const n = s.length;
+  return n % 2 ? s[(n - 1) >> 1] : (s[n / 2 - 1] + s[n / 2]) / 2;
+}
+
+// sung: [{ step, frames }] for the steps with notes to sing.
+export function followed(sung) {
+  const dev = [];
+  const rs = [];
+  const held = []; // misses on long level notes, in cents
+  for (const { step, frames } of sung) {
+    const pairs = []; // [target, sung] for each heard frame in a sung note
+    let fi = 0;
+    for (const ev of step.events) {
+      if (ev.role !== 'sing') continue;
+      while (fi < frames.length && frames[fi].t < ev.t) fi++;
+      for (let i = fi; i < frames.length && frames[i].t < ev.t + ev.d; i++) {
+        const f = frames[i];
+        if (f.m == null) continue;
+        const x = targetAt(ev, f.t);
+        pairs.push([x, f.m]);
+        if (ev.d >= 0.8 && ev.m2 == null) held.push(Math.abs(foldDiff(f.m, x).d) * 100);
+      }
+    }
+    if (pairs.length < 10) continue;
+    const ay = pairs.reduce((s, p) => s + p[1], 0) / pairs.length;
+    for (const [, y] of pairs) dev.push(y - ay);
+    // Octave slips (9 or more semitones off the step's line) don't count against the singer.
+    const off = median(pairs.map(([x, y]) => y - x));
+    const kept = pairs.filter(([x, y]) => Math.abs(y - x - off) < 9);
+    const mx = kept.reduce((s, p) => s + p[0], 0) / kept.length;
+    const my = kept.reduce((s, p) => s + p[1], 0) / kept.length;
+    let sxx = 0, syy = 0, sxy = 0;
+    for (const [x, y] of kept) {
+      sxx += (x - mx) ** 2;
+      syy += (y - my) ** 2;
+      sxy += (x - mx) * (y - my);
+    }
+    // Weighted by how far the step's target moves: a slide or a scale says more than two holds.
+    if (sxx > 0) rs.push({ r: syy > 0 ? sxy / Math.sqrt(sxx * syy) : 0, w: sxx / kept.length });
+  }
+  dev.sort((p, q) => p - q);
+  const at = (q) => dev[Math.round(q * (dev.length - 1))];
+  const span = dev.length ? at(0.9) - at(0.1) : 0;
+  const w = rs.reduce((s, k) => s + k.w, 0);
+  const r = w > 0 ? rs.reduce((s, k) => s + k.r * k.w, 0) / w : 0;
+  const exact = held.length ? median(held) : null;
+  return { span, r, exact, ok: span >= FOLLOW_SPAN && r >= FOLLOW_R && !(exact != null && exact < MACHINE_CENTS) };
+}
+
 // results: [{ step, notes, frames }] from the player.
+// heard: rules 1 and 2; follow: rule 3; ok: all three.
 export function warmupCheck(results) {
   const sung = results.filter((r) => r.step.kind !== 'move' && r.step.events.some((e) => e.role === 'sing'));
   const perStep = sung.map((r) => {
@@ -187,7 +256,9 @@ export function warmupCheck(results) {
   });
   const sum = summarize(sung);
   const missed = perStep.filter((p) => p.share < STEP_HEARD_MIN).map((p) => p.title);
-  return { ok: sung.length > 0 && missed.length === 0 && wasHeard(sum), coverage: heardShare(sum), perStep, missed };
+  const heard = sung.length > 0 && missed.length === 0 && wasHeard(sum);
+  const follow = followed(sung);
+  return { ok: heard && follow.ok, heard, follow, coverage: heardShare(sum), perStep, missed };
 }
 
 export function verdict(score) {

@@ -23,6 +23,7 @@ const PRESET_INFO = [
 const VOICE_CHANGING = 'Voice changing (cracks, squeaks, new low notes)? Do the range test instead. It finds where your voice is right now.';
 const VERSION = '1.1';
 const NOT_HEARD = 'We couldn’t hear you';
+const NOT_FOLLOWED = 'We couldn’t hear the tune';
 const TABS = ['today', 'lessons', 'songs'];
 
 let current = null;
@@ -58,9 +59,10 @@ const sset = (k, v) => {
 };
 
 // ---------- Daily warm-up and the song lock ----------
-// Songs open once today's warm-up has counted (the app heard every sung part), until local
-// midnight. Lessons, the warm-up and the range test never lock. A grown-up can switch the lock
-// off in Settings. Every lock and "done today" visual, and the gate in openItem, read these.
+// Songs open once today's warm-up has counted (the app heard every sung part, moving with the
+// notes), until local midnight. Lessons, the warm-up and the range test never lock. A grown-up
+// can switch the lock off in Settings. Every lock and "done today" visual, and the gate in
+// openItem, read these.
 const lockEnabled = () => S().warmupLock !== false;
 const warmedUpToday = () => warmedToday();
 const songsUnlocked = () => !lockEnabled() || warmedUpToday();
@@ -254,7 +256,7 @@ function settingsSheet(gate = null) {
   const html = `
     <h2>Settings</h2>
     <div class="field">
-      <div><b>Headphones</b><p>On: you also hear the guide note while you sing. Wired headphones work best. Bluetooth drops to call quality while the mic is on.</p></div>
+      <div><b>Headphones</b><p>On: you also hear the guide note while you sing, except in the warm-up, where you always listen first, then sing. Wired headphones work best. Bluetooth drops to call quality while the mic is on.</p></div>
       <button class="switch ${s.headphones ? 'on' : ''}" role="switch" aria-checked="${s.headphones}" aria-label="Headphones" data-act="set" data-k="headphones" data-v="${!s.headphones}"><i></i></button>
     </div>
     <div class="field col"><b>Note names</b>${seg('names', [['letters', 'C D E'], ['solfa', 'Do Re Mi']])}</div>
@@ -286,7 +288,7 @@ function settingsSheet(gate = null) {
           </div>`
         : ''
     }
-    <p class="lock-note">This is a gentle nudge, not a lock. A determined teenager can get around it, for example by clearing Safari’s website data.</p>
+    <p class="lock-note">This is a gentle nudge, not a real lock. The app checks that someone sang along with the warm-up, but it can’t be certain.</p>
     <button class="field link-row" data-act="care"><span>${ICON.heart}<b>Look after your voice</b></span>${ICON.chev}</button>
     <p class="about">Note by Note ${VERSION} · Nothing you sing is recorded or leaves this device.</p>
     <button class="btn primary wide" data-act="sheet-close">Done</button>`;
@@ -1093,6 +1095,9 @@ function playerCtrl({ kind, id }) {
   let cardIdx = 0;
   let cardEnd = 0;
   let lastSecs = -1;
+  // The warm-up is always hear-then-sing, whatever the headphones setting: nothing plays while
+  // the child sings, so sound from the phone's speaker can't count as their voice and open songs.
+  const guideWhileSinging = () => kind !== 'warmup' && S().headphones;
   // The song a locked tap asked for, offered on the warm-up's done sheet.
   const forSong = kind === 'warmup' ? pendingSong : null;
   if (kind === 'warmup') pendingSong = null;
@@ -1103,7 +1108,7 @@ function playerCtrl({ kind, id }) {
     <header class="p-head">
       <button class="icon-btn" data-act="close" aria-label="Close">${ICON.close}</button>
       <div class="p-title"><h2>${esc(plan.title)}</h2><p id="p-sub"></p></div>
-      <button class="icon-btn hp${S().headphones ? ' on' : ''}" data-act="hp" aria-pressed="${S().headphones}" aria-label="Headphones">${ICON.phones}</button>
+      ${kind === 'warmup' ? '<span></span>' : `<button class="icon-btn hp${S().headphones ? ' on' : ''}" data-act="hp" aria-pressed="${S().headphones}" aria-label="Headphones">${ICON.phones}</button>`}
     </header>
     <div class="p-progress" id="prog" role="img" hidden></div>
     ${CUE_MARKUP}
@@ -1412,7 +1417,7 @@ function playerCtrl({ kind, id }) {
     const A = st.audio;
     while (ai < A.length && A[ai].t < t + 0.7) {
       const a = A[ai++];
-      if (a.hp && !S().headphones) continue;
+      if (a.hp && !guideWhileSinging()) continue;
       let at = T0 + a.t;
       if (a.kind === 'click') {
         if (at < now - 0.03) continue;
@@ -1654,7 +1659,8 @@ function playerCtrl({ kind, id }) {
     requestAnimationFrame(() => drawOverview(bd.querySelector('.replay'), results));
   }
 
-  // ---- The daily warm-up's ending: it counts only if the app heard every sung part (warmupCheck).
+  // ---- The daily warm-up's ending: it counts only if the app heard every sung part and the
+  // voice went up and down with the notes (warmupCheck).
   // Then it opens songs until midnight and counts as a practice day. No score headline: it isn't a test.
   function finishWarmup(sum) {
     const check = warmupCheck(results);
@@ -1664,7 +1670,7 @@ function playerCtrl({ kind, id }) {
       cheer();
     }
     setBtn(el.start, 'again');
-    setCue(check.ok ? 'Warmed up' : NOT_HEARD, '');
+    setCue(check.ok ? 'Warmed up' : check.heard ? NOT_FOLLOWED : NOT_HEARD, '');
     setProgress(seg.n, 1, true);
     warmupSheet(sum, check);
   }
@@ -1730,13 +1736,21 @@ function playerCtrl({ kind, id }) {
         <button class="care-link" data-act="care">${ICON.heart}Look after your voice</button>
       </div>`;
     if (!check.ok) {
+      // Sound was heard, but it didn't move with the notes like a voice (a hum, a drone, a speaker).
+      const offTune = check.heard;
+      // Songs may already be open from an earlier warm-up today; this one just didn't count.
+      const songsLine = !lock ? '' : warmedUpToday() ? '<p>Songs are still open from your earlier warm-up.</p>' : '<p>Songs open after a warm-up I can hear.</p>';
       openSheet(
         `<p class="eyebrow">${esc(WARMUP.title)}</p>
          ${hum('sing')}
-         <h2>${NOT_HEARD}</h2>
-         ${check.missed.length ? `<p>I didn’t hear you in:</p><div class="missed">${check.missed.map((t) => `<span>${esc(t)}</span>`).join('')}</div>` : ''}
-         <p>Sing each note right to the end of its bar, at a medium volume, with the phone about an arm’s length away.</p>
-         ${lock ? '<p>Songs open after a warm-up I can hear.</p>' : ''}
+         <h2>${offTune ? NOT_FOLLOWED : NOT_HEARD}</h2>
+         ${!offTune && check.missed.length ? `<p>I didn’t hear you in:</p><div class="missed">${check.missed.map((t) => `<span>${esc(t)}</span>`).join('')}</div>` : ''}
+         <p>${
+           offTune
+             ? 'I heard sound, but not a voice singing along with the notes. Listen to each part, then sing it back: up when it goes up, down when it goes down.'
+             : 'Sing each note right to the end of its bar, at a medium volume, with the phone about an arm’s length away.'
+         }</p>
+         ${songsLine}
          <div class="sheet-actions">
            <button class="btn secondary" data-act="done">Done</button>
            <button class="btn primary" data-act="again">Try again</button>
