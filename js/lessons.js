@@ -125,7 +125,7 @@ function holdStep(range, holds, { vowel = 'ah', title = 'Hold it steady', intro,
     title,
     vowel,
     tonic: T,
-    intro: intro || `Breathe in, then hold each note on ${QUOTE(vowel)}. Keep the line flat and level to the end.`,
+    intro: intro || `Breathe in, then hold each note on ${QUOTE(vowel)}. Keep the line level to the end.`,
   });
 }
 
@@ -408,14 +408,15 @@ export const LESSONS = {
 export const UNITS = [
   { id: 'start', title: 'Start here', lessons: ['range', 'match', 'hold'] },
   { id: 'pitch', title: 'Pitch', lessons: ['steps', 'five', 'scale', 'leaps', 'arps', 'minor', 'echo'] },
-  { id: 'breath', title: 'Breath and control', lessons: ['longer', 'sirens', 'staccato'] },
+  { id: 'breath', title: 'Breath skills', lessons: ['longer', 'sirens', 'staccato'] },
 ];
 
 export const ORDER = UNITS.flatMap((u) => u.lessons);
 
 // ---------- Daily warm-up ----------
 // About 4 minutes: body and breath, small hum slides, a light "oo" pattern from high to low,
-// a five-note scale, the control move of the day, then one big siren once the voice is warm.
+// a five-note scale, today's challenge (a control move that changes by weekday), then one big
+// siren once the voice is warm.
 // Everything sung stays inside safeBand(range, 2), so nothing touches the very top note.
 
 export const MOVE_CARDS = [
@@ -441,13 +442,13 @@ export const CONTROLS = {
     holdStep(band, [[2, 5], [4, 6]], {
       vowel: 'oo',
       title: CONTROL_TITLES.hold,
-      intro: `Control of the day. Breathe in, then hold each note on ${QUOTE('oo')}. Keep the line flat right to the end.`,
+      intro: `Today’s challenge. Breathe in, then hold each note on ${QUOTE('oo')}. Keep the line level right to the end.`,
     }),
   bounce: (band, tight) =>
     staccatoStep(band, 2, {
       title: CONTROL_TITLES.bounce,
       degs: tight ? [0, 2, 4, 2, 0] : [0, 4, 7, 4, 0],
-      intro: `Control of the day. Short, bouncy notes on ${QUOTE('ha')}. Start each one cleanly and stop it cleanly.`,
+      intro: `Today’s challenge. Short, bouncy notes on ${QUOTE('ha')}. Start each one cleanly and stop it cleanly.`,
     }),
   swell: (band) =>
     holdStep(band, [[2, 6], [4, 6]], {
@@ -455,12 +456,12 @@ export const CONTROLS = {
       title: CONTROL_TITLES.swell,
       swell: true,
       cue: (secs, i, n) => `Soft, louder, then soft · ${i + 1} of ${n}`,
-      intro: 'Control of the day. Start soft, grow a little louder, then fade away. Keep the line flat. Watch the level bar grow and shrink.',
+      intro: 'Today’s challenge. Start soft, grow a little louder, then fade away. Keep the line steady. Watch the level bar grow and shrink.',
     }),
   slide: (band) =>
     slideDownStep(band, 3, {
       title: CONTROL_TITLES.slide,
-      intro: `Control of the day. Slide slowly down on ${QUOTE('oo')}, smooth like a lift, no bumps.`,
+      intro: `Today’s challenge. Slide slowly down on ${QUOTE('oo')}, smooth like a lift, no bumps.`,
     }),
 };
 
@@ -510,7 +511,7 @@ export function buildWarmup(range, date = new Date()) {
 export const WARMUP = {
   id: 'warmup',
   title: 'Daily warm-up',
-  blurb: 'Wake up, slide, scale, and today’s control move. About 4 minutes.',
+  blurb: 'Wake up, slide, scale, and today’s challenge. About 4 minutes.',
   minutes: 4, // the one place the warm-up's length lives: Today, Songs and the lock all read it
   controlTitle: (date = new Date()) => CONTROL_TITLES[controlFor(date)],
   build: (range, date = new Date()) => buildWarmup(range, date),

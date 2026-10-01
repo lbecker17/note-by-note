@@ -2,8 +2,8 @@ import { AudioEngine } from './audio.js';
 import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './lessons.js';
 import { SONGS, buildSong, difficulty, songGlyph } from './songs.js';
 import { Lane, drawOverview } from './lane.js';
-import { letterName, label, family, prefersFlats, voiceType, spanWords, pc } from './music.js';
-import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck } from './score.js';
+import { letterName, label, family, prefersFlats, pc } from './music.js';
+import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, offWords } from './score.js';
 import { store, today, week, warmedToday } from './store.js';
 import { ICON, PHASE_ICON, MARK, SQUIGGLE, STAFF, BURST, AROUND, confetti, rating, hum, WARM_STEPS, CONTROL_STEP, MOVE_ART, moveRing } from './art.js';
 
@@ -22,9 +22,13 @@ const PRESET_INFO = [
 ];
 const VOICE_CHANGING = 'Voice changing (cracks, squeaks, new low notes)? Do the range test instead. It finds where your voice is right now.';
 const VERSION = '1.1';
-const NOT_HEARD = 'We couldn’t hear you';
-const NOT_FOLLOWED = 'We couldn’t hear the tune';
+// The app talks in one voice, as “I”: “I couldn’t hear you”, “I set How strict to Relaxed”.
+const NOT_HEARD = 'I couldn’t hear you';
+const NOT_FOLLOWED = 'I couldn’t hear the tune';
 const TABS = ['today', 'lessons', 'songs'];
+// The grown-ups' corner of the results and warm-up sheets: small and quiet, below everything a
+// child needs.
+const GROWN_UPS = `<div class="grown-ups"><span>For grown-ups:</span><button class="quiet-link" data-act="copy">Copy results for Claude</button></div>`;
 
 let current = null;
 let sheet = null;
@@ -67,10 +71,9 @@ const lockEnabled = () => S().warmupLock !== false;
 const warmedUpToday = () => warmedToday();
 const songsUnlocked = () => !lockEnabled() || warmedUpToday();
 
-// The warm-up's steps as pictures, for the Today hero and the "Up next" card. Step 5 is the
-// control move of the day (ctl: 'hold' | 'bounce' | 'swell' | 'slide'), marked { today: true }.
+// The warm-up's steps as pictures, for the Today hero and the "Up next" card. Step 5 is today's
+// challenge, a control move (ctl: 'hold' | 'bounce' | 'swell' | 'slide'), marked { today: true }.
 const warmTrail = (ctl = controlFor()) => WARM_STEPS.map((s) => (s.key === 'control' ? { ...s, ...CONTROL_STEP[ctl], today: true } : s));
-const todayControl = () => ({ title: WARMUP.controlTitle() });
 const warmLength = () => `About ${WARMUP.minutes} minutes`;
 const clockTime = (ms) => new Date(ms).toLocaleTimeString('en-AU', { hour: 'numeric', minute: '2-digit' });
 
@@ -131,7 +134,11 @@ function keyboardSVG(range, { from = 36, to = 84, compact = false } = {}) {
   return out + '</svg>';
 }
 
-const voiceLabel = (range) => (store.data.rangeFrom === 'child' ? 'Child range' : voiceType(range));
+// Where the saved range came from, in a few words. No voice-type labels (Alto, Tenor…): a
+// range alone can't tell, so the app shows the notes themselves (report Q12).
+const RANGE_FROM = { test: 'From your test', child: 'Child range', high: 'Higher voice', low: 'Lower voice' };
+const rangeSource = () => RANGE_FROM[store.data.rangeFrom] || '';
+const rangeText = (r) => `${letterName(r.low)} to ${letterName(r.high)}`;
 
 function presetsHTML(act = 'preset') {
   return `<div class="presets">${PRESET_INFO.map(([k, name, who]) => {
@@ -165,8 +172,11 @@ function openSheet(html, actions = {}, opts = {}) {
       if (e.target === bd) closeSheet();
     });
   sheet = { el: bd, actions, onClose: opts.onClose, key: opts.key };
-  const first = bd.querySelector('.sheet button');
-  if (first) first.focus({ preventScroll: true });
+  // Focus starts at the top, on the heading (or the sheet itself when it has none), so a screen
+  // reader begins with the title and the content, not a button at the bottom.
+  const top = bd.querySelector('.sheet h2') || bd.querySelector('.sheet');
+  top.setAttribute('tabindex', '-1');
+  top.focus({ preventScroll: true });
   return bd;
 }
 
@@ -193,7 +203,7 @@ function micSheet(then) {
        <button class="btn primary big wide" data-act="mic-allow">Try again</button>
        <button class="btn text wide" data-act="sheet-close">Close</button>`
       : `<h2>Turn on the microphone</h2>
-       <p>Note by Note listens so it can show your pitch as you sing. Nothing is recorded or sent anywhere.</p>
+       <p>I listen so I can show your pitch as you sing. Nothing is recorded or sent anywhere.</p>
        <p class="muted">Tip: you'll hear the notes best with the phone's volume up and Silent mode off.</p>
        <button class="btn primary big wide" data-act="mic-allow">Allow microphone</button>
        <button class="btn text wide" data-act="sheet-close">Not now</button>`;
@@ -220,7 +230,7 @@ function micSheet(then) {
 function needRangeSheet() {
   openSheet(
     `<h2>First, find your range</h2>
-     <p>Every lesson moves into your key, so the app needs to know where your voice sits. It takes about a minute.</p>
+     <p>Every lesson moves into your key, so I need to know where your voice sits. It takes about a minute.</p>
      <button class="btn primary big wide" data-act="range">${ICON.play}Find my range</button>
      <p class="muted center">Or start with a typical range:</p>
      ${presetsHTML()}
@@ -253,6 +263,7 @@ function settingsSheet(gate = null) {
   const status = warmedUpToday()
     ? `${ICON.check}Today: warmed up${warm.at ? ` at ${clockTime(warm.at)}` : ''}`
     : 'Not yet today';
+  const strictCents = Object.values(STRICTNESS).map((t) => `${t.good} (${t.label})`);
   const html = `
     <h2>Settings</h2>
     <div class="field">
@@ -260,15 +271,12 @@ function settingsSheet(gate = null) {
       <button class="switch ${s.headphones ? 'on' : ''}" role="switch" aria-checked="${s.headphones}" aria-label="Headphones" data-act="set" data-k="headphones" data-v="${!s.headphones}"><i></i></button>
     </div>
     <div class="field col"><b>Note names</b>${seg('names', [['letters', 'C D E'], ['solfa', 'Do Re Mi']])}</div>
-    <div class="field col"><b>How strict</b>${seg('strict', [['relaxed', 'Relaxed'], ['standard', 'Standard'], ['strict', 'Strict']])}<p class="muted">${STRICTNESS[s.strict].blurb}. 100 cents is one half step.</p></div>
+    <div class="field col"><b>How strict</b>${seg('strict', [['relaxed', 'Relaxed'], ['standard', 'Standard'], ['strict', 'Strict']])}<p class="muted">${STRICTNESS[s.strict].blurb}</p></div>
     <div class="field">
-      <div><b>Your range</b><p>${range ? `${letterName(range.low)} to ${letterName(range.high)} · ${voiceLabel(range)}` : 'Not set yet'}</p></div>
-      <button class="btn small secondary" data-act="range">${range ? 'Retest' : 'Find it'}</button>
+      <div><b>Your comfy notes</b><p>${range ? esc([rangeText(range), rangeSource()].filter(Boolean).join(' · ')) : 'Not found yet'}</p></div>
+      <button class="btn small secondary" data-act="range">${range ? 'Retest' : 'Find them'}</button>
     </div>
-    <div class="field">
-      <div><b>Progress</b><p>Clears scores and practice days. Keeps your range.</p></div>
-      <button class="btn small danger" data-act="reset">Reset</button>
-    </div>
+    <button class="field link-row" data-act="care"><span>${ICON.heart}<b>Look after your voice</b></span>${ICON.chev}</button>
     <h3 class="group-h">For grown-ups</h3>
     <div class="field lock-field">
       <div>
@@ -288,8 +296,14 @@ function settingsSheet(gate = null) {
           </div>`
         : ''
     }
-    <p class="lock-note">This is a gentle nudge, not a real lock. The app checks that someone sang along with the warm-up, but it can’t be certain.</p>
-    <button class="field link-row" data-act="care"><span>${ICON.heart}<b>Look after your voice</b></span>${ICON.chev}</button>
+    <p class="lock-note">This is a gentle nudge, not a real lock. I check that someone sang along with the warm-up, but I can’t be certain.</p>
+    <div class="field">
+      <div><b>Reset progress</b><p>Clears scores and practice days. Keeps the range.</p></div>
+      <button class="btn small danger" data-act="reset">Reset</button>
+    </div>
+    <div class="field">
+      <div><b>How strict, in cents</b><p>Singing counts as in tune within ${strictCents.slice(0, -1).join(', ')} or ${strictCents[strictCents.length - 1]} cents of the note. 100 cents is one half step.</p></div>
+    </div>
     <p class="about">Note by Note ${VERSION} · Nothing you sing is recorded or leaves this device.</p>
     <button class="btn primary wide" data-act="sheet-close">Done</button>`;
   let armed = false;
@@ -357,6 +371,18 @@ function settingsSheet(gate = null) {
     });
 }
 
+// Keeps a button's label to `lines` lines: if its <span> wraps onto more, it gets the short
+// label instead. Returns true when it did.
+function fitLabel(btn, short, lines = 1) {
+  const span = btn && btn.querySelector('span');
+  if (!span) return false;
+  const text = document.createRange();
+  text.selectNodeContents(span);
+  if (text.getClientRects().length <= lines) return false;
+  span.textContent = short;
+  return true;
+}
+
 // Focus something in the open sheet without scrolling it (after a sheet re-renders in place).
 function focusIn(sel) {
   const el = sheet && sheet.el.querySelector(sel);
@@ -367,7 +393,7 @@ function focusIn(sel) {
 
 const CARE = [
   ['shout', 'Sing, don’t shout', 'Shouting and screaming are the hardest thing on your voice, and so is singing over loud music.'],
-  ['volume', 'Comfy volume', 'Medium is plenty. The app hears you fine.'],
+  ['volume', 'Comfy volume', 'Medium is plenty. I can hear you fine.'],
   ['easy', 'Easy notes only', 'Never push for a high note. If it pinches, go lower.'],
   ['water', 'Scratchy or sore? Stop.', 'Have a drink of water and rest your voice. Tell a grown-up if it’s still sore tomorrow.'],
   ['rest', 'Sick? Rest.', 'When you have a cold or a croaky voice, skip singing until your voice feels normal, then start with the warm-up. Songs will still be here tomorrow.', 'rest'],
@@ -375,8 +401,8 @@ const CARE = [
 ];
 
 const CARE_GROWNUPS = `
-  <h3>What this app can and can’t do</h3>
-  <p>It measures pitch and timing only. It can’t hear strain, breathiness or tension, and its scores say nothing about vocal health. Warm-ups help singing feel easier and, in choir studies, more in tune. No study shows they prevent voice injury.</p>
+  <h3>What I can and can’t do</h3>
+  <p>I measure pitch and timing only. I can’t hear strain, breathiness or tension, and my scores say nothing about vocal health. Warm-ups help singing feel easier and, in choir studies, more in tune. No study shows they prevent voice injury.</p>
   <h3>Everyday voice care for children</h3>
   <p>These habits matter more than any warm-up:</p>
   <ul>
@@ -421,7 +447,7 @@ const CARE_GROWNUPS = `
     <li>Boys’ voices usually start changing at about 13, anywhere from about 10½ to 16½. The change takes around 18 months and sometimes more than three years.</li>
     <li>Cracks and sudden flips are normal. Let boys sing where it’s comfortable, usually the new lower notes, rather than forcing high notes they used to have.</li>
     <li>Girls’ voices change too: breathiness, a lower bottom, cracks and an unsteady range are normal and settle with time.</li>
-    <li>Redo the range test every few weeks while the voice is changing. The app will remind you. (VoiceScience; Williams, Welch &amp; Howard 2020; Gackle; Cooksey.)</li>
+    <li>Redo the range test every few weeks while the voice is changing. I’ll remind you. (VoiceScience; Williams, Welch &amp; Howard 2020; Gackle; Cooksey.)</li>
   </ul>
   <h3>Preventer inhalers</h3>
   <p>If your child uses a preventer (steroid) inhaler and you notice hoarseness, mention it to your GP or pharmacist.</p>
@@ -506,7 +532,7 @@ function lockSheet(target) {
     `${hum('sing')}
      <h2>Warm up first</h2>
      <p>Singers warm up before songs, like stretching before sport. It takes about ${WARMUP.minutes} minutes. Then every song is open until midnight.</p>
-     <p>Today’s control: <span class="ctl">${esc(WARMUP.controlTitle())}</span></p>
+     <p>Today’s challenge: <span class="ctl">${esc(WARMUP.controlTitle())}</span></p>
      <button class="btn primary big wide" data-act="lock-warm">${ICON.play}Start warm-up</button>
      <button class="btn text wide" data-act="sheet-close">Not now</button>
      <button class="care-link" data-act="lock-care">${ICON.heart}Throat sore today? Rest your voice</button>`,
@@ -540,7 +566,7 @@ function relaxedNote() {
     if (sheet) return;
     openSheet(
       `<h2>How strict: Relaxed</h2>
-       <p>We set How strict to Relaxed, which suits young singers. Change it any time in Settings.</p>
+       <p>I set How strict to Relaxed, which suits young singers. Change it any time in Settings.</p>
        <button class="btn primary big wide" data-act="sheet-close">OK</button>`,
       {},
       { cls: 'centered', label: 'How strict' }
@@ -745,7 +771,6 @@ function heroHTML() {
     </section>`;
   }
   const noRange = !store.data.range;
-  const ctl = todayControl();
   const chip = noRange
     ? `<span class="chip">${ICON.sprout}Find your range first</span>`
     : !songsUnlocked()
@@ -755,7 +780,7 @@ function heroHTML() {
     ${STAFF}${hum('sing')}
     ${chip}
     <h2>${esc(WARMUP.title)}</h2>
-    <p class="sub">${warmLength()}.${ctl ? `<br>Today: <b>${esc(ctl.title)}</b>` : ''}</p>
+    <p class="sub">${warmLength()}.<br>Today: <b>${esc(WARMUP.controlTitle())}</b></p>
     ${stepsHTML(trail, false)}
     <button class="btn ${noRange ? 'secondary' : 'primary'} big wide" data-act="open" data-kind="warmup" data-id="warmup">${ICON.play}Start warm-up</button>
     <button class="safe-line" data-act="care" aria-label="Sing easy and comfy. Stop if anything hurts. Look after your voice">${ICON.heart}<span>Sing easy and comfy. Stop if anything hurts.</span></button>
@@ -810,18 +835,19 @@ function nextLessonHTML() {
 
 function tilesHTML(due) {
   const r = store.data.range;
+  const src = rangeSource();
   const voice = r
-    ? `<button class="tile" data-act="range" aria-label="Your voice: ${letterName(r.low)} to ${letterName(r.high)}, ${esc(voiceLabel(r))}. ${due ? 'Check again' : 'Retest'}">
-        <span class="eyebrow">Your voice</span>
+    ? `<button class="tile" data-act="range" aria-label="Your comfy notes: ${rangeText(r)}${src ? `, ${esc(src.toLowerCase())}` : ''}. ${due ? 'Check again' : 'Retest'}">
+        <span class="eyebrow">Your comfy notes</span>
         <span class="vr">${letterName(r.low)}<span>to</span>${letterName(r.high)}</span>
         ${keyboardSVG(r, { compact: true })}
-        <span class="tile-foot"><span>${esc(voiceLabel(r))}</span><b${due ? ' class="due"' : ''}>${due ? 'Check again' : 'Retest'}</b></span>
+        <span class="tile-foot">${src ? `<span>${esc(src)}</span>` : ''}<b${due ? ' class="due"' : ''}>${due ? 'Check again' : 'Retest'}</b></span>
       </button>`
-    : `<button class="tile" data-act="range" aria-label="Your voice: not found yet. Find it">
-        <span class="eyebrow">Your voice</span>
+    : `<button class="tile" data-act="range" aria-label="Your comfy notes: not found yet. Find them">
+        <span class="eyebrow">Your comfy notes</span>
         <span class="blurb">Not found yet</span>
         ${keyboardSVG(null, { compact: true })}
-        <span class="tile-foot"><b>Find it</b></span>
+        <span class="tile-foot"><b>Find them</b></span>
       </button>`;
   return `<div class="tiles">
     ${voice}
@@ -859,7 +885,7 @@ function todayHTML() {
 const UNIT_META = {
   start: { icon: 'sprout', tab: 'Start here', intro: 'Find your voice and your first notes.' },
   pitch: { icon: 'ladder', tab: 'Pitch', intro: 'Find the notes and move between them.' },
-  breath: { icon: 'wind', tab: 'Breath &amp; control', intro: 'Long notes, smooth slides, quick notes.' },
+  breath: { icon: 'wind', tab: 'Breath skills', intro: 'Long notes, smooth slides, quick notes.' },
 };
 
 // The remembered unit, else the one holding "Up next".
@@ -1069,6 +1095,14 @@ function tuneWriter(el) {
   };
 }
 
+const upper = (w) => w[0].toUpperCase() + w.slice(1);
+
+// The tune pill with no note to aim at: how close the voice is to the nearest note, in words.
+function nearestWords(m) {
+  const c = (m - Math.round(m)) * 100;
+  return Math.abs(c) <= 15 ? 'Right on the note' : upper(offWords(c));
+}
+
 function levelOf(r) {
   return r ? clamp01((20 * Math.log10(r.rms + 1e-9) + 58) / 46) : 0;
 }
@@ -1120,7 +1154,7 @@ function playerCtrl({ kind, id }) {
     </div>
     <p class="lyrics" id="lyrics" ${plan.song ? '' : 'hidden'}></p>
     <div class="readout">
-      <span class="note-now" id="note">–</span>
+      <span class="note-now" id="note"></span>
       <span class="note-info"><span class="tune" id="cents">Tap Start to begin</span><span class="level"><i id="level"></i></span></span>
     </div>
     <div class="p-controls">
@@ -1261,7 +1295,7 @@ function playerCtrl({ kind, id }) {
       const st = step();
       el.move.innerHTML = `<div class="move-pic">${MOVE_ART[st.cards[0].id] || ''}</div>
         <h3>${esc(st.title)}</h3>
-        <p>${st.cards.length} quick moves for your body and breath. Then we sing.</p>
+        <p>${st.cards.length} quick moves for your body and breath. Then it’s time to sing.</p>
         <div class="move-foot"><span class="move-dots" aria-hidden="true">${st.cards.map(() => '<i></i>').join('')}</span></div>`;
       el.move.hidden = false;
     } else el.move.hidden = true;
@@ -1308,8 +1342,9 @@ function playerCtrl({ kind, id }) {
     el.player.dataset.state = 'running';
   }
 
-  // ---- Move cards: a picture, what to do, a countdown ring and Next. The mic stays on (the
-  // level bar moves) but nothing is kept or scored, and the warm-up check skips the step.
+  // ---- Move cards: a picture, what to do, a countdown ring and Next. The mic stays on, but the
+  // note readout is hidden (there's nothing to sing), nothing is kept or scored, and the warm-up
+  // check skips the step.
   let moveBits = null;
   function startMove(st) {
     state = 'moving';
@@ -1448,8 +1483,9 @@ function playerCtrl({ kind, id }) {
       const target = targetAt(ev, f.t);
       const x = foldDiff(f.m, target);
       f.dm = target + x.d;
+      f.c = x.d * 100;
       f.octave = x.octave;
-      f.k = creditFor(x.d * 100, tol, ev.m2 != null ? 2 : 1);
+      f.k = creditFor(f.c, tol, ev.m2 != null ? 2 : 1);
       f.fam = family(ev.m, keyOf(ev, st));
       if (f.k > 0) {
         if (!ev.hits) ev.hits = [];
@@ -1525,21 +1561,19 @@ function playerCtrl({ kind, id }) {
   }
 
   // st and t say which key to name notes in: the one at that moment of that step.
-  function readout(r, target, st, t) {
-    let noteTxt = '–';
+  // f: this moment's frame from decorate(), while running. On a note to sing, the readout agrees
+  // with the bar: it names the note in the bar's octave (the right note sung higher or lower
+  // counts) and gives the bar's verdict.
+  function readout(r, f, st, t) {
+    let noteTxt = state === 'running' ? '–' : '';
     if (r && r.m != null) {
       const solfa = S().names === 'solfa';
       const tonic = keyAt(st, t);
       const key = { tonic, flats: prefersFlats(tonic, !!st.minor), names: S().names, octave: !solfa };
-      noteTxt = label(r.m, key);
-      if (target != null) {
-        const c = Math.round(foldDiff(r.m, target).d * 100);
-        if (Math.abs(c) <= tol.good) setTune('tune ok', `${ICON.check}In tune`);
-        else setTune('tune near', `A little ${c < 0 ? 'low' : 'high'} <small>${c < 0 ? '−' : '+'}${Math.abs(c)}¢</small>`);
-      } else {
-        const c = Math.round((r.m - Math.round(r.m)) * 100);
-        setTune('tune', c === 0 ? 'Right on the note' : `${c > 0 ? '+' : '−'}${Math.abs(c)}¢ from ${esc(label(Math.round(r.m), key))}`);
-      }
+      const onNote = f && f.k != null;
+      noteTxt = label(onNote ? f.dm : r.m, key);
+      if (onNote) setTune(f.k === 1 ? 'tune ok' : 'tune near', f.k === 1 ? `${ICON.check}In tune` : upper(offWords(f.c)));
+      else setTune('tune', nearestWords(r.m));
     } else {
       setTune('tune', audio.micOn ? 'Listening…' : state === 'ready' ? 'Tap Start to begin' : 'Mic is off');
     }
@@ -1592,13 +1626,12 @@ function playerCtrl({ kind, id }) {
   // settled: re-shown after the care sheet, so no confetti or stamp animation the second time.
   function resultsSheet(sum, heard, prevBest, settled = false) {
     const pct = Math.round(sum.score * 100);
-    const lean =
-      sum.avgAbs == null ? '–' : Math.abs(sum.tendency) < 6 ? 'Centred' : `${Math.round(Math.abs(sum.tendency))}¢ ${sum.tendency < 0 ? 'flat' : 'sharp'}`;
+    // Numbers a child can read. Low or high goes in the tip, in words; cents stay in the report.
     const stats = [
       [`${sum.landed}/${sum.total}`, 'notes landed'],
-      [sum.avgAbs == null ? '–' : `${Math.round(sum.avgAbs)}¢`, 'average miss'],
-      sum.steadiness != null ? [`${Math.round(sum.steadiness * 100)}%`, 'held steady'] : [lean, 'overall lean'],
+      [`${Math.round(sum.coverage * 100)}%`, 'voice heard'],
     ];
+    if (sum.steadiness != null) stats.push([`${Math.round(sum.steadiness * 100)}%`, 'held steady']);
     const nx = nextAfter(kind, id);
     // Celebrate honestly (spec §6.9): only what the mic heard, and only good runs or a real new best.
     const newBest = heard && prevBest != null && sum.score > prevBest;
@@ -1617,19 +1650,19 @@ function playerCtrl({ kind, id }) {
         <div class="score-col"><span class="score">${pct}<small>%</small></span>${heard ? rating(stars) : ''}</div>
         ${verdictHTML}
       </div>
-      <div class="stats">${stats.map(([b, s]) => `<div><b>${esc(b)}</b><span>${s}</span></div>`).join('')}</div>
+      <div class="stats${stats.length === 2 ? ' two' : ''}">${stats.map(([b, s]) => `<div><b>${esc(b)}</b><span>${s}</span></div>`).join('')}</div>
       <canvas class="replay" aria-label="Your pitch across the whole exercise"></canvas>
       <p class="tip">${esc(heard ? tip(sum) : 'The mic hardly heard you that time, so this one won’t count toward your practice days or best score. Hold the phone a little closer, sing out, and try again.')}</p>
       ${care ? '<p class="care-line">Throat scratchy or sore? Stop for today and have a drink of water.</p>' : ''}
       ${plan.song ? `<p class="care-line">${esc(plan.song.credit)}</p>` : ''}
       <div class="sheet-actions">
         <button class="btn ${heard ? 'secondary' : 'primary'}" data-act="again">Try again</button>
-        ${nx ? `<button class="btn ${heard ? 'primary' : 'secondary'}" data-act="next">Next: ${esc(nx.title)}</button>` : `<button class="btn ${heard ? 'primary' : 'secondary'}" data-act="done">Done</button>`}
+        ${nx ? `<button class="btn ${heard ? 'primary' : 'secondary'}" data-act="next"><span>Next: ${esc(nx.title)}</span></button>` : `<button class="btn ${heard ? 'primary' : 'secondary'}" data-act="done">Done</button>`}
       </div>
       <div class="sheet-links">
-        <button class="btn text" data-act="copy">Copy results for Claude</button>
         <button class="care-link" data-act="care">${ICON.heart}Look after your voice</button>
-      </div>`;
+      </div>
+      ${GROWN_UPS}`;
     const width = Math.min(window.innerWidth, 560);
     const bd = openSheet(
       html,
@@ -1656,6 +1689,9 @@ function playerCtrl({ kind, id }) {
         before: celebrate && !settled ? confetti(BURST, [75, 128], width) : '',
       }
     );
+    // A long title ("Next: Twinkle, Twinkle, Little Star") becomes "Next song" rather than three lines.
+    const nextBtn = nx && bd.querySelector('[data-act="next"]');
+    if (nextBtn && fitLabel(nextBtn, `Next ${nx.kind}`, 2)) nextBtn.setAttribute('aria-label', `Next ${nx.kind}: ${nx.title}`);
     requestAnimationFrame(() => drawOverview(bd.querySelector('.replay'), results));
   }
 
@@ -1732,9 +1768,9 @@ function playerCtrl({ kind, id }) {
       },
     };
     const links = `<div class="sheet-links">
-        <button class="btn text" data-act="copy">Copy results for Claude</button>
         <button class="care-link" data-act="care">${ICON.heart}Look after your voice</button>
-      </div>`;
+      </div>
+      ${GROWN_UPS}`;
     if (!check.ok) {
       // Sound was heard, but it didn't move with the notes like a voice (a hum, a drone, a speaker).
       const offTune = check.heard;
@@ -1764,7 +1800,7 @@ function playerCtrl({ kind, id }) {
     const [v, what] = controlStat(sum, check);
     const nudge = warmNudge();
     const width = Math.min(window.innerWidth, 560);
-    openSheet(
+    const bd = openSheet(
       `<p class="eyebrow">${esc(WARMUP.title)}</p>
        ${hum('happy')}
        <h2>Warmed up!</h2>
@@ -1783,7 +1819,7 @@ function playerCtrl({ kind, id }) {
        }
        <div class="sheet-actions">
          <button class="btn secondary" data-act="done">Done</button>
-         <button class="btn primary" data-act="songs">${ICON.songs}${song ? `Sing ${esc(song.title)}` : 'Go to Songs'}</button>
+         <button class="btn primary" data-act="songs"${song ? ` aria-label="Sing a song: ${esc(song.title)}"` : ''}>${ICON.songs}<span>${song ? esc(song.title) : 'Sing a song'}</span></button>
        </div>
        <p class="care-line">Throat scratchy or sore? Stop for today and have a drink of water.</p>
        ${links}`,
@@ -1796,6 +1832,9 @@ function playerCtrl({ kind, id }) {
         before: settled ? '' : confetti(AROUND, [50, 130], width),
       }
     );
+    // The main button names the song the child tapped while songs were locked, if the title fits
+    // on one line. Otherwise it says "Sing a song" (and still opens that song).
+    if (song) fitLabel(bd.querySelector('[data-act="songs"]'), 'Sing a song');
   }
 
   async function copyReport(btn, sum) {
@@ -1804,7 +1843,7 @@ function playerCtrl({ kind, id }) {
       title: plan.title + (plan.song ? (mode === 'learn' ? ' (line by line)' : ' (sung through)') : ''),
       sum,
       range,
-      voice: range ? voiceType(range) : '',
+      rangeFrom: store.data.rangeFrom,
       strictKey: S().strict,
       date: new Date().toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' }),
     });
@@ -1884,7 +1923,7 @@ function playerCtrl({ kind, id }) {
         } else if (!el.countin.hidden) el.countin.hidden = true;
         updateCue(st, t, cur, next);
         renderLyrics(t);
-        readout(r, cur && cur.role === 'sing' ? targetAt(cur, t) : null, st, t);
+        readout(r, r ? live : null, st, t);
         progressAt(Math.max(0, t));
         if (t > st.end + 0.35) endStep();
       } else if (state === 'moving') {
@@ -1893,7 +1932,6 @@ function playerCtrl({ kind, id }) {
           audio.play({ kind: 'click', accent: true }, now + 0.01);
           nextCard();
         }
-        if (state === 'moving') readout(r, null, step(), 0);
       } else if (state === 'between') {
         const nx = plan.steps[stepIdx + 1];
         const left = betweenUntil - now;
@@ -1916,8 +1954,8 @@ function playerCtrl({ kind, id }) {
       if (state !== 'running' && state !== 'between' && state !== 'moving') return;
       const at = state === 'between' ? stepIdx + 1 : stepIdx;
       const keep = plan.id === 'warmup' && results.length ? { results: results.slice(), at } : null;
-      if (keep) stop('Paused because the app lost focus. Tap Carry on to pick up where you left off.', keep);
-      else stop('Stopped because the app lost focus. Tap Start to go again.');
+      if (keep) stop('Paused while you were away. Tap Carry on to keep going.', keep);
+      else stop('Stopped while you were away. Tap Start to go again.');
     },
     probe() {
       const st = step();
@@ -1951,8 +1989,8 @@ function openItemReplace(kind, id) {
 
 // ---------- Range test ----------
 
-const RANGE_INTRO =
-  'Sing a comfy low note, then a comfy high note, at a medium volume. Hold each one until the bar fills. If anything feels scratchy or sore, stop and have a drink of water.';
+// Short cues, so a young reader isn't faced with a paragraph. Each keeps its safety words.
+const RANGE_INTRO = 'Sing a comfy low note, then a comfy high note. Stop if anything hurts.';
 
 function rangeCtrl() {
   let state = 'intro'; // intro | low | high | result
@@ -1976,7 +2014,7 @@ function rangeCtrl() {
       <div class="hold" aria-hidden="true"><i id="hold"></i></div>
     </div>
     <div class="readout">
-      <span class="note-now" id="note">–</span>
+      <span class="note-now" id="note"></span>
       <span class="note-info"><span class="tune" id="cents">Tap Start to begin</span><span class="level"><i id="level"></i></span></span>
     </div>
     <div class="p-controls">
@@ -2011,7 +2049,7 @@ function rangeCtrl() {
     setMarks();
     el.player.dataset.state = 'running';
     setText(el.sub, 'Step 1 of 2');
-    setCue('Sing a comfy low note on “ah” and hold it. Low, but not growly.', 'sing');
+    setCue('Sing a low “ah” and hold it. Easy, not growly.', 'sing');
     setBtn(el.start, 'stop');
     requestWake();
   }
@@ -2022,9 +2060,9 @@ function rangeCtrl() {
     const r = found;
     el.player.dataset.state = 'done';
     const html = () => `
-      <p class="eyebrow">Your comfy range</p>
+      <p class="eyebrow">Your comfy notes</p>
       <p class="big-range">${letterName(r.low)} <span>to</span> ${letterName(r.high)}</p>
-      <p class="muted">Closest voice type: <b>${voiceType(r)}</b>. That's ${spanWords(r.high - r.low)}.</p>
+      <p class="muted">That’s ${r.high - r.low + 1} piano keys, black and white.</p>
       ${keyboardSVG(r)}
       <div class="adjust">
         <div class="adj"><span>Lowest</span><button class="step" data-act="adj" data-k="low" data-d="-1" aria-label="Lowest note down">−</button><button class="note-btn" data-act="hear" data-m="${r.low}" aria-label="Hear ${letterName(r.low)}">${letterName(r.low)}</button><button class="step" data-act="adj" data-k="low" data-d="1" aria-label="Lowest note up">+</button></div>
@@ -2102,10 +2140,10 @@ function rangeCtrl() {
         audio.blip(note, 0.5);
         state = 'high';
         setText(el.sub, 'Step 2 of 2');
-        setCue(`Low note: ${letterName(note)}. Now an easy high note, still on “ah”. Not a squeak, and never push. If it pinches, pick a lower one.`, 'sing');
+        setCue('Now a high “ah”. Easy, not a squeak. Stop if it pinches.', 'sing');
       } else if (state === 'high') {
         if (note < found.low + 4) {
-          setCue(`That's close to your low note (${letterName(found.low)}). Try a higher note.`, 'sing');
+          setCue('That’s close to your low note. Try a higher one.', 'sing');
           return;
         }
         found.high = note;
@@ -2155,8 +2193,10 @@ function rangeCtrl() {
       const vis = frames.map((f) => ({ ...f, dm: f.m }));
       const liveF = r && r.m != null ? { t: r.t, m: r.m, dm: r.m } : null;
       lane.draw(now, state === 'low' || state === 'high' ? vis : [], liveF);
-      setText(el.note, r && r.m != null ? letterName(r.m) : '–');
-      setTune('tune', r && r.m != null ? `${Math.round(440 * Math.pow(2, (r.m - 69) / 12))} Hz` : audio.micOn ? 'Listening…' : 'Tap Start to begin');
+      const testing = state === 'low' || state === 'high';
+      const voiced = r && r.m != null;
+      setText(el.note, voiced ? letterName(r.m) : testing ? '–' : '');
+      setTune('tune', voiced ? (testing ? 'Hold it…' : 'I can hear you') : audio.micOn ? 'Listening…' : 'Tap Start to begin');
       const lv = levelOf(r);
       if (Math.abs(lv - lastLevel) > 0.02) {
         lastLevel = lv;
@@ -2188,7 +2228,7 @@ function freeCtrl() {
     ${CUE_MARKUP}
     <div class="lane-wrap"><canvas id="lane"></canvas></div>
     <div class="readout">
-      <span class="note-now" id="note">–</span>
+      <span class="note-now" id="note"></span>
       <span class="note-info"><span class="tune" id="cents">Tap Start to turn on the mic</span><span class="level"><i id="level"></i></span></span>
     </div>
     <div class="p-controls"><button class="btn primary big wide" data-act="f-start" id="startBtn"></button></div>
@@ -2228,10 +2268,9 @@ function freeCtrl() {
       lane.draw(now, frames, r && r.m != null ? { t: r.t, m: r.m, dm: r.m } : null);
       if (r && r.m != null) {
         setText(el.note, letterName(r.m));
-        const c = Math.round((r.m - Math.round(r.m)) * 100);
-        setTune('tune', c === 0 ? 'Right on the note' : `${c > 0 ? '+' : '−'}${Math.abs(c)}¢ from ${letterName(Math.round(r.m))}`);
+        setTune('tune', nearestWords(r.m));
       } else {
-        setText(el.note, '–');
+        setText(el.note, audio.micOn ? '–' : '');
         setTune('tune', audio.micOn ? 'Listening…' : 'Tap Start to turn on the mic');
       }
       const lv = levelOf(r);

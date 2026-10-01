@@ -93,18 +93,6 @@ export function warmedToday() {
   return !!(store.data.warm && store.data.warm.day === today());
 }
 
-export function streak(days) {
-  const set = new Set(days);
-  const d = new Date();
-  if (!set.has(today(d))) d.setDate(d.getDate() - 1);
-  let n = 0;
-  while (set.has(today(d))) {
-    n++;
-    d.setDate(d.getDate() - 1);
-  }
-  return n;
-}
-
 // Monday-first week with practised flags.
 export function week(days) {
   const set = new Set(days);

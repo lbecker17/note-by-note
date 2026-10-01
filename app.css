@@ -240,14 +240,13 @@ h1, h2, h3 { text-wrap: balance; }
 button { font: inherit; color: inherit; cursor: pointer; }
 a { color: inherit; }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+[tabindex="-1"]:focus { outline: none; } /* a sheet's heading, focused on open so screen readers start there */
 svg { display: block; }
 .muted { color: var(--muted); }
 .center { text-align: center; }
 .small { font-size: 14px; }
-.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 /* Eyebrows: sentence case, terracotta. No more spaced UPPERCASE. */
 .eyebrow { display: block; font: 800 13px/1.2 var(--font-body); color: var(--accent-ink); letter-spacing: 0.01em; }
-.acc { font-size: 0.8em; vertical-align: 0.1em; } /* optional wrapper for ♯ ♭ (fallback font), see §2 */
 
 /* ---------- Buttons ---------- */
 .btn {
@@ -319,7 +318,7 @@ body[data-screen="player"] .tabbar { display: none; }
 
 /* ---------- Cards ---------- */
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 12px; }
-.card h3, .h3 { font: 600 20px/1.2 var(--font-display); }
+.card h3 { font: 600 20px/1.2 var(--font-display); }
 
 /* Hero: the daily warm-up NEW */
 .hero { position: relative; overflow: hidden; background: var(--hero-bg); color: var(--hero-fg); border-radius: var(--r-xl); padding: 18px; box-shadow: var(--shadow-lift); }
@@ -419,6 +418,7 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 
 /* Keyboard (existing keyboardSVG) */
 .kbd { width: 100%; height: auto; }
+.sheet .kbd { flex: none; } /* a long sheet scrolls; the keyboard keeps its size */
 .kbd .kw { fill: var(--key-white); stroke: var(--line-strong); stroke-width: 0.6; }
 .kbd .kw.in { fill: var(--range-key); }
 .kbd .kb { fill: var(--key-black); }
@@ -543,8 +543,9 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .between h3 { font: 600 26px/1.15 var(--font-display); letter-spacing: -0.01em; }
 .between p { color: var(--fg-2); max-width: 32ch; font-size: 15px; }
 .between .between-count { font: 600 44px/1 var(--font-display); color: var(--fg); margin: 4px 0; }
-/* "Wake up your body" move cards NEW */
+/* "Wake up your body" move cards NEW. Nothing to sing, so no lane and no note readout either. */
 .player[data-state="moving"] .lane-wrap canvas, .player[data-step="move"] .lane-wrap canvas { visibility: hidden; }
+.player[data-step="move"] .readout { display: none; }
 .move { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 18px 20px; text-align: center; }
 .move .move-art { width: 140px; height: 140px; }
 .move h3 { margin-top: 4px; font: 600 26px/1.1 var(--font-display); letter-spacing: -0.01em; }
@@ -566,6 +567,11 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .hold { position: absolute; left: 52px; right: 14px; bottom: 12px; height: 8px; border-radius: 4px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--line); overflow: hidden; }
 .hold i { display: block; height: 100%; width: 0; background: var(--good-fill); border-radius: 4px; transition: width 0.1s linear; }
 .range-screen[data-state="ready"] .hold { visibility: hidden; }
+/* Short screens (iPhone SE): the lane gives up height so the cue never overlaps the header. */
+@media (max-height: 700px) {
+  .range-screen .cue { flex-shrink: 0; }
+  .range-screen .lane-wrap { min-height: 120px; }
+}
 /* Song lyrics */
 .lyrics { text-align: center; font-size: 20px; font-weight: 700; line-height: 1.35; padding: 12px 20px 0; min-height: calc(2 * 1.35em + 12px); color: var(--muted); text-wrap: balance; }
 .lyrics .syl.done { color: var(--fg-2); }
@@ -576,7 +582,6 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .note-info { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; min-width: 0; }
 .tune { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 5px 12px; border-radius: var(--r-pill); font: 800 15px/1.1 var(--font-body); white-space: nowrap; background: var(--surface-2); color: var(--muted); } /* replaces #cents text */
 .tune svg { width: 16px; height: 16px; }
-.tune small { font: 700 13px/1 var(--font-body); font-variant-numeric: tabular-nums; min-width: 3.2ch; opacity: 0.85; }
 .tune.ok { background: var(--good-soft); color: var(--good); }
 .tune.near { background: var(--star-soft); color: var(--fg); }
 .level { width: 104px; height: 8px; border-radius: 4px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--line); overflow: hidden; }
@@ -659,6 +664,10 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .sheet-actions { display: grid; grid-template-columns: 1fr 1.5fr; gap: 10px; }
 .sheet-actions .btn { padding: 0 12px; }
 .sheet-links { display: flex; flex-direction: column; align-items: center; margin-top: -6px; }
+/* For grown-ups: "Copy results for Claude", small and quiet at the very bottom */
+.grown-ups { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; column-gap: 2px; padding-top: 6px; border-top: 1px dashed var(--line-strong); font: 700 13px/1.2 var(--font-body); color: var(--muted); }
+.quiet-link { min-height: 44px; padding: 0 6px; border: 0; background: none; color: var(--muted); font: 700 13px/1.2 var(--font-body); text-decoration: underline; text-underline-offset: 3px; }
+.grown-ups textarea.report { margin-top: 4px; }
 .care-line { font-size: 14px; color: var(--muted); text-align: center; }
 .care-link { align-self: center; display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 8px; border: 0; background: none; color: var(--accent-ink); font: 800 15px/1.2 var(--font-body); text-decoration: none; }
 .care-link svg { width: 18px; height: 18px; }
@@ -713,6 +722,12 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
 .adj .step { width: 44px; height: 44px; border: 0; border-radius: 12px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--line); font: 800 22px/1 var(--font-body); }
 .adj .step { display: grid; place-items: center; padding: 3px 0 0; color: var(--fg); } /* Nunito's tall ascent sits the − and + high */
 .adj .note-btn { border: 0; background: transparent; font: 600 26px/1 var(--font-display); padding: 6px 0; min-height: 44px; }
+/* Too narrow for the two side by side (iPhone SE): one row each, label on the left. */
+@media (max-width: 360px) {
+  .adjust { grid-template-columns: 1fr; gap: 8px; }
+  .adj { grid-template-columns: minmax(0, 1fr) 44px minmax(64px, auto) 44px; padding: 6px 10px; }
+  .adj span { grid-column: auto; text-align: left; font-size: 14px; }
+}
 
 /* ---------- Celebration (good runs only) NEW ---------- */
 .confetti { position: absolute; left: 0; right: 0; top: 0; height: 0; overflow: visible; pointer-events: none; z-index: 2; }

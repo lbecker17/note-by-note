@@ -303,10 +303,11 @@ export class Lane {
       g.strokeStyle = C['lane-bg'];
       g.lineWidth = 2.5;
       g.stroke();
+      // The right note in another octave counts. The dot sits on the bar; a small note says why.
       g.fillStyle = C.muted;
-      g.font = `700 11px ${font}`;
+      g.font = `700 12px ${font}`;
       g.textAlign = 'left';
-      if (live.octave) g.fillText(live.octave < 0 ? '8vb' : '8va', px + 12, py - 12);
+      if (live.octave) g.fillText(live.octave < 0 ? 'same note, lower' : 'same note, higher', px + 13, py < 26 ? py + 16 : py - 14);
       if (dm > vhi || dm < vlo) {
         const up = dm > vhi;
         g.fillStyle = C.fg;

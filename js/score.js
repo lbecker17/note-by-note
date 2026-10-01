@@ -2,11 +2,22 @@
 
 import { letterName, prefersFlats } from './music.js';
 
+// good and near are in cents (100 cents is one half step). blurb is the children's wording;
+// the cents themselves are only shown to grown-ups (Settings, the copied report).
 export const STRICTNESS = {
-  relaxed: { good: 50, near: 100, label: 'Relaxed', blurb: 'In tune within 50 cents' },
-  standard: { good: 30, near: 60, label: 'Standard', blurb: 'In tune within 30 cents' },
-  strict: { good: 15, near: 35, label: 'Strict', blurb: 'In tune within 15 cents' },
+  relaxed: { good: 50, near: 100, label: 'Relaxed', blurb: 'Close to the note counts as in tune.' },
+  standard: { good: 30, near: 60, label: 'Standard', blurb: 'Quite close to the note counts as in tune.' },
+  strict: { good: 15, near: 35, label: 'Strict', blurb: 'Only right on the note counts as in tune.' },
 };
+
+// The words children see for being off the note, in the tune pill, the results and the tips:
+// "a little low / high" up to a half step away, "too low / high" beyond it. Cents never reach them.
+const TOO_FAR = 100;
+
+export function offWords(cents) {
+  const dir = cents < 0 ? 'low' : 'high';
+  return Math.abs(cents) > TOO_FAR ? `too ${dir}` : `a little ${dir}`;
+}
 
 export function targetAt(ev, time) {
   if (ev.m2 == null) return ev.m;
@@ -153,7 +164,7 @@ export function summarize(steps) {
 }
 
 // Share of the singing time (0 to 1) when the mic heard a voice, from a summarize() result.
-// A run heard for less than HEARD_MIN of it doesn't count toward progress or the streak:
+// A run heard for less than HEARD_MIN of it doesn't count toward progress or practice days:
 // most likely nobody sang, or the mic couldn't pick them up.
 export const HEARD_MIN = 0.2;
 
@@ -268,12 +279,15 @@ export function verdict(score) {
   return 'Keep practising';
 }
 
+// How far (in cents) the run's average must lean before the tip calls it low or high.
+const LEAN_MIN = 20;
+
 export function tip(sum) {
   if (sum.total === 0) return '';
   if (sum.coverage < 0.45) return 'The mic lost you on a lot of notes. Sing a little louder, or hold the phone closer.';
-  if (sum.octaveShare > 0.5) return 'You sang most notes an octave away from the guide. That still counts. Redo the range test if the notes felt uncomfortable.';
-  if (sum.tendency < -20) return `On average you sat about ${Math.round(-sum.tendency)} cents flat. Think of each note as slightly higher, and keep the air moving to the end of the note.`;
-  if (sum.tendency > 20) return `On average you sat about ${Math.round(sum.tendency)} cents sharp. Relax your jaw and let each note settle instead of pushing.`;
+  if (sum.octaveShare > 0.5) return 'You sang the same notes as the guide, but most of them higher or lower. That still counts. Redo the range test if the notes felt uncomfortable.';
+  if (sum.tendency < -LEAN_MIN) return `You often sang ${offWords(sum.tendency)}. Think of each note as slightly higher, and keep the air moving to the end of the note.`;
+  if (sum.tendency > LEAN_MIN) return `You often sang ${offWords(sum.tendency)}. Relax your jaw and let each note settle instead of pushing.`;
   if (sum.onset != null && sum.onset > 0.35) return 'You found the notes, but late. Breathe in during the tick so you’re ready to start on time.';
   if (sum.steadiness != null && sum.steadiness < 0.7) return 'Your long notes wobbled. Breathe low into your belly and let the air out slowly and evenly.';
   if (sum.score >= 0.85) return 'That was accurate. Switch to Strict in settings for a tougher check.';
@@ -286,15 +300,26 @@ function cents(c) {
   return r > 0 ? `+${r}` : `${r}`;
 }
 
-// Plain-text summary to paste into Claude for coaching.
-export function reportText({ title, sum, range, voice, strictKey, date }) {
+// Plain-text summary to paste into Claude for coaching. rangeFrom says where the range came
+// from ('test', or a typical range: 'child', 'high', 'low').
+const RANGE_SOURCE = {
+  test: 'from the range test',
+  child: 'a typical child range, not tested',
+  high: 'a typical higher-voice range, not tested',
+  low: 'a typical lower-voice range, not tested',
+};
+
+export function reportText({ title, sum, range, rangeFrom, strictKey, date }) {
   const tol = STRICTNESS[strictKey];
   const lines = [];
   lines.push('Note by Note practice results');
   lines.push(`Lesson: ${title}`);
   lines.push(`Date: ${date}`);
-  if (range) lines.push(`My comfortable range: ${letterName(range.low)} to ${letterName(range.high)} (${voice})`);
-  lines.push(`Strictness: ${tol.label} (${tol.blurb.toLowerCase()})`);
+  if (range) {
+    const src = RANGE_SOURCE[rangeFrom];
+    lines.push(`My comfortable range: ${letterName(range.low)} to ${letterName(range.high)}${src ? ` (${src})` : ''}`);
+  }
+  lines.push(`Strictness: ${tol.label} (in tune within ${tol.good} cents)`);
   lines.push(`Score: ${Math.round(sum.score * 100)}% · ${sum.landed} of ${sum.total} notes landed`);
   if (sum.avgAbs != null) lines.push(`Average distance from the note: ${Math.round(sum.avgAbs)} cents · overall lean: ${Math.abs(Math.round(sum.tendency))} cents ${sum.tendency < 0 ? 'flat' : 'sharp'}`);
   lines.push(`The mic heard me for ${Math.round(sum.coverage * 100)}% of the singing time`);
