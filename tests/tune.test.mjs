@@ -247,6 +247,33 @@ test('findNotes: the detector\'s echo after a sound is not singing', () => {
   assert.ok(Math.abs(res.notes[1].t1 - truth[2].t1) < 0.03, `ends at ${res.notes[1].t1}`);
 });
 
+test('findNotes: a lone short sound is a blip, the same note among others is staccato', () => {
+  // On its own in silence, 90 ms of pitch is what the detector makes of a blip of about 70 ms.
+  const lone = sing([{ p: 60, d: 0.5, gap: 0.6 }, { p: 67, d: 0.09, gap: 0.6 }, { p: 62, d: 0.5 }]);
+  assert.deepEqual(ps(findNotes(lone.frames)), [60, 62]);
+  // With neighbours a fraction of a second away it is a note.
+  const quick = sing([60, 62, 64, 65, 67].map((p) => ({ p, d: 0.09, gap: 0.15 })));
+  assert.deepEqual(ps(findNotes(quick.frames)), [60, 62, 64, 65, 67]);
+});
+
+test('findNotes: a deep wobble with the level holding steady is still one note', () => {
+  // One vibrato trough falls a whole semitone. Without rms that looks like the note sung
+  // again; with a steady level it is a wobble.
+  const { frames } = sing([{ p: 64, d: 2, vib: [0.35, 5.5] }], { rms: true });
+  for (const f of frames) if (f.m != null && Math.abs(f.t - 1.3) < 0.04) f.m -= 1 - Math.abs(f.t - 1.3) / 0.04;
+  assert.deepEqual(ps(findNotes(frames)), [64]);
+  assert.deepEqual(ps(findNotes(frames.map(({ t, m }) => ({ t, m })))), [64, 64]);
+});
+
+test('findNotes: a note that began while the browser stalled starts in the middle of the stall', () => {
+  const parts = [{ p: 62, d: 0.5, gap: 0.4 }, { p: 65, d: 0.5 }];
+  const onset = 0.3 + 0.5 + 0.4;
+  const { frames } = sing(parts, { stalls: [[onset - 0.15, onset + 0.15]] });
+  const res = findNotes(frames);
+  assert.deepEqual(ps(res), [62, 65]);
+  assert.ok(Math.abs(res.notes[1].t0 - onset) < 0.03, `starts at ${res.notes[1].t0}, sung at ${onset}`);
+});
+
 test('findNotes: short octave jumps are folded back', () => {
   const { frames, truth } = sing(SCALE.map((p, i) => ({ p, d: 0.4, oct: i % 2 ? [0.15, 0.01] : [0.2, 0.07] })));
   const res = findNotes(frames);

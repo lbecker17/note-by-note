@@ -24,6 +24,8 @@ const NOTE_OPTS = {
 const MAX_SEG = 1.2; // seconds; longer steady stretches are cut and joined again afterwards
 const MAX_STALL = 0.4; // seconds with no frames at all that still count as one stretch of singing
 const LEVEL_DIP = 0.35; // a level this far under the singing either side is a break between notes
+const LONELY = 0.3; // seconds of silence either side that leave a sound on its own
+const BLIP_SMEAR = 0.02; // seconds a lone short sound looks longer than it was
 
 // frames: [{ t, m, rms? }] in time order, m a MIDI float or null.
 // Returns { notes: [{ t0, t1, m, p, conf }], sungSeconds, glideShare, tuning }.
@@ -40,10 +42,19 @@ export function findNotes(frames, opts = {}) {
   const { runs, sung } = voicedRuns(frames, o.gap, dt);
   let glide = 0;
   let found = [];
+  const kept = [];
   for (const run of runs) {
     trimFade(run, dt, o.fade);
     if (run.jumpy) clean(run, dt);
-    if (!run.x.length) continue;
+    if (run.x.length) kept.push(run);
+  }
+  // A sound with nothing else within LONELY seconds either side, in silence of its own.
+  kept.forEach((run, i) => {
+    const before = i > 0 ? run.t[0] - kept[i - 1].t[kept[i - 1].t.length - 1] : Infinity;
+    const after = i + 1 < kept.length ? kept[i + 1].t[0] - run.t[run.t.length - 1] : Infinity;
+    run.lonely = before > LONELY && after > LONELY;
+  });
+  for (const run of kept) {
     const segs = segmentRun(run, o.penalty, dt);
     const res = runNotes(run, segs, o);
     glide += res.glide;
@@ -227,18 +238,20 @@ function voicedRuns(frames, gap, dt) {
     if (n > start) {
       weight(dt);
       const v = (A, extra = 0) => A.subarray(start, n + extra);
-      runs.push({ t: v(T), x: v(X), r: v(R), g: v(G), w: v(Wt), PW: v(PW, 1), PX: v(PX, 1), jumpy });
+      runs.push({ t: v(T), x: v(X), r: v(R), g: v(G), w: v(Wt), PW: v(PW, 1), PX: v(PX, 1), jumpy, lead, first: T[start] });
     }
     start = n;
     jumpy = false;
   };
   let lost = 0; // time since the last voiced frame that no frame covered
+  let lead = 0; // half of any stall just before the run's first frame (see runNotes)
   let hushLo = Infinity; // quietest and loudest unvoiced frame since then (NaN without rms)
   let hushHi = -Infinity;
   for (let i = 0; i < N; i++) {
     const f = frames[i];
     if (!f || !(f.t > last)) continue; // broken or out-of-order frame
-    if (last > -Infinity) lost += Math.max(0, f.t - last - 1.5 * dt);
+    const missed = last > -Infinity ? Math.max(0, f.t - last - 1.5 * dt) : 0;
+    lost += missed;
     last = f.t;
     const m = f.m;
     if (typeof m !== 'number' || !(m > 12 && m < 120)) {
@@ -255,6 +268,7 @@ function voicedRuns(frames, gap, dt) {
         if (Math.abs(m - X[n - 1]) >= 4.5) jumpy = true;
       }
     }
+    if (n === start) lead = missed / 2;
     T[n] = f.t;
     X[n] = m;
     R[n] = typeof f.rms === 'number' && f.rms >= 0 ? f.rms : NaN;
@@ -619,7 +633,15 @@ function runNotes(run, segs, o) {
     for (const nt of it.notes) {
       for (const part of splitDips(run, nt, o, core)) {
         const n = measure(run, part, core);
-        if (n && n.t1 - n.t0 >= o.minNote) notes.push(n);
+        // A lone sound in silence shows up longer than it was: the detector's window catches it
+        // a little before it starts and holds on after it stops. A blip (a cough, a knock, an
+        // "uh") is a lone sound; a short note in a tune has neighbours.
+        const alone = run.lonely && part.a === 0 && part.b === run.x.length;
+        if (!n || n.t1 - n.t0 < o.minNote + (alone ? BLIP_SMEAR : 0)) continue;
+        // A note heard first just after the browser stalled began somewhere in the stall: its
+        // middle is the best guess (unless the start has been trimmed away since).
+        if (part.a === 0 && run.lead > 0 && run.t[0] === run.first) n.t0 -= run.lead;
+        notes.push(n);
       }
     }
   }
@@ -791,12 +813,30 @@ function smooth(run, k, half) {
 }
 
 // Something between two pieces at the same level that drops well below both.
+// (A deep wobble with the level holding steady is not a dip: see levelHolds.)
 function dipBetween(run, list, l, r) {
-  for (let k = l.i + 1; k < r.i; k++) if (list[k].dip) return true;
-  if (r.a <= l.b || r.t0 - l.t1 > 0.25) return false;
+  let dip = false;
+  for (let k = l.i + 1; k < r.i; k++) if (list[k].dip) dip = true;
+  if (!dip) {
+    if (r.a <= l.b || r.t0 - l.t1 > 0.25) return false;
+    let lo = Infinity;
+    for (let k = l.b; k < r.a; k++) lo = Math.min(lo, run.x[k]);
+    dip = Math.min(l.mu, r.mu) - lo >= 0.8;
+  }
+  if (!dip || r.a <= l.b) return dip;
+  const level = (a, b) => quantile(Float64Array.from(run.r.subarray(a, b)).sort(), 0.5, true);
+  return !levelHolds(run, l.b, r.a, Math.min(level(l.a, l.b), level(r.a, r.b)));
+}
+
+// A note sung again comes with a dip in level as well as pitch: a consonant, a catch in the
+// voice. True when the level through frames [i, j] (and the unvoiced frames bridged inside)
+// stays at 70% or more of `ref`, the singing either side: the pitch dip was a deep wobble of
+// one note. False when there is no level to go on.
+function levelHolds(run, i, j, ref) {
+  if (!(ref > 0) || j < i) return false;
   let lo = Infinity;
-  for (let k = l.b; k < r.a; k++) lo = Math.min(lo, run.x[k]);
-  return Math.min(l.mu, r.mu) - lo >= 0.8;
+  for (let k = i; k <= j; k++) lo = Math.min(lo, run.r[k], run.g[k]);
+  return lo >= 0.7 * ref;
 }
 
 // Split a note where the pitch (or, when we have it, the level) dips clearly and comes
@@ -853,6 +893,7 @@ function findDip(run, a, b, o) {
       // Deeper than any vibrato swing on either side, and wider than a one-frame glitch.
       if (d >= Math.max(0.7, Math.max(L.swing, R.swing, noteSwing) + 0.3)) {
         span = below(run, x, a, b, k, Math.min(L.mid, R.mid) - d / 2);
+        if (span && haveRms && levelHolds(run, Math.max(a, span.i - 1), Math.min(b - 1, span.j + 1), Math.min(L.rms, R.rms))) span = null;
         if (span) depth = d;
       }
     }
