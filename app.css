@@ -809,10 +809,14 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
   border-radius: var(--r-lg); background: var(--lane-bg); border: 1px solid var(--line); box-shadow: var(--shadow);
 }
 .song-grid canvas { display: block; height: 168px; min-width: 100%; }
-/* While a tune plays, the grid (and its lit block) stays in sight when the view is scrolled down
-   to "Make it a song". */
-.song-view.playing .song-grid { position: sticky; top: var(--safe-top); z-index: 1; }
-.song-cap { margin-top: -6px; font-size: 14px; font-weight: 700; color: var(--muted); text-align: center; }
+.song-pic { display: flex; flex-direction: column; gap: 8px; }
+/* While a tune plays, the grid (and its lit block) stays in sight, on paper of its own, when the
+   view is scrolled down to "Make it a song". The margin and padding cancel out, so nothing moves. */
+.song-view.playing .song-pic {
+  position: sticky; top: var(--safe-top); z-index: 1; margin: -8px -16px; padding: 8px 16px;
+  background-color: var(--bg); background-image: var(--paper-grain);
+}
+.song-cap { font-size: 14px; font-weight: 700; color: var(--muted); text-align: center; }
 .stats.one { grid-template-columns: 1fr; }
 .song-facts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
 .song-facts li { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 10px; align-items: center; font: 700 16px/1.35 var(--font-body); }

@@ -2552,8 +2552,10 @@ function freeCtrl() {
       <h2 class="song-title" tabindex="-1">${shown ? 'Your song' : 'Let’s sing again'}</h2>
       ${
         shown
-          ? `<div class="song-grid" id="songGrid" role="group" aria-label="Note blocks"><canvas role="img" aria-label="${esc(summary)}"></canvas></div>
-             <p class="song-cap" aria-hidden="true">${esc(summary)}</p>`
+          ? `<div class="song-pic">
+               <div class="song-grid" id="songGrid" role="group" aria-label="Note blocks"><canvas role="img" aria-label="${esc(summary)}"></canvas></div>
+               <p class="song-cap" aria-hidden="true">${esc(summary)}</p>
+             </div>`
           : ''
       }
       ${has ? '<button class="btn primary big wide" data-act="f-tune" id="tuneBtn"></button>' : ''}
