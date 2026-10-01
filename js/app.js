@@ -2913,8 +2913,6 @@ const PIECE_LINES = 16; // a part offered on its own: up to this many lines
 let familySongs = []; // library records, oldest first
 let familyState = 'loading'; // 'loading' | 'ready' | 'unavailable'
 let famInput = null; // the hidden file picker
-let pinFails = 0;
-let pinWaitUntil = 0;
 
 const findSong = (id) => SONGS.find((s) => s.id === id) || (familySongs.find((r) => r.id === id) || {}).song || null;
 const findRecord = (id) => familySongs.find((r) => r.id === id) || null;
@@ -2991,22 +2989,73 @@ const shortDate = (iso) => {
 
 // ---- The grown-up PIN ----
 
-// Ask for the grown-up PIN (or set one up the first time), then run then().
-// why: one sentence for the grown-up. back(): where Cancel goes (default: just close).
+// Ask for the grown-up PIN, then run then(). With no PIN yet, the times-table sum comes first and
+// then a new PIN is set: otherwise a child could set the first PIN and use it to turn the warm-up
+// lock off. why: one sentence for the grown-up. back(): where Cancel goes (default: just close).
 function grownUp({ why, then, back = null }) {
-  pinSheet({ mode: store.data.pin ? 'check' : 'new', why, then, back });
+  if (store.data.pin) pinSheet({ mode: 'check', why, then, back });
+  else sumSheet({ why: 'Before you set a PIN, show me you’re a grown-up.', then: () => pinSheet({ mode: 'new', then, back }), back });
 }
 
 function changePin() {
   const back = () => settingsSheet();
-  const setNew = () => pinSheet({ mode: 'new', then: back, back });
-  if (store.data.pin) grownUp({ why: 'Enter your PIN first.', then: setNew, back });
-  else setNew();
+  grownUp({ why: 'Enter your PIN first.', then: store.data.pin ? () => pinSheet({ mode: 'new', then: back, back }) : back, back });
 }
+
+// The times-table check (as in Settings) on a sheet of its own, for grown-up steps that come
+// before there is a PIN: setting the first one, and resetting a forgotten one.
+function sumSheet(o) {
+  const g = o.gate || newGate();
+  const bd = openSheet(
+    `<div class="pin-art" aria-hidden="true">${ICON.lock}</div>
+     <h2>Grown-ups only</h2>
+     <p>${esc(o.why)}</p>
+     <div class="gate">
+       ${g.err ? '<p class="err" role="alert">Not quite. Try this one:</p>' : ''}
+       <label for="gate">Grown-ups: what is ${g.a} × ${g.b}?</label>
+       <input id="gate" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done">
+       <button class="btn secondary" data-act="sum-go">Check</button>
+     </div>
+     <button class="btn text wide" data-act="sum-cancel">Cancel</button>`,
+    {
+      'sum-go': () => check(),
+      'sum-cancel': () => (o.back ? o.back() : closeSheet()),
+    },
+    { label: 'Grown-ups only', key: 'sum', cls: 'pin' }
+  );
+  const input = bd.querySelector('#gate');
+  function check() {
+    if (parseInt(input.value.trim(), 10) === g.a * g.b) return o.then();
+    sumSheet({ ...o, gate: newGate(true) });
+    focusIn('#gate');
+  }
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      check();
+    }
+  });
+  input.focus({ preventScroll: true });
+}
+
+// Wrong PINs: { fails, until, lockouts }, kept in the saved data so a reload doesn't clear a
+// lockout. Every 5 misses lock the PIN for longer: 30 s, 1 min, 2 min, … up to 30 min.
+let pinTimer = 0;
+const pinLock = () => ({ fails: 0, until: 0, lockouts: 0, ...(store.data.pinLock || {}) });
+const setPinLock = (v) => {
+  store.data.pinLock = v;
+  store.save();
+};
+const waitWords = (ms) => {
+  const s = Math.max(1, Math.ceil(ms / 1000));
+  if (s < 60) return `${s} seconds`;
+  const m = Math.ceil(s / 60);
+  return m === 1 ? '1 minute' : `${m} minutes`;
+};
 
 // mode: 'check' | 'new' | 'again' (first: the PIN typed in 'new'). msg: a kind word on a miss.
 function pinSheet(o) {
-  const { mode, why, then, back, first = null, msg = '' } = o;
+  const { mode, why, then, back, first = null } = o;
   if (!pinSupported()) {
     openSheet(
       `<h2>Grown-ups only</h2>
@@ -3017,7 +3066,17 @@ function pinSheet(o) {
     );
     return;
   }
-  const waiting = mode === 'check' && Date.now() < pinWaitUntil;
+  clearTimeout(pinTimer);
+  const left = pinLock().until - Date.now();
+  const waiting = mode === 'check' && left > 0;
+  if (waiting) {
+    const again = { ...o, msg: '' };
+    o = { ...o, msg: `Too many tries. Wait ${waitWords(left)}, then try again.` };
+    pinTimer = setTimeout(() => {
+      if (sheet && sheet.key === 'pin') pinSheet(again);
+    }, left + 200);
+  }
+  const { msg: shownMsg } = o;
   const head =
     mode === 'check'
       ? `<h2>Grown-ups only</h2><p>${esc(why)}</p>`
@@ -3030,8 +3089,8 @@ function pinSheet(o) {
     `<div class="pin-art" aria-hidden="true">${ICON.lock}</div>
      ${head}
      <label class="pin-label" for="pin">${label}</label>
-     <input id="pin" class="pin-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="done"${waiting ? ' disabled' : ''}${msg ? ' aria-describedby="pin-msg"' : ''}>
-     ${msg ? `<p class="err" id="pin-msg" role="alert">${esc(msg)}</p>` : ''}
+     <input id="pin" class="pin-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="done"${waiting ? ' disabled' : ''}${shownMsg ? ' aria-describedby="pin-msg"' : ''}>
+     ${shownMsg ? `<p class="err" id="pin-msg" role="alert">${esc(shownMsg)}</p>` : ''}
      <div class="sheet-actions">
        <button class="btn secondary" data-act="pin-cancel">Cancel</button>
        <button class="btn primary" data-act="pin-go"${waiting ? ' disabled' : ''}>${go}</button>
@@ -3064,7 +3123,7 @@ function pinSheet(o) {
       }
       busy = true;
       store.setPin(await makePin(v));
-      pinFails = 0;
+      setPinLock(null);
       return then();
     }
     busy = true;
@@ -3072,19 +3131,20 @@ function pinSheet(o) {
     busy = false;
     if (!sheet || sheet.key !== 'pin') return; // closed while checking
     if (ok) {
-      pinFails = 0;
+      setPinLock(null);
       return then();
     }
-    pinFails++;
-    if (pinFails >= 5) {
-      pinFails = 0;
-      pinWaitUntil = Date.now() + 30000;
-      setTimeout(() => {
-        if (sheet && sheet.key === 'pin') pinSheet({ ...o, msg: '' });
-      }, 30000);
-      pinSheet({ ...o, msg: 'Too many tries. Wait 30 seconds, then try again.' });
+    const lk = pinLock();
+    lk.fails++;
+    if (lk.fails >= 5) {
+      lk.fails = 0;
+      lk.lockouts++;
+      lk.until = Date.now() + Math.min(30 * 60e3, 30e3 * 2 ** (lk.lockouts - 1));
+      setPinLock(lk);
+      pinSheet({ ...o, msg: '' }); // shows the wait
       return;
     }
+    setPinLock(lk);
     pinSheet({ ...o, msg: 'That’s not the PIN. Try again.' });
     focusIn('#pin');
   }
@@ -3105,8 +3165,12 @@ function pinSheet(o) {
   }
 }
 
+// Resetting a forgotten PIN deletes the family songs, and needs the times-table sum: so it is no
+// way around the PIN. Afterwards a new PIN is set and Settings opens; the action that asked for
+// the PIN is not carried out.
 function forgotPinSheet(o) {
   let armed = false;
+  const toSettings = () => settingsSheet();
   const n = familySongs.length;
   openSheet(
     `<h2>Forgot the PIN?</h2>
@@ -3124,23 +3188,33 @@ function forgotPinSheet(o) {
           btn.textContent = 'Tap to delete songs';
           return;
         }
-        btn.disabled = true;
-        try {
-          await library.clear();
-        } catch (e) {
-          /* nothing to delete, or no storage: the PIN still resets */
-        }
-        for (const r of familySongs) delete store.data.progress['song:' + r.id];
-        familySongs = [];
-        store.setPin(null);
-        pinFails = 0;
-        pinWaitUntil = 0;
-        refreshHome();
-        pinSheet({ ...o, mode: 'new', msg: '' });
+        sumSheet({ why: 'Show me you’re a grown-up to reset the PIN.', then: reset, back: () => forgotPinSheet(o) });
       },
     },
     { label: 'Forgot PIN', key: 'pin-forgot', cls: 'pin-forgot-sheet' }
   );
+  async function reset() {
+    // The PIN changes only once the songs are really gone. Where this browser window has no song
+    // storage at all (Private Browsing), there are none to delete.
+    if (familyState !== 'unavailable') {
+      try {
+        await library.clear();
+      } catch (e) {
+        openSheet(
+          `<h2>PIN not reset</h2><p>I couldn’t delete the family songs. Try again.</p><button class="btn primary wide" data-act="sheet-close">OK</button>`,
+          {},
+          { label: 'PIN not reset', key: 'pin-forgot', cls: 'pin' }
+        );
+        return;
+      }
+    }
+    for (const r of familySongs) delete store.data.progress['song:' + r.id];
+    familySongs = [];
+    store.setPin(null);
+    setPinLock(null);
+    refreshHome();
+    pinSheet({ mode: 'new', then: toSettings, back: toSettings });
+  }
 }
 
 // ---- Adding a song ----

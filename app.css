@@ -403,7 +403,7 @@ button.safe-line svg { display: inline-block; vertical-align: -3px; margin-right
 }
 .gtile { width: 56px; height: 52px; border-radius: 14px; background: var(--surface-2); display: grid; place-items: center; position: relative; }
 .gtile .glyph-svg { width: 44px; height: 28px; }
-.ttl { display: block; font: 800 17px/1.25 var(--font-body); }
+.ttl { display: block; font: 800 17px/1.25 var(--font-body); overflow-wrap: anywhere; }
 .blurb { display: block; font-size: 15px; line-height: 1.35; color: var(--muted); }
 .go { width: 36px; height: 36px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-ink); display: grid; place-items: center; }
 .go svg { width: 20px; height: 20px; }
@@ -953,3 +953,9 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
 .field.link-row.danger b { color: var(--danger); }
 .keep-field p { max-width: 34ch; }
 .sheet.fam h2 { overflow-wrap: anywhere; }
+/* Titles and words from song files can be one long unbroken word: they wrap rather than widen
+   the page or push a sheet off screen. */
+.srow > span { min-width: 0; }
+.sheet h2, .sheet h3, .sheet p, .sheet li, .sheet b, .sheet label, .sheet .eyebrow, .btn > span { overflow-wrap: anywhere; }
+.btn > span { min-width: 0; }
+.select, .text-input { max-width: 100%; }
