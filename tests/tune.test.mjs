@@ -371,7 +371,7 @@ test('findNotes: a singer who drifts between phrases is followed, phrase by phra
   // semitone from where they began, the notes follow them into the new key.
   const phrase = [60, 62, 64, 65, 67, 65, 64, 62, 60];
   const parts = [];
-  [0, 0.3, 0.6, 0.9].forEach((drift, k) => {
+  [0, 0.3, 0.6, 0.9].forEach((drift) => {
     phrase.forEach((p, i) => parts.push({ p, d: 0.3, gap: i === phrase.length - 1 ? 0.8 : 0.05, dev: drift }));
   });
   const res = findNotes(sing(parts).frames);
@@ -416,10 +416,16 @@ test('findNotes: a note change hidden in a stall starts in the stall', () => {
   const res = findNotes(sing(parts, { stalls: [[onset - 0.15, onset + 0.15]] }).frames);
   assert.deepEqual(ps(res), [62, 65]);
   assert.ok(Math.abs(res.notes[1].t0 - onset) < 0.06, `starts at ${res.notes[1].t0}, sung at ${onset}`);
-  // But a note that is only just swelling up after the stall began right there.
-  const late = sing([{ p: 62, d: 0.6, gap: 0.25 }, { p: 65, d: 0.6 }], { rms: true, stalls: [[0.75, 1.15]] });
-  for (const f of late.frames) if (f.m != null && f.t >= 1.15 && f.t < 1.19) f.rms = 0.01;
-  assert.ok(findNotes(late.frames).notes[1].t0 > 1.1);
+  // But a note that is only just swelling up after the stall began right there, whether the
+  // stall was short enough to bridge or long enough to start a new stretch of singing.
+  for (const stall of [[0.75, 1.15], [0.75, 1.35]]) {
+    const late = sing([{ p: 62, d: 0.6, gap: stall[1] - 0.9 }, { p: 65, d: 0.6 }], { rms: true, stalls: [stall] });
+    for (const f of late.frames) if (f.m != null && f.t >= stall[1] && f.t < stall[1] + 0.04) f.rms = 0.02;
+    const t0 = findNotes(late.frames).notes[1].t0;
+    assert.ok(t0 > stall[1] - 0.05, `starts at ${t0}, sung at ${stall[1]}`);
+    const plain = findNotes(late.frames.map(({ t, m }) => ({ t, m }))).notes[1].t0;
+    assert.ok(plain < stall[1] - 0.1, `without a level, the middle of the stall: ${plain}`);
+  }
 });
 
 test('findNotes: talking is not a tune', () => {

@@ -28,7 +28,7 @@ const HOLE_CONSONANT = 0.03; // half a typical consonant before a note, in secon
 const LEVEL_DIP = 0.35; // a level this far under the singing either side is a break between notes
 const SCOOP_LONG = 0.3; // seconds: a slide shorter than this that lands on a note is a scoop into it
 const SLIDE_MAX = 1.5; // semitones between two pieces that may still be one note on a slide
-const SPOKEN = 0.35; // seconds: a take with no note this long, many of them sliding, is speech
+const SPOKEN = 0.35; // seconds: a take of 8 or more sounds, none this long and many sliding, is speech
 const LONELY = 0.3; // seconds of silence either side that leave a sound on its own
 const BLIP_SMEAR = 0.02; // seconds a lone short sound looks longer than it was
 
@@ -69,7 +69,7 @@ export function findNotes(frames, opts = {}) {
 
   // Talking, not singing: a run of syllables, none held as long as a sung note usually is at
   // least once in a tune, and many sliding through their pitch. That is speech, not a tune.
-  if (found.length >= 6 && found.every((n) => n.t1 - n.t0 < SPOKEN) && found.filter((n) => n.slides).length >= 0.25 * found.length) found = [];
+  if (found.length >= 8 && found.every((n) => n.t1 - n.t0 < SPOKEN) && found.filter((n) => n.slides).length >= 0.25 * found.length) found = [];
 
   const { aimed, miss, tuning } = tuneNotes(found);
 
@@ -804,9 +804,11 @@ function runNotes(run, segs, o) {
     const alone = run.lonely && part.a === 0 && part.b === run.x.length;
     if (!n || n.t1 - n.t0 < o.minNote + (alone ? BLIP_SMEAR : 0)) continue;
     // A note heard first just after the browser stalled began somewhere in the stall: its
-    // middle is the best guess (unless the start has been trimmed away since).
-    if (part.a === 0 && run.lead > 0 && run.t[0] === run.first) n.t0 -= run.lead;
-    else if (part.a > 0 && changedInHole(run, part.a)) {
+    // middle is the best guess (unless the start has been trimmed away since, or the sound
+    // is still swelling up, so it had only just begun).
+    if (part.a === 0 && run.lead > 0 && run.t[0] === run.first) {
+      if (!swelling(run, 0)) n.t0 -= run.lead;
+    } else if (part.a > 0 && changedInHole(run, part.a)) {
       // The same inside a run, when the tune moved on to a new note during the stall: a
       // little after the middle, as a new note usually follows a short consonant.
       const prev = notes[notes.length - 1];
@@ -820,17 +822,22 @@ function runNotes(run, segs, o) {
   return { notes, glide };
 }
 
+// Frame k is the start of a sound that is still swelling up: under half the level it reaches
+// within 80 ms. False without rms.
+function swelling(run, k) {
+  const { t, r } = run;
+  let top = 0;
+  for (let j = k + 1; j < t.length && t[j] - t[k] <= 0.08; j++) top = Math.max(top, r[j]);
+  return r[k] >= 0 && r[k] < 0.5 * top;
+}
+
 // Whether a note starting at frame k > 0 began in a hole just before it: a stretch with no
 // frames at all, not even unvoiced ones, so nobody heard what happened there. Not when the
 // first frame after the hole is still at the old note's pitch (the change came after), or
-// when the sound there is still swelling up (under half the level it reaches within 80 ms:
-// the note had only just begun).
+// when the sound there is still swelling up (the note had only just begun).
 function changedInHole(run, k) {
-  const { t, x, r, g } = run;
-  if (!(g[k] === Infinity && t[k] - t[k - 1] > MIN_STALL)) return false;
-  let top = 0;
-  for (let j = k + 1; j < t.length && t[j] - t[k] <= 0.08; j++) top = Math.max(top, r[j]);
-  if (r[k] >= 0 && r[k] < 0.5 * top) return false;
+  const { t, x, g } = run;
+  if (!(g[k] === Infinity && t[k] - t[k - 1] > MIN_STALL) || swelling(run, k)) return false;
   // The new note's level: its frames over the next 0.1 s.
   const ahead = [];
   for (let j = k; j < t.length && t[j] - t[k] <= 0.1; j++) ahead.push(x[j]);
