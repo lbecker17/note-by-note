@@ -10,10 +10,10 @@ import { parseMidi } from '../js/midi.js';
 import { parseXML, decodeXmlBytes, decodeEntities } from '../js/xml.js';
 import { readMusicXML, musicxmlMelody } from '../js/musicxml.js';
 import { crc32 } from '../js/unzip.js';
-import { decodeCp1252 } from '../js/text.js';
-import { importSongFile, importMidi, importMusicXML, sliceSong, songSections, karaokeSyllables, parseChordSymbol, ImportError } from '../js/import.js';
-import { readFamilySongFile, writeFamilySongFile, validateSong, familySongFileName, songId, FAMILY_CREDIT } from '../js/nbn.js';
-import { buildSong, songData, setHarmonizer, SONGS } from '../js/songs.js';
+import { decodeCp1252, cutText, UNSAFE_CHARS } from '../js/text.js';
+import { importSongFile, importMidi, importMusicXML, sliceSong, songSections, karaokeSyllables, parseChordSymbol, ImportError, IMPORT_LIMITS } from '../js/import.js';
+import { readFamilySongFile, writeFamilySongFile, validateSong, familySongFileName, cleanFileName, songId, FAMILY_CREDIT } from '../js/nbn.js';
+import { buildSong, songData, songGlyph, setHarmonizer, SONGS } from '../js/songs.js';
 import { parseMelody, parseLyrics } from '../js/music.js';
 
 // ---------- MIDI files, byte by byte ----------
@@ -388,6 +388,161 @@ test('karaoke syllables and chord names', () => {
   assert.equal(parseChordSymbol('Doe'), null);
 });
 
+// ---------- MIDI: melismas, fills, played note lengths, pickups ----------
+
+// Syllable events on the starts of the listed notes (index -> text).
+const wordsAt = (starts, words, ppq = PPQ) => Object.entries(words).map(([i, w]) => [Math.round(starts[i] * ppq), lyricEv(utf8(w))]);
+
+test('MIDI: long melismas are held, and a fill after a rest is left out', () => {
+  // Ode to Joy in eighths, sung on one syllable: 8 notes after a word's last syllable, and
+  // 16 notes in the middle of a hyphenated word ("Glo- … ri- a"). No extender exists in MIDI.
+  const run8 = [E4, E4, F4, G4, G4, F4, E4, D4].map((m) => [m, 0.5]);
+  const run16 = [...run8, ...[C4, C4, D4, E4, E4, D4, D4, C4].map((m) => [m, 0.5])];
+  const mel = tune([[C4, 1], [C4, 1], [G4, 1], [G4, 1], ...run8, [A4, 1], [A4, 1], [G4, 2], [F4, 1], ...run16, [E4, 1], [D4, 1], [C4, 2]]);
+  const lyr = wordsAt(mel.starts, { 0: 'Sing ', 1: 'a ', 2: 'lit-', 3: 'tle ', 12: 'song ', 13: 'for ', 14: 'me,\r', 15: 'Glo-', 32: 'ri-', 33: 'a ', 34: 'now.' });
+  const r = importMidi(smf(0, PPQ, [trackBytes([...mel.ev, ...lyr])]));
+  const hold = (n) => Array(n).fill('~').join(' ');
+  assert.equal(parseLyrics(r.song.lyrics).join(' '), `Sing a lit- tle ${hold(8)} song for me, Glo- ${hold(16)} ri- a now.`);
+  assert.ok(!r.warnings.some((w) => /Left out|Ran out/.test(w)), r.warnings.join(' | '));
+  assertPlayable(r.song);
+
+  // A lead instrument plays a lick in the rest after a line: that's not the singer.
+  const line1 = tune([...TW1.slice(0, 6), [G4, 1], ['r', 1], ...TW2]);
+  const lick = tune([[C5, 0.25], [D5, 0.25], [C5, 0.25]], { at: 7.25 });
+  const words = wordsAt(line1.starts, Object.fromEntries('Up we go to the big tree, down we come to you and me.'.split(' ').map((w, i) => [i, w + ' '])));
+  const f = importMidi(smf(0, PPQ, [trackBytes([...line1.ev, ...lick.ev, ...words])]));
+  assert.equal(parseLyrics(f.song.lyrics).join(' '), 'Up we go to the big tree, down we come to you and me.');
+  assert.equal(notesOnly(f.song.melody).join(' '), 'C4 C4 G4 G4 A4 A4 G4 r/1 F4 F4 E4 E4 D4 D4 C4/2');
+  assert.ok(f.warnings.some((w) => /^Left out 3 notes with no words/.test(w)), f.warnings.join(' | '));
+});
+
+test('MIDI: notes held for 80% of their length keep their written length', () => {
+  // Dotted, long and tied-over notes, and one real rest, all played at 80%.
+  const items = [[E4, 1.5], [D4, 0.5], [C4, 2], [D4, 1], [E4, 1], [F4, 1], ['r', 1], [G4, 5], [F4, 1], [E4, 1], [D4, 1], [C4, 4]];
+  const r = importMidi(smf(0, PPQ, [trackBytes(tune(items, { legato: 0.8 }).ev)]));
+  assert.equal(notesOnly(r.song.melody).join(' '), 'E4/1.5 D4/0.5 C4/2 D4 E4 F4 r/1 G4/5 F4 E4 D4 C4/4');
+
+  // A karaoke line marker keeps a five-bar line whole, even with a comma and a rest in it.
+  const long = [[C4, 1], [C4, 1], [G4, 1], [G4, 1], [A4, 1], [A4, 1], [G4, 1.5], ['r', 0.5], ...TW2, [E4, 1], [D4, 1], [C4, 2]];
+  const mel = tune([...long, ...TW3, ...TW4]);
+  const text = 'Hap-py lit-tle bells ring out, all a-long the snow-y road and back home, Ring-ing on and on for you, and for me, sing-ing all the way.';
+  const syl = text.split(' ').flatMap((w) => w.split(/(?<=-)/));
+  assert.equal(syl.length, 32);
+  const mark = { 0: '\\', 17: '/', 24: '/' };
+  const lyr = syl.map((s, i) => [Math.round(mel.starts[i] * PPQ), textEv(ascii((mark[i] || '') + s + (s.endsWith('-') ? '' : ' ')))]);
+  const k = importMidi(smf(0, PPQ, [trackBytes([...mel.ev, ...lyr])]), { fileName: 'bells.kar' });
+  assert.deepEqual(k.song.lyrics.split('\n'), ['Hap- py lit- tle bells ring out, all a- long the snow- y road and back home,', 'Ring- ing on and on for you,', 'and for me, sing- ing all the way.']);
+});
+
+test('MIDI: a pickup written as a 1/4 bar is a short first bar, not a change of time', () => {
+  const mel = tune([[G4, 1], ...TW1, ...TW2]);
+  const words = 'Now the sun is up so high, shin-ing on the gar-den wall.'.split(' ').flatMap((w) => w.split(/(?<=-)/));
+  const lyr = words.map((w, i) => [Math.round(mel.starts[i] * PPQ), lyricEv(utf8(w.endsWith('-') ? w : w + ' '))]);
+  const r = importMidi(smf(0, PPQ, [trackBytes([[0, timeSigEv(1, 4)], [PPQ, timeSigEv(4, 4)], ...mel.ev, ...lyr])]));
+  assert.ok(!r.warnings.some((w) => /time signature/.test(w)), r.warnings.join(' | '));
+  assert.equal(r.song.meter, 4);
+  assert.ok(r.song.melody.startsWith('G4 | C4 C4 G4 G4 | A4 A4 G4/2'), r.song.melody);
+  assert.ok(parseMelody(r.song.melody).phrases[0][1] >= 8, 'the first line runs on past the pickup');
+});
+
+test('MIDI: a whole line in one karaoke event, however long, keeps its words', () => {
+  const mel = tune([...TW1, ...TW2, ...TW3, ...TW4]);
+  const lines = [
+    '\\Wonderful glittering starlight twinkling everywhere tonight brightly',
+    '/Over the rooftops and chimneys the candles are glowing',
+    '\\Sleepy little children are dreaming of summer',
+    '/Under their blankets the kittens are purring softly',
+  ];
+  assert.ok(lines[0].length > 64);
+  const firsts = [0, 7, 14, 21];
+  const lyr = lines.map((l, i) => [Math.round(mel.starts[firsts[i]] * PPQ), textEv(ascii(l))]);
+  const r = importMidi(smf(0, PPQ, [trackBytes([...mel.ev, ...lyr])]), { fileName: 'stars.kar' });
+  assert.equal(parseLyrics(r.song.lyrics).slice(0, 7).join(' '), 'Wonderful glittering starlight twinkling everywhere tonight brightly');
+  assert.ok(r.warnings.some((w) => /a whole line at a time/.test(w)), r.warnings.join(' | '));
+  assertPlayable(r.song);
+});
+
+test('MIDI: a harmony line in the tune\'s track is flagged for the grown-up', () => {
+  // Twinkle with a descant a third above, on the same channel, in its second half. Nothing in
+  // the file says which line is the tune, so the top note is kept and the grown-up is told.
+  const mel = tune([...TW1, ...TW2, ...TW3, ...TW4]);
+  const descant = tune([...TW3, ...TW4].map(([m, d]) => [m + 4, d]), { at: 16 });
+  const words = 'Sing a song of stars to-night, shin-ing on the hill so bright, hear the night birds call to you, all the dark-ness through.'.split(' ').flatMap((w) => w.split(/(?<=-)/));
+  const lyr = words.map((w, i) => [Math.round(mel.starts[i] * PPQ), lyricEv(utf8(w.endsWith('-') ? w : w + ' '))]);
+  const r = importMidi(smf(0, PPQ, [trackBytes([...mel.ev, ...descant.ev, ...lyr])]));
+  assert.ok(r.warnings.some((w) => /^From bar 5, the tune’s track often plays two notes at once/.test(w)), r.warnings.join(' | '));
+  assertPlayable(r.song);
+});
+
+test('MIDI: long breaks shrink to one bar, and the chords stay with the tune', () => {
+  const mel = tune([...TW1, ['r', 24], ...TW2]);
+  const words = 'Up we go to the big tree, down we come to you and me.'.split(' ');
+  const lyr = words.map((w, i) => [Math.round(mel.starts[i] * PPQ), lyricEv(utf8(w + ' '))]);
+  const marks = [[0, 'C'], [32, 'G']].map(([b, c]) => [b * PPQ, meta(0x06, ascii(c))]);
+  const r = importMidi(smf(0, PPQ, [trackBytes([...mel.ev, ...lyr, ...marks])]));
+  assert.ok(r.warnings.includes('A long break with no singing was shortened to one bar.'), r.warnings.join(' | '));
+  assert.equal(parseMelody(r.song.melody).totalBeats, 20);
+  assert.equal(r.song.chords, 'C/4 | C/4 | C/4 | G/4 | G/4');
+});
+
+// ---------- MIDI files made to be awkward ----------
+
+test('MIDI: a RIFF length with the top bit set, and note-ons stacked on one key', () => {
+  // The first chunk claims 0xFFFFFFF8 bytes: reading it as a negative number used to loop forever.
+  const inner = smf(0, 96, [trackBytes(tune(TW1, { ppq: 96 }).ev)]);
+  const le32 = (n) => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255];
+  const riff = (len) => new Uint8Array([...ascii('RIFF'), ...le32(inner.length + 24), ...ascii('RMID'), ...ascii('LIST'), ...le32(len), ...ascii('INFO'), ...ascii('data'), ...le32(inner.length), ...inner]);
+  assert.throws(() => parseMidi(riff(0xfffffff8)), /no MIDI data/);
+  assert.equal(parseMidi(riff(4)).tracks[0].notes.length, 7, 'a LIST chunk before the data is skipped');
+
+  // Three note-ons on one key, then three note-offs: each off ends the oldest note.
+  const body = [0, 0x90, 60, 90, 10, 60, 91, 10, 60, 92, 10, 60, 0, 10, 60, 0, 10, 60, 0, 0, 0xff, 0x2f, 0];
+  const t = parseMidi(smf(0, 96, [body])).tracks[0];
+  assert.deepEqual(
+    t.notes.map((n) => [n.tick, n.endTick, n.vel]),
+    [[0, 30, 90], [10, 40, 91], [20, 50, 92]]
+  );
+  // Tens of thousands of them stay quick (each note-off used to shift the whole queue).
+  const n = 60000;
+  const stacked = [0, 0x90];
+  for (let i = 0; i < n; i++) stacked.push(60, 90, 0);
+  for (let i = 0; i < n; i++) stacked.push(60, 0, 0);
+  stacked.pop();
+  stacked.push(0xff, 0x2f, 0);
+  const t0 = performance.now();
+  assert.equal(parseMidi(smf(0, 96, [stacked])).tracks[0].notes.length, n);
+  assert.ok(performance.now() - t0 < 1000, 'stacked note-ons are matched in constant time');
+});
+
+test('MIDI: notes, text and tempo floods are capped while the file is read', async () => {
+  const { MIDI_LIMITS } = await import('../js/midi.js');
+  const saved = { ...MIDI_LIMITS };
+  try {
+    Object.assign(MIDI_LIMITS, { notes: 10, texts: 5, metas: 3 });
+    const mel = tune([...TW1, ...TW2]);
+    const lyr = 'Up we go to the big tree'.split(' ').map((w, i) => [Math.round(mel.starts[i] * PPQ), lyricEv(utf8(w + ' '))]);
+    const tempos = [100, 101, 102, 103, 104].map((b, i) => [i * PPQ, tempoEv(b)]);
+    const midi = parseMidi(smf(0, PPQ, [trackBytes([...tempos, ...mel.ev, ...lyr])]));
+    assert.equal(midi.tracks[0].notes.length, 10);
+    assert.equal(midi.tracks[0].texts.length, 5);
+    assert.equal(midi.tempos.length, 3);
+    for (const what of ['notes; only the first 10', 'text events; only the first 5', 'tempo changes; only the first 3']) {
+      assert.ok(midi.warnings.some((w) => w.includes(what)), what);
+    }
+  } finally {
+    Object.assign(MIDI_LIMITS, saved);
+  }
+
+  // Syllables are capped too, and so are the tracks and channels weighed as the tune.
+  assert.equal(karaokeSyllables([{ beat: 0, text: 'one two three four five' }, { beat: 1, text: 'six seven' }], 3).length, 3);
+  const tracks = [];
+  for (let i = 0; i < 70; i++) tracks.push(trackBytes(tune([[C4 + (i % 12), 1]], { ch: i % 9 }).ev));
+  const many = importMidi(smf(1, PPQ, tracks));
+  assert.ok(many.choices.length <= 64, `${many.choices.length} choices`);
+  // A file whose notes are all cut to nothing has no notes, not "only drums".
+  assert.throws(() => importMidi(smf(0, 96, [[0, 0x90, 60, 90, 0, 60, 0, 0, 0xff, 0x2f, 0]])), /has no notes/);
+});
+
 // ---------- XML ----------
 
 test('XML reader: entities, CDATA, comments, namespaces, and no DTD processing', () => {
@@ -618,6 +773,194 @@ test('MusicXML: compressed .mxl through META-INF/container.xml', async () => {
   assert.equal(plain.song.id, r.song.id);
 });
 
+// ---------- MusicXML: melismas, jumps, verses and pickups ----------
+
+// Small scores in 4/4 with 2 divisions a beat. n('q', 'C4', 'one', 'two'): a quarter note C4
+// with "one" on lyric line 1 and "two" on line 2 (null: no syllable on that line).
+const LEN = { e: [1, 'eighth'], q: [2, 'quarter'], h: [4, 'half'], w: [8, 'whole'] };
+const n = (len, p, ...lyrics) => xnote({ p, dur: LEN[len][0], type: LEN[len][1], lyrics: lyrics.map((t) => (typeof t === 'string' ? L(t) : t)) });
+const rest = (len) => xnote({ rest: true, dur: LEN[len][0], type: LEN[len][1] });
+const bar = (num, body) => ({ attrs: `number="${num}"`, body: (num === 1 ? '<attributes><divisions>2</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>' : '') + body });
+const voiceScore = (measures, name = 'Voice') => partwise('Test', [{ id: 'P1', name, measures }]);
+const sung = (r) => parseLyrics(r.song.lyrics).join(' ');
+const lineStarts = (r) => {
+  const lyr = parseLyrics(r.song.lyrics);
+  return parseMelody(r.song.melody).phrases.map(([s]) => lyr[s]);
+};
+const sound = (attrs, words = '') => `<direction>${words ? `<direction-type><words>${words}</words></direction-type>` : ''}<sound ${attrs}/></direction>`;
+const words = (w) => `<direction><direction-type><words>${w}</words></direction-type></direction>`;
+const FWD = '<barline location="left"><repeat direction="forward"/></barline>';
+const BACK = '<barline location="right"><repeat direction="backward"/></barline>';
+const ending = (num, type, side = 'left', more = '') => `<barline location="${side}"><ending number="${num}" type="${type}"/>${more}</barline>`;
+
+test('MusicXML: a long melisma with no extender line is sung; a cue cut off by rests is not', () => {
+  // Ode to Joy in eighths on "-py", as engravers leave the extender off. Bar 5 is an
+  // instrumental cue in the voice part, after a bar's rest.
+  const run = ['G4', 'F4', 'E4', 'D4', 'C4', 'C4', 'D4', 'E4'].map((p) => n('e', p)).join('');
+  const xml = voiceScore([
+    bar(1, n('q', 'E4', 'Sing') + n('q', 'E4', 'a') + n('q', 'F4', L('hap', 'begin')) + n('q', 'G4', L('py', 'end'))),
+    bar(2, run),
+    bar(3, n('q', 'E4', 'all') + n('q', 'D4', 'day') + n('h', 'D4', 'long.')),
+    bar(4, rest('w')),
+    bar(5, n('q', 'C4') + n('q', 'D4') + rest('h')),
+    bar(6, n('q', 'E4', 'Sing') + n('q', 'E4', 'it') + n('h', 'F4', 'now.')),
+  ]);
+  const r = importMusicXML(xml);
+  assert.equal(sung(r), 'Sing a hap- py ~ ~ ~ ~ ~ ~ ~ ~ all day long. Sing it now.');
+  assert.ok(r.warnings.some((w) => /^Left out 2 notes with no words .*from bar 5/.test(w)), r.warnings.join(' | '));
+  assertPlayable(r.song);
+});
+
+test('MusicXML: D.S. al Coda and D.C. al Fine are followed, and the jump sings the next verse', () => {
+  // Twinkle: an intro bar, segno, To Coda after bar 3, D.S. al Coda at the end of bar 5.
+  const xml = voiceScore([
+    bar(1, rest('w')),
+    bar(2, sound('segno="s1"') + n('q', 'C4', 'Stars', 'Moon') + n('q', 'C4', 'up', 'up') + n('q', 'G4', 'so', 'so') + n('q', 'G4', 'high', 'bright')),
+    bar(3, n('q', 'A4', 'shine', 'glow') + n('q', 'A4', 'on', 'on') + n('h', 'G4', 'me,', 'me,') + sound('tocoda="c1"', 'To Coda')),
+    bar(4, n('q', 'F4', 'all') + n('q', 'F4', 'the') + n('q', 'E4', 'night') + n('q', 'E4', 'long')),
+    bar(5, n('q', 'D4', 'you') + n('q', 'D4', 'and') + n('h', 'C4', 'me.') + sound('dalsegno="s1"', 'D.S. al Coda')),
+    bar(6, sound('coda="c1"') + n('q', 'G4', 'then') + n('q', 'G4', 'we') + n('q', 'F4', 'go') + n('q', 'F4', 'home')),
+    bar(7, n('q', 'E4', 'to') + n('q', 'E4', 'the') + n('h', 'C4', 'end.')),
+  ]);
+  const r = importMusicXML(xml);
+  assert.equal(sung(r), 'Stars up so high shine on me, all the night long you and me. Moon up so bright glow on me, then we go home to the end.');
+  assert.ok(lineStarts(r).includes('Moon'), 'the D.S. starts a new line');
+  assert.ok(!r.warnings.some((w) => /Sung through|not followed/.test(w)), r.warnings.join(' | '));
+  assertPlayable(r.song);
+
+  // The same jumps written only as words, with no <sound>: D.C. al Fine.
+  const dc = voiceScore([
+    bar(1, n('q', 'C4', 'Row', 'Sail') + n('q', 'C4', 'the', 'the') + n('q', 'G4', 'boat', 'ship') + n('q', 'G4', 'home', 'home')),
+    bar(2, n('q', 'A4', 'row', 'sail') + n('q', 'A4', 'it', 'it') + n('h', 'G4', 'slow,', 'slow,') + words('Fine')),
+    bar(3, n('q', 'F4', 'down') + n('q', 'F4', 'the') + n('q', 'E4', L('riv', 'begin')) + n('q', 'E4', L('er', 'end'))),
+    bar(4, n('q', 'D4', 'we') + n('q', 'D4', 'both') + n('h', 'C4', 'go,') + words('D.C. al Fine')),
+  ]);
+  assert.equal(sung(importMusicXML(dc)), 'Row the boat home row it slow, down the riv- er we both go, Sail the ship home sail it slow,');
+});
+
+test('MusicXML: pickups take the right verse at a repeat and into a chorus written once', () => {
+  // Three verses in a repeat (Twinkle). Each verse ends with the pickup into the chorus, whose
+  // words are written once, on line 1. The 1st ending ends the chorus and holds the pickup into
+  // the next verse on lines 2 and 3; the 2nd ending ends the song.
+  const xml = voiceScore([
+    bar(1, FWD + n('q', 'C4', 'Here', 'There', 'Now') + n('q', 'C4', 'we', 'they', 'you') + n('q', 'G4', 'go', 'go', 'go') + n('q', 'G4', 'now', 'too', 'home')),
+    bar(2, n('q', 'A4', 'on', 'on', 'by') + n('q', 'A4', 'the', 'the', 'the') + n('q', 'G4', 'road,', 'way,', 'sea,') + n('q', 'G4', 'Oh')),
+    bar(3, n('q', 'F4', 'sing') + n('q', 'F4', 'it') + n('q', 'E4', 'loud') + n('q', 'E4', 'and')),
+    bar(4, ending('1, 2', 'start') + n('q', 'D4', 'sing') + n('q', 'D4', 'it') + n('q', 'C4', 'clear.') + n('q', 'C4', null, 'And', 'So') + ending('1, 2', 'stop', 'right', '<repeat direction="backward"/>')),
+    bar(5, ending('3', 'start') + n('q', 'D4', 'sing') + n('q', 'D4', 'it') + n('h', 'C4', 'out!') + ending('3', 'discontinue', 'right')),
+  ]);
+  const r = importMusicXML(xml);
+  assert.equal(
+    sung(r),
+    'Here we go now on the road, Oh sing it loud and sing it clear. And There they go too on the way, Oh sing it loud and sing it clear. So Now you go home by the sea, Oh sing it loud and sing it out!'
+  );
+  assert.ok(lineStarts(r).includes('And') && lineStarts(r).includes('So'), 'a verse starts at its pickup');
+  assertPlayable(r.song);
+});
+
+test('MusicXML: verses stacked before a repeated chorus are each sung, with the chorus twice', () => {
+  const xml = voiceScore([
+    bar(1, n('q', 'E4', 'Rain', 'Snow', 'Sun') + n('q', 'E4', 'is', 'is', 'is') + n('q', 'F4', 'on', 'on', 'on') + n('q', 'G4', 'the', 'the', 'the')),
+    bar(2, n('q', 'G4', 'roof', 'road', 'lake') + n('q', 'F4', 'and', 'and', 'and') + n('q', 'E4', 'the', 'the', 'the') + n('q', 'D4', 'hill,', 'mill,', 'sea,')),
+    bar(3, FWD + n('q', 'C4', 'sing') + n('q', 'C4', 'a') + n('q', 'D4', 'song') + n('q', 'E4', 'for')),
+    bar(4, n('q', 'E4', 'you') + n('q', 'D4', 'and') + n('h', 'D4', 'me.') + BACK),
+  ]);
+  const r = importMusicXML(xml);
+  const chorus = 'sing a song for you and me. sing a song for you and me.';
+  assert.equal(sung(r), `Rain is on the roof and the hill, ${chorus} Snow is on the road and the mill, ${chorus} Sun is on the lake and the sea, ${chorus}`);
+  assert.ok(r.warnings.includes('Sung through 3 times, once for each verse.'), r.warnings.join(' | '));
+});
+
+test('MusicXML: a verse\'s extra syllable written in a second voice', () => {
+  // Verse 2 needs two notes where verse 1 holds one: the half note is split in voice 2,
+  // which carries only line 2.
+  const split = `<backup><duration>4</duration></backup>${xnote({ p: 'G4', dur: 2, type: 'quarter', voice: 2, lyrics: [null, L('the')] })}${xnote({ p: 'G4', dur: 2, type: 'quarter', voice: 2, lyrics: [null, L('trees,')] })}`;
+  const xml = voiceScore([
+    bar(1, n('q', 'C4', 'Bells', 'Birds') + n('q', 'C4', 'are', 'are') + n('q', 'G4', L('ring', 'begin'), L('sing', 'begin')) + n('q', 'G4', L('ing', 'end'), L('ing', 'end'))),
+    bar(2, n('q', 'A4', 'all', 'up') + n('q', 'A4', 'through', 'in') + n('h', 'G4', 'town,') + split),
+    bar(3, n('q', 'F4', 'far', 'hear') + n('q', 'F4', 'and', 'them') + n('q', 'E4', 'near', 'sing') + n('q', 'E4', 'now.', 'now.')),
+  ]);
+  const r = importMusicXML(xml);
+  assert.equal(sung(r), 'Bells are ring- ing all through town, far and near now. Birds are sing- ing up in the trees, hear them sing now.');
+  assert.equal(r.choices.find((c) => c.chosen).id, 'p1v1');
+  assertPlayable(r.song);
+});
+
+test('MusicXML: the tune is the soprano even when the alto has one more word', () => {
+  const sop = [bar(1, n('q', 'G4', 'Shine') + n('q', 'G4', 'on') + n('q', 'A4', 'us') + n('q', 'A4', 'all')), bar(2, n('q', 'G4', 'bright') + n('q', 'F4', 'star') + n('h', 'E4', 'light.'))];
+  const alto = [bar(1, n('q', 'E4', 'Shine') + n('q', 'E4', 'on') + n('q', 'F4', 'us') + n('q', 'F4', 'all')), bar(2, n('q', 'E4', 'bright') + n('q', 'D4', 'star') + n('q', 'C4', 'light.') + n('q', 'C4', 'yeah!'))];
+  const r = importMusicXML(partwise('Echo', [{ id: 'P1', name: 'Soprano', measures: sop }, { id: 'P2', name: 'Alto', measures: alto }]));
+  assert.equal(r.choices.find((c) => c.chosen).label, 'Soprano');
+  assert.ok(r.warnings.includes('The tune is from Soprano.'), r.warnings.join(' | '));
+  assert.equal(notesOnly(r.song.melody).join(' '), 'G4 G4 A4 A4 G4 F4 E4/2');
+
+  // Two parts with the same words and no telling names: the higher line.
+  const low = sop.map((m) => ({ ...m, body: m.body.replace(/<octave>4<\/octave>/g, '<octave>3</octave>') }));
+  const two = importMusicXML(partwise('Duet', [{ id: 'P1', name: 'Singer 1', measures: low }, { id: 'P2', name: 'Singer 2', measures: sop }]));
+  assert.equal(two.choices.find((c) => c.chosen).label, 'Singer 2');
+});
+
+test('MusicXML: verse numbers, styled syllables, elisions and a syllable on a grace note', () => {
+  const ly = (num, syllabic, ...texts) => `<lyric number="${num}"><syllabic>${syllabic}</syllabic>${texts.join('')}</lyric>`;
+  const t = (s) => `<text>${s}</text>`;
+  const pitch = (p) => `<pitch><step>${p[0]}</step><octave>${p[1]}</octave></pitch>`;
+  const note = (p, lyrics) => `<note>${pitch(p)}<duration>2</duration><voice>1</voice><type>quarter</type>${lyrics}</note>`;
+  const grace = `<note><grace slash="yes"/>${pitch('B3')}<voice>1</voice><type>eighth</type>${ly(1, 'single', t('Oh,'))}${ly(2, 'single', t('Hey,'))}</note>`;
+  const xml = voiceScore([
+    bar(
+      1,
+      note('C4', ly(1, 'single', t('1. Sing')) + ly(2, 'single', t('2. Ring'))) +
+        note('D4', ly(1, 'begin', t('Ma'), '<text font-style="italic">r</text>') + ly(2, 'begin', t('ding'))) +
+        note('E4', ly(1, 'end', t('y')) + ly(2, 'end', t('dong'))) +
+        note('F4', ly(1, 'single', t('to'), '<elision> </elision>', t('a')) + ly(2, 'single', t('for')))
+    ),
+    bar(2, grace + note('C4', '') + note('D4', ly(1, 'single', t('my')) + ly(2, 'single', t('my'))) + n('h', 'E4', 'dear.', 'friend.')),
+  ]);
+  const r = importMusicXML(xml);
+  assert.equal(sung(r), 'Sing Mar- y to‿a Oh, my dear. Ring ding- dong for Hey, my friend.');
+  assertPlayable(r.song);
+});
+
+test('MusicXML: a plain .zip from a Mac, and an .mxl that unzips too big', async () => {
+  // macOS "Compress" adds a resource-fork copy, which can come first.
+  const mac = zip([
+    { name: '__MACOSX/._Morning Light.musicxml', data: [0, 5, 22, 7, 0, 2, 0, 0, 77, 97, 99] },
+    { name: 'Morning Light.musicxml', data: utf8(NB_XML), deflate: true },
+  ]);
+  assert.equal((await importSongFile(mac, 'Morning Light.zip')).song.melody, NB_MELODY);
+
+  // A few kilobytes that unzip to more than a plain score may be.
+  const big = new Uint8Array(IMPORT_LIMITS.xmlBytes + 1).fill(0x20);
+  big.set(utf8(NB_XML));
+  const bomb = zip([{ name: 'score.musicxml', data: big, deflate: true }]);
+  assert.ok(bomb.length < 100 * 1024);
+  await assert.rejects(importSongFile(bomb, 'big.mxl'), (e) => e instanceof ImportError && /too big/.test(e.message));
+});
+
+test('MusicXML: huge or hostile scores are cut down, and file text is cleaned for display', () => {
+  // A long measure repeated 16 times stops at the note limit, with one warning.
+  const many = Array.from({ length: 1000 }, (_, i) => xnote({ p: ['C4', 'D4', 'E4', 'F4'][i % 4], dur: 1, type: 'eighth' })).join('');
+  const rep = importMusicXML(voiceScore([bar(1, many + '<barline location="right"><repeat direction="backward" times="16"/></barline>')]));
+  assert.equal(rep.warnings.filter((w) => /only its first 12000 notes/.test(w)).length, 1, rep.warnings.join(' | '));
+
+  // Control characters and bidi overrides in part names and bar numbers never reach the screen.
+  const sop = [1, 2, 3].map((k) => ({ attrs: `number="‮${k}<b>"`, body: (k === 1 ? '<attributes><divisions>2</divisions></attributes>' : '') + n('q', 'C4', 'la') + n('q', 'D4', 'la') + n('h', 'E4', 'la') }));
+  const evil = importMusicXML(partwise('X', [{ id: 'P1', name: 'Lead‮evil\u0007', measures: sop }, { id: 'P2', name: 'B', measures: sop }]));
+  const shown = [...evil.choices.map((c) => c.label), ...evil.warnings, ...evil.sections.flatMap((s) => [s.firstBar, s.lastBar])];
+  assert.ok(shown.every((x) => !UNSAFE_CHARS.test(x)), JSON.stringify(shown));
+  assert.equal(evil.choices[0].label, 'Leadevil');
+  assert.equal(evil.sections[0].firstBar, '1<b>');
+
+  // At most 64 choices, 100 parts and 16 verses.
+  const voices = Array.from({ length: 70 }, (_, i) => `${i ? '<backup><duration>2</duration></backup>' : ''}${xnote({ p: 'C4', dur: 2, type: 'quarter', voice: i + 1 })}`).join('');
+  assert.equal(importMusicXML(voiceScore([bar(1, voices)])).choices.length, 64);
+  const parts = Array.from({ length: 101 }, (_, i) => ({ id: `P${i + 1}`, name: `Part ${i + 1}`, measures: [bar(1, n('w', 'C4', 'la'))] }));
+  assert.ok(importMusicXML(partwise('Crowd', parts)).warnings.includes('This score has 101 parts; only the first 100 were read.'));
+  const verses = Array.from({ length: 40 }, (_, i) => L(`v${i}`));
+  const v = importMusicXML(voiceScore([bar(1, xnote({ p: 'C4', dur: 2, type: 'quarter', lyrics: verses }) + n('q', 'D4', 'a') + n('q', 'E4', 'b') + n('q', 'F4', 'c'))]));
+  assert.ok(v.warnings.includes('Only the first 16 verses were used.'), v.warnings.join(' | '));
+});
+
 // ---------- Long songs: sections ----------
 
 test('long songs offer sections of lines, and a section is a song of its own', () => {
@@ -742,6 +1085,33 @@ test('.nbn files: round trip, and strict checks on files that arrive from elsewh
   assert.ok(p2.ok, p2.error);
   assert.deepEqual(p2.song, plain);
   assert.equal(p2.source, null);
+});
+
+test('.nbn files: a melody ending in a line break, and long names with emoji', async () => {
+  // A trailing "//" used to make an empty last line that crashed the player.
+  const song = { id: '', title: 'Ends with a break', credit: FAMILY_CREDIT, key: 'C', bpm: 100, meter: 4, melody: 'C4 D4 E4 F4 // G4 A4 B4 C5 // r/2', lyrics: 'a b c d e f g h', chords: null };
+  song.id = songId(song);
+  const back = readFamilySongFile(writeFamilySongFile(song));
+  assert.ok(back.ok, back.error);
+  assert.equal(parseMelody(back.song.melody).phrases.length, 2);
+  assertPlayable(back.song);
+  assert.equal(songSections(back.song).stats.lines, 2);
+  assert.equal(songGlyph(back.song).pts.length, 4);
+  const viaImport = await importSongFile(enc.encode(writeFamilySongFile(song)), 'break.nbn');
+  assert.equal(viaImport.stats.lines, 2);
+
+  // Names cut to length never end in half an emoji, so the importer's own output saves.
+  const name = 'a'.repeat(159) + '😀😀.mid';
+  assert.ok(!UNSAFE_CHARS.test(cleanFileName(name)));
+  const r = importMidi(smf(0, PPQ, [trackBytes(tune(TW1).ev)]), { fileName: name });
+  assert.equal(r.source.fileName, 'a'.repeat(159));
+  assert.ok(writeFamilySongFile(r.song, r.source));
+  const file = familySongFileName({ title: 'a' + '😀'.repeat(40) });
+  assert.ok(!UNSAFE_CHARS.test(file), file);
+  assert.equal(cutText('ab😀', 3), 'ab');
+  // A very long syllable is cut for the song too, whole emoji only.
+  const longWord = importMusicXML(voiceScore([bar(1, n('q', 'C4', 'a' + '😀'.repeat(30)) + n('q', 'D4', 'b') + n('q', 'E4', 'c') + n('q', 'F4', 'd'))]));
+  assert.ok(longWord.fits, longWord.warnings.join(' | '));
 });
 
 // ---------- songs.js with family songs ----------

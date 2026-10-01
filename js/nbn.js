@@ -9,7 +9,7 @@
 // from the content, and the credit is always the family-song line.
 
 import { parseMelody, parseLyrics, parseChords, parsePitch } from './music.js';
-import { UNSAFE_CHARS, UNSAFE_CHARS_G, decodeUtf8, stripUtf8Bom, toBytes } from './text.js';
+import { UNSAFE_CHARS, UNSAFE_CHARS_G, cutText, decodeUtf8, stripUtf8Bom, toBytes } from './text.js';
 
 export const NBN_FORMAT = 'note-by-note-song';
 export const NBN_VERSION = 1;
@@ -168,7 +168,7 @@ function validateSource(src) {
 // Just the file's own name: no folders, nothing unsafe.
 export function cleanFileName(name) {
   const base = String(name || '').split(/[\\/]/).pop();
-  return base.replace(UNSAFE_CHARS_G, '').replace(/[\t\n\r]/g, ' ').trim().slice(0, SONG_LIMITS.fileName);
+  return cutText(base.replace(UNSAFE_CHARS_G, '').replace(/[\t\n\r]/g, ' ').trim(), SONG_LIMITS.fileName);
 }
 
 export function makeSource(kind, fileName, now = new Date()) {
@@ -218,13 +218,12 @@ export function readFamilySongFile(data) {
 
 // A file name for sending a song: its title, without characters file systems dislike.
 export function familySongFileName(song) {
-  const base = String((song && song.title) || '')
+  const name = String((song && song.title) || '')
     .replace(UNSAFE_CHARS_G, '')
     .replace(/[\\/:*?"<>|\t\n\r]+/g, ' ')
     .replace(/^[.\s]+|[.\s]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .slice(0, 60)
-    .trim();
+    .replace(/\s+/g, ' ');
+  const base = cutText(name, 60).trim();
   return (base || 'Family song') + NBN_EXT;
 }
 

@@ -6,7 +6,9 @@
 
 import { decodeUtf8, decodeCp1252, decodeUtf16, stripUtf8Bom, toBytes } from './text.js';
 
-export const XML_LIMITS = { chars: 48 * 1024 * 1024, depth: 256, elements: 1_500_000, attrs: 256 };
+// elements: each one costs a few hundred bytes of memory; a song's sheet music has tens of
+// thousands at most.
+export const XML_LIMITS = { chars: 48 * 1024 * 1024, depth: 256, elements: 600_000, attrs: 256 };
 
 export class XmlError extends Error {}
 

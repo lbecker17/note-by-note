@@ -19,7 +19,10 @@
 
 import { decodeUtf8, decodeCp1252, isAscii, stripUtf8Bom, toBytes } from './text.js';
 
-export const MIDI_LIMITS = { bytes: 8 * 1024 * 1024, events: 2_000_000, tracks: 512 };
+// notes, texts and metas (each of tempo, time and key signatures) are kept up to these
+// counts, far more than any song has; past them the rest is skipped with a warning, so a
+// hostile file can't fill the phone's memory with millions of tiny events.
+export const MIDI_LIMITS = { bytes: 8 * 1024 * 1024, events: 2_000_000, tracks: 512, notes: 100_000, texts: 20_000, metas: 10_000 };
 
 const TEXT_KINDS = { 1: 'text', 2: 'copyright', 3: 'name', 4: 'instrument', 5: 'lyric', 6: 'marker', 7: 'cue', 8: 'program', 9: 'device' };
 
@@ -34,14 +37,16 @@ export function looksLikeMidi(data) {
   return tag(b, 0) === 'MThd' || (tag(b, 0) === 'RIFF' && tag(b, 8) === 'RMID');
 }
 
+const le32 = (b, p) => (b[p] | (b[p + 1] << 8) | (b[p + 2] << 16) | (b[p + 3] << 24)) >>> 0;
+
 // Find the SMF inside a RIFF "RMID" wrapper.
 function unwrapRiff(b) {
   let p = 12;
   while (p + 8 <= b.length) {
     const id = tag(b, p);
-    const len = b[p + 4] | (b[p + 5] << 8) | (b[p + 6] << 16) | ((b[p + 7] << 24) >>> 0);
+    const len = le32(b, p + 4);
     if (id === 'data') return b.subarray(p + 8, Math.min(b.length, p + 8 + len));
-    p += 8 + len + (len & 1);
+    p += 8 + len + (len & 1); // always moves on: len is never negative
   }
   throw new MidiError('This RIFF file has no MIDI data inside.');
 }
@@ -112,7 +117,7 @@ export function parseMidi(data) {
   if (!chunks.length) throw new MidiError('This MIDI file has no tracks.');
   if (chunks.length < ntrks) warn(`The header says ${ntrks} tracks but the file has ${chunks.length}.`);
 
-  const counter = { events: 0 };
+  const counter = { events: 0, notes: 0, texts: 0, tempos: 0, timeSigs: 0, keySigs: 0 };
   const raw = chunks.map(([s, e], i) => readTrack(b, s, e, i, warn, counter));
 
   // Text: one decision for the whole file, so a karaoke file reads consistently.
@@ -200,7 +205,7 @@ function readTrack(b, p, end, index, warn, counter) {
   const timeSigs = [];
   const keySigs = [];
   const programs = [];
-  const open = new Map(); // (ch << 7 | note) -> [{ tick, vel }] oldest first
+  const open = new Map(); // (ch << 7 | note) -> { ons: [{ tick, vel }], next }: oldest unmatched at ons[next]
   let tick = 0;
   let status = 0;
   let chPrefix = null;
@@ -217,12 +222,23 @@ function readTrack(b, p, end, index, warn, counter) {
     return -2;
   };
 
+  // A note-off ends the oldest note still sounding on that key (in constant time, however
+  // many note-ons a file stacks up).
   const noteOff = (ch, m) => {
-    const key = (ch << 7) | m;
-    const q = open.get(key);
-    if (!q || !q.length) return;
-    const on = q.shift();
+    const q = open.get((ch << 7) | m);
+    if (!q || q.next >= q.ons.length) return;
+    const on = q.ons[q.next++];
+    if (q.next === q.ons.length) q.ons.length = q.next = 0;
     notes.push({ tick: on.tick, endTick: tick, ch, m, vel: on.vel });
+  };
+  // Keep an event only while the file is under its cap for that kind.
+  const room = (kind, limit, what) => {
+    if (counter[kind] >= limit) {
+      warn(`This file has a huge number of ${what}; only the first ${limit} were read.`);
+      return false;
+    }
+    counter[kind]++;
+    return true;
   };
 
   while (p < end) {
@@ -258,9 +274,10 @@ function readTrack(b, p, end, index, warn, counter) {
       const d2 = need === 2 ? b[p + 1] : 0;
       p += need;
       if (hi === 0x90 && d2 > 0) {
+        if (!room('notes', MIDI_LIMITS.notes, 'notes')) continue;
         const key = (ch << 7) | d1;
-        if (!open.has(key)) open.set(key, []);
-        open.get(key).push({ tick, vel: d2 });
+        if (!open.has(key)) open.set(key, { ons: [], next: 0 });
+        open.get(key).ons.push({ tick, vel: d2 });
       } else if (hi === 0x80 || hi === 0x90) noteOff(ch, d1);
       else if (hi === 0xc0) programs.push({ tick, ch, program: d1 });
       continue;
@@ -278,17 +295,18 @@ function readTrack(b, p, end, index, warn, counter) {
         ended = true;
         break;
       }
-      if (type >= 1 && type <= 9) texts.push({ tick, type, bytes: d, ch: chPrefix });
-      else if (type === 0x20 && d.length >= 1) chPrefix = d[0] & 0x0f;
+      if (type >= 1 && type <= 9) {
+        if (room('texts', MIDI_LIMITS.texts, 'text events')) texts.push({ tick, type, bytes: d, ch: chPrefix });
+      } else if (type === 0x20 && d.length >= 1) chPrefix = d[0] & 0x0f;
       else if (type === 0x51 && d.length >= 3) {
         const us = (d[0] << 16) | (d[1] << 8) | d[2];
-        if (us > 0) tempos.push({ tick, us, track: index });
+        if (us > 0 && room('tempos', MIDI_LIMITS.metas, 'tempo changes')) tempos.push({ tick, us, track: index });
       } else if (type === 0x58 && d.length >= 2) {
         const den = 2 ** d[1];
-        if (d[0] > 0 && den <= 64) timeSigs.push({ tick, num: d[0], den, track: index });
+        if (d[0] > 0 && den <= 64 && room('timeSigs', MIDI_LIMITS.metas, 'time signatures')) timeSigs.push({ tick, num: d[0], den, track: index });
       } else if (type === 0x59 && d.length >= 2) {
         const sf = d[0] > 127 ? d[0] - 256 : d[0];
-        if (sf >= -7 && sf <= 7) keySigs.push({ tick, sf, mi: d[1] ? 1 : 0, track: index });
+        if (sf >= -7 && sf <= 7 && room('keySigs', MIDI_LIMITS.metas, 'key signatures')) keySigs.push({ tick, sf, mi: d[1] ? 1 : 0, track: index });
       }
       // Running status carries on after meta events in lenient readers; keep it.
       continue;
@@ -307,7 +325,7 @@ function readTrack(b, p, end, index, warn, counter) {
 
   let hanging = 0;
   for (const [key, q] of open) {
-    for (const on of q) {
+    for (const on of q.ons.slice(q.next)) {
       notes.push({ tick: on.tick, endTick: Math.max(tick, on.tick), ch: key >> 7, m: key & 0x7f, vel: on.vel });
       hanging++;
     }

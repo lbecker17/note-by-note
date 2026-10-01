@@ -24,7 +24,7 @@ import { parseMidi, looksLikeMidi, MidiError } from './midi.js';
 import { readMusicXML, musicxmlMelody, readMxl, MusicXmlError } from './musicxml.js';
 import { looksLikeZip, ZipError } from './unzip.js';
 import { decodeXmlBytes, XmlError } from './xml.js';
-import { toBytes, cleanText, UNSAFE_CHARS_G } from './text.js';
+import { toBytes, cleanText, cutText, UNSAFE_CHARS_G } from './text.js';
 import { songId, validateSong, readFamilySongFile, makeSource, FAMILY_CREDIT, SONG_LIMITS } from './nbn.js';
 import { parseMelody, parseLyrics } from './music.js';
 
@@ -34,7 +34,11 @@ export class ImportError extends Error {}
 export const COMFORT = { lines: 12, notes: 160, seconds: 150 };
 const SECTION_LINES = 8;
 const MAX_READ_NOTES = 12000; // far more than any song; a file with more is cut short
-export const IMPORT_LIMITS = { midiBytes: 4 * 1024 * 1024, xmlBytes: 24 * 1024 * 1024, mxlBytes: 8 * 1024 * 1024 };
+const MAX_SYLLABLES = 6000; // the same for words
+const MAX_CANDIDATES = 64; // tracks and channels considered for the tune (a band has far fewer)
+// xmlBytes caps a score both as a file and unzipped from an .mxl, so a small .mxl can't
+// unpack into more than a plain file could be. Sheet music for one song is far smaller.
+export const IMPORT_LIMITS = { midiBytes: 4 * 1024 * 1024, xmlBytes: 16 * 1024 * 1024, mxlBytes: 8 * 1024 * 1024 };
 
 const EPS = 1e-6;
 const mod12 = (x) => ((x % 12) + 12) % 12;
@@ -74,7 +78,7 @@ export async function importSongFile(data, fileName = '', opts = {}) {
     if (kind === 'midi') return importMidi(b, o);
     if (kind === 'zip') {
       if (b.length > IMPORT_LIMITS.mxlBytes) throw new ImportError('This file is too big.');
-      return importMusicXML(await readMxl(b), { ...o, kind: 'mxl' });
+      return importMusicXML(await readMxl(b, IMPORT_LIMITS.xmlBytes), { ...o, kind: 'mxl' });
     }
     if (kind === 'json') {
       const r = readFamilySongFile(b);
@@ -135,7 +139,10 @@ function pickLyrics(midi, fileName) {
         if (x.text.startsWith('@T') && !title) title = x.text.slice(2);
         continue;
       }
-      if (x.text.length > 64 || (x.beat <= firstNote + EPS && META_TEXT.test(x.text))) continue;
+      // Some karaoke files put a whole line of words in one event. Longer text, or a notice
+      // ("Sequenced by…", a web address) at the start or in a long event, isn't words.
+      const long = x.text.length > 64;
+      if (x.text.length > 200 || ((long || x.beat <= firstNote + EPS) && META_TEXT.test(x.text))) continue;
       (x.metaType === 5 ? lyr : txt).push(x);
     }
     if (lyr.length) groups.push({ track: t.index, type: 5, events: lyr });
@@ -159,8 +166,8 @@ const cleanSyl = (t) => t.replace(UNSAFE_CHARS_G, '').trim().replace(/\s+/g, '�
 // "\" starts a paragraph and "/" a line (Soft Karaoke .kar); CR starts a line and LF a
 // paragraph (MIDI lyric events). A leading or trailing space marks a word boundary, a
 // trailing "-" joins the next syllable. Files that put a whole line in one event are split
-// into words that follow on from the event's first note.
-export function karaokeSyllables(events) {
+// into words that follow on from the event's first note. At most `max` syllables.
+export function karaokeSyllables(events, max = MAX_SYLLABLES) {
   const raw = events.map((e) => e.text.replace(/\u0000/g, ''));
   const spaced = raw.filter((t) => /^[ \t]|[ \t]$/.test(t.replace(/^[\\/\r\n]+|[\r\n]+$/g, ''))).length;
   const lineMode = raw.filter((t) => /\S\s+\S/.test(t.trim())).length >= Math.max(2, raw.length * 0.5);
@@ -169,7 +176,8 @@ export function karaokeSyllables(events) {
   let pendLine = false;
   let pendPara = false;
   let pendWord = true;
-  events.forEach((e, k) => {
+  for (let k = 0; k < events.length && out.length < max; k++) {
+    const e = events[k];
     let t = raw[k];
     let line = pendLine;
     let para = pendPara;
@@ -201,10 +209,10 @@ export function karaokeSyllables(events) {
       pendLine = line || nextLine;
       pendPara = para || nextPara;
       pendWord = pendWord || lead || trail || line;
-      return;
+      continue;
     }
     const words = lineMode ? t.split(/\s+/).flatMap((w) => w.split(/(?<=[^-\s])-(?=[^-\s])/).map((s, i, a) => (i < a.length - 1 ? s + '-' : s))) : [t];
-    words.forEach((w, i) => {
+    words.slice(0, max - out.length).forEach((w, i) => {
       let hy = false;
       if (w.length > 1 && w.endsWith('-')) {
         w = w.slice(0, -1);
@@ -223,7 +231,7 @@ export function karaokeSyllables(events) {
     pendLine = nextLine;
     pendPara = nextPara;
     pendWord = trail;
-  });
+  }
   for (let k = 0; k < out.length; k++) {
     const nx = out[k + 1];
     out[k].joinNext = nx && !nx.wordStart ? 'join' : null;
@@ -391,6 +399,19 @@ function monophonic(notes) {
   return out;
 }
 
+// Where a track plays two or more different notes at once (chords, or a harmony line).
+function chordOnsets(notes) {
+  const sorted = [...notes].sort((a, b) => a.beat - b.beat);
+  const out = [];
+  for (let i = 0; i < sorted.length; ) {
+    let j = i + 1;
+    while (j < sorted.length && sorted[j].beat - sorted[i].beat < 0.04) j++;
+    if (sorted.slice(i, j).some((n) => n.m !== sorted[i].m)) out.push(sorted[i].beat);
+    i = j;
+  }
+  return out;
+}
+
 function mergeSyl(into, s) {
   into.text = into.text + (into.joinNext ? '' : '‿') + s.text;
   into.joinNext = s.joinNext;
@@ -463,8 +484,11 @@ function alignSyllables(notes, syls, shift) {
 
 // Snap a played performance to a written rhythm: note starts to sixteenths, but a start
 // within a little of an eighth goes to the eighth (human timing), and eighth-note triplets
-// only in beats where they clearly fit better. Players let go early, so note ends snap to
-// eighths, and small gaps between notes (a player lifting off) are closed.
+// only in beats where they clearly fit better. Players let go of every note early, by about
+// the same share of its length all through a file (sequenced karaoke files often hold notes
+// for 80-90% of their value). So a note runs on to the next one unless it is held for clearly
+// less than that usual share of the time between them, or stops more than a sixteenth short;
+// only then is there a rest, and the note's written length is its held length scaled back up.
 function quantize(notes) {
   if (!notes.length) return [];
   const near = (x, g) => Math.abs(x / g - Math.round(x / g)) * g;
@@ -496,8 +520,18 @@ function quantize(notes) {
     const b = Math.floor(x + 0.02);
     return b + (triplet.has(b) ? Math.round((x - b) * 3) / 3 : Math.round((x - b) * 2) / 2);
   };
+  // The usual share of the time to the next note that a note is held for.
+  const shares = [];
+  for (let i = 0; i + 1 < notes.length; i++) {
+    const ioi = notes[i + 1].q - notes[i].q;
+    if (ioi > 0.1 && ioi <= 4) shares.push(Math.min(1, (notes[i].e - notes[i].q) / ioi));
+  }
+  shares.sort((a, b) => a - b);
+  const hold = Math.max(0.5, shares.length ? shares[shares.length >> 1] : 1);
+
   const out = [];
-  for (const n of notes) {
+  for (let i = 0; i < notes.length; i++) {
+    const n = notes[i];
     const q = snap(n.q);
     const prev = out[out.length - 1];
     if (prev && q <= prev.q + EPS) {
@@ -508,24 +542,36 @@ function quantize(notes) {
       }
       continue;
     }
-    out.push({ ...n, q, e: snapEnd(n.e) });
+    const next = notes[i + 1];
+    const held = n.e - n.q;
+    const tight = !!next && next.q - n.e <= 0.25 + EPS; // let go less than a sixteenth early
+    const legato = tight || (!!next && held >= (hold - 0.15) * (next.q - n.q));
+    out.push({ ...n, q, e: snapEnd(n.q + held / hold), legato, tight });
   }
   for (let i = 0; i < out.length; i++) {
     const n = out[i];
     const next = out[i + 1];
-    const g = gridAt(n.q);
-    if (n.e < n.q + g - EPS) n.e = n.q + g;
-    if (next) {
-      if (n.e > next.q) n.e = next.q;
-      if (next.q - n.e < 0.5 - EPS) n.e = next.q;
-    }
+    if (next && (n.legato || n.e > next.q)) n.e = next.q;
+    else if (n.e < n.q + gridAt(n.q) - EPS) n.e = next ? Math.min(next.q, n.q + gridAt(n.q)) : n.q + gridAt(n.q);
   }
-  return out.map(({ e, ...n }) => ({ ...n, d: e - n.q }));
+  return out.map(({ e, legato, ...n }) => ({ ...n, d: e - n.q }));
 }
 
 function buildMeasures(timeSigs, endQ) {
-  const sigs = timeSigs.map((t) => ({ q: t.beat, num: t.num, den: t.den })).sort((a, b) => a.q - b.q);
+  const sigs = [];
+  for (const t of [...timeSigs].sort((a, b) => a.beat - b.beat)) {
+    const last = sigs[sigs.length - 1];
+    if (last && t.beat - last.q < EPS) Object.assign(last, { num: t.num, den: t.den });
+    else sigs.push({ q: t.beat, num: t.num, den: t.den });
+  }
   if (!sigs.length || sigs[0].q > EPS) sigs.unshift({ q: 0, num: 4, den: 4 });
+  // Notation programs often write a pickup as a bar of its own in a short time signature
+  // (1/4, then 4/4). That's a short first bar in the next signature, not a change of time.
+  if (sigs.length > 1) {
+    const len0 = (sigs[0].num * 4) / sigs[0].den;
+    const next = sigs[1];
+    if (Math.abs(next.q - len0) < EPS && len0 < (next.num * 4) / next.den - EPS) Object.assign(sigs[0], { num: next.num, den: next.den });
+  }
   const out = [];
   let q = 0;
   let si = 0;
@@ -546,6 +592,10 @@ function midiLine(midi, opts) {
   const warnings = midi.warnings.filter((w) => !/no end marker/.test(w));
   const lyr = pickLyrics(midi, opts.fileName || '');
   const syls = karaokeSyllables(lyr.events);
+  if (syls.length >= MAX_SYLLABLES) warnings.push(`This file has a huge number of words; only the first ${MAX_SYLLABLES} syllables were read.`);
+  if (syls.filter((x) => x.follow).length > syls.length / 4) {
+    warnings.push('The words in this file come a whole line at a time, so a long word sits on one note and the words may not line up with the tune. Check them before you save.');
+  }
 
   const byId = new Map();
   for (const t of midi.tracks) {
@@ -557,7 +607,12 @@ function midiLine(midi, opts) {
     }
   }
   const cands = [...byId.values()];
-  if (!cands.length) throw new ImportError(midi.tracks.some((t) => t.notes.length) ? 'This file only has drums, no tune.' : 'This file has no notes.');
+  if (!cands.length) throw new ImportError(midi.tracks.some((t) => t.notes.some((n) => n.ch === 9)) ? 'This file only has drums, no tune.' : 'This file has no notes.');
+  if (cands.length > MAX_CANDIDATES) {
+    // Only a file made to be awkward has this many: keep the busiest.
+    cands.sort((a, b) => b.notes.length - a.notes.length);
+    cands.length = MAX_CANDIDATES;
+  }
   const useLyrics = scoreCandidates(cands, syls);
   cands.sort((a, b) => b.score - a.score);
   const channelsIn = (t) => new Set(cands.filter((c) => c.track === t).map((c) => c.ch)).size;
@@ -584,6 +639,13 @@ function midiLine(midi, opts) {
   }
   notes = quantize(notes);
   const end = notes.length ? notes[notes.length - 1].q + notes[notes.length - 1].d : 0;
+  const measures = buildMeasures(own(midi.timeSigs), end);
+  // A chord's top note is taken as the tune. When the tune's track often plays two notes at
+  // once, say so: a harmony line above the tune can't be told from one below it.
+  const both = chordOnsets(chosen.notes);
+  if (both.length >= 8 && both.length >= 0.1 * notes.length) {
+    warnings.push(`From bar ${barAt(measures, both[0]).label}, the tune’s track often plays two notes at once; the top one was taken as the tune. Check it before you save.`);
+  }
   const tempos = own(midi.tempos).map((t) => ({ q: t.beat, bpm: t.bpm }));
   const ks = own(midi.keySigs);
 
@@ -596,7 +658,7 @@ function midiLine(midi, opts) {
   return {
     title,
     notes,
-    measures: buildMeasures(own(midi.timeSigs), end),
+    measures,
     chords: pickChordText(midi, lyr),
     tempos,
     defaultTempo: 120,
@@ -624,36 +686,56 @@ function barAt(measures, q) {
   return measures[lo];
 }
 
-// With words, the song runs from the first syllable to the last. A run of notes with no
-// syllable is a held syllable ("~", a melisma) when it carries straight on from a syllable
-// and is short: up to 6 notes within a bar, or up to 32 notes within four bars when the
-// sheet music draws an extender line. Any other run with no words (an intro, a solo
-// between verses, a tune that goes on after the words stop) is left out whole.
-function keepSung(notes, measures, warnings) {
+// With words, the song runs from the first syllable to the last. In between, a run of notes
+// with no syllable is either a held syllable ("~", a melisma) or left out:
+// - In sheet music (vocal) the line is the singer's own part, so its notes are all sung unless
+//   a bar or more of rest cuts them off from the words (an instrumental cue in the voice part).
+// - In a MIDI file the tune's instrument often plays an intro, a solo or fills between lines
+//   too. A run is held when the word goes on after it, or else for as long as it carries
+//   straight on from the syllable with no rest (up to two bars). The rest is left out.
+// After the last syllable, only a melisma straight on from it and within the next bar is kept.
+function keepSung(notes, measures, warnings, vocal) {
   const first = notes.findIndex((n) => n.syl);
   const out = [];
   const droppedMid = [];
   const droppedEnd = [];
+  const end = (x) => x.q + x.d;
+  const gap = (a, b) => b.q - end(a);
+  let lastSyl = null;
   let i = first;
   while (i < notes.length) {
     const n = notes[i];
     if (n.syl) {
       out.push({ ...n, hold: false });
+      lastSyl = n.syl;
       i++;
       continue;
     }
     let j = i;
     while (j < notes.length && !notes[j].syl) j++;
     const run = notes.slice(i, j);
+    const atEnd = j >= notes.length;
     const anchor = out[out.length - 1];
-    const ext = anchor.syl && anchor.syl.ext;
     const bar = fullBar(barAt(measures, anchor.q));
-    let maxGap = run[0].q - (anchor.q + anchor.d);
-    for (let k = 1; k < run.length; k++) maxGap = Math.max(maxGap, run[k].q - (run[k - 1].q + run[k - 1].d));
-    const span = run[run.length - 1].q + run[run.length - 1].d - anchor.q;
-    const melisma = maxGap < 1 - EPS && (ext ? run.length <= 32 && span <= 4 * bar + EPS : run.length <= 6 && span <= bar + anchor.d + EPS);
-    if (melisma) for (const x of run) out.push({ ...x, syl: null, hold: true });
-    else (j >= notes.length ? droppedEnd : droppedMid).push(...run);
+    // The notes that carry straight on from the syllable. A played note that stops a little
+    // short (tight: false, see quantize) is followed by a fill, not a melisma.
+    let legato = gap(anchor, run[0]) < EPS && anchor.tight !== false ? 1 : 0;
+    while (legato && legato < run.length && gap(run[legato - 1], run[legato]) < EPS) legato++;
+    // The longest rest from the syllable, through the run, to the next syllable.
+    const around = atEnd ? [anchor, ...run] : [anchor, ...run, notes[j]];
+    let longest = 0;
+    for (let k = 1; k < around.length; k++) longest = Math.max(longest, gap(around[k - 1], around[k]));
+    const span = (k) => end(run[k - 1]) - run[0].q; // the first k notes of the run
+    let keep = 0;
+    if (atEnd) keep = legato === run.length && end(run[run.length - 1]) <= end(anchor) + bar + EPS ? run.length : 0;
+    else if (vocal) keep = longest < bar - EPS ? run.length : 0;
+    else if (lastSyl.joinNext && longest < 1 - EPS && span(run.length) <= 4 * bar + EPS) keep = run.length;
+    else {
+      keep = legato;
+      while (keep && span(keep) > 2 * bar + EPS) keep--;
+    }
+    for (let k = 0; k < keep; k++) out.push({ ...run[k], syl: null, hold: true });
+    (atEnd ? droppedEnd : droppedMid).push(...run.slice(keep));
     i = j;
   }
   if (first >= 2) warnings.push(`Left out ${first} notes before the words start.`);
@@ -665,23 +747,39 @@ function keepSung(notes, measures, warnings) {
 // Long stretches with no singing (three or more empty bars) shrink to one empty bar.
 function squeezeGaps(notes, measures, chords, tempos, keys, warnings) {
   const cuts = [];
+  let mi = 0;
   for (let i = 0; i + 1 < notes.length; i++) {
     const from = notes[i].q + notes[i].d;
     const to = notes[i + 1].q;
     if (to - from < 3) continue;
-    const empty = measures.filter((m) => m.q >= from - EPS && m.q + m.len <= to + EPS);
-    if (empty.length >= 3) cuts.push({ from: empty[1].q, to: empty[empty.length - 1].q + empty[empty.length - 1].len });
+    // The empty bars are measures[mi..k-1]: the notes and the measures are both in order.
+    while (mi < measures.length && measures[mi].q < from - EPS) mi++;
+    let k = mi;
+    while (k < measures.length && measures[k].q + measures[k].len <= to + EPS) k++;
+    if (k - mi >= 3) cuts.push({ from: measures[mi + 1].q, to: measures[k - 1].q + measures[k - 1].len });
   }
   if (!cuts.length) return { notes, measures, chords, tempos, keys };
-  const map = (q) => {
-    let shift = 0;
-    for (const c of cuts) {
-      if (q >= c.to - EPS) shift += c.to - c.from;
-      else if (q > c.from) return c.from - shift;
+  const before = [0]; // beats cut before each cut
+  for (const c of cuts) before.push(before[before.length - 1] + c.to - c.from);
+  // The first cut that doesn't end at or before q.
+  const cutAt = (q) => {
+    let lo = 0;
+    let hi = cuts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (q >= cuts[mid].to - EPS) lo = mid + 1;
+      else hi = mid;
     }
-    return q - shift;
+    return lo;
   };
-  const inCut = (q) => cuts.some((c) => q >= c.from - EPS && q < c.to - EPS);
+  const map = (q) => {
+    const k = cutAt(q);
+    return (k < cuts.length && q > cuts[k].from ? cuts[k].from : q) - before[k];
+  };
+  const inCut = (q) => {
+    const k = cutAt(q);
+    return k < cuts.length && q >= cuts[k].from - EPS;
+  };
   warnings.push(cuts.length === 1 ? 'A long break with no singing was shortened to one bar.' : `${cuts.length} long breaks with no singing were shortened to one bar each.`);
   return {
     notes: notes.map((n) => ({ ...n, q: map(n.q) })),
@@ -762,7 +860,9 @@ export function estimateKey(notes) {
 function splitLines(notes, measures) {
   const n = notes.length;
   if (n <= 1) return [0];
-  const marked = notes.filter((x, i) => i > 0 && (x.line || x.para)).length >= 2;
+  // Karaoke line markers, or sections in sheet music (after a repeat or a jump).
+  const karaoke = notes.filter((x, i) => i > 0 && x.line).length >= 2;
+  const marked = karaoke || notes.filter((x, i) => i > 0 && x.para).length >= 2;
   const lyricTexts = notes.filter((x) => x.syl).map((x) => x.syl.text).join(' ');
   const mixedCase = /[a-z]/.test(lyricTexts) && /[A-Z]/.test(lyricTexts);
   const score = new Float64Array(n);
@@ -790,7 +890,8 @@ function splitLines(notes, measures) {
     if (b.para || b.sect) s += 4;
     if (b.sys) s += 1;
     if (mixedCase && b.syl && /^[A-Z]/.test(b.syl.text)) s += 1;
-    if (marked) s += b.line || b.para ? 20 : -2;
+    // Marked lines are the file's own; a karaoke line is split only when it's very long.
+    if (marked) s += b.line || b.para ? 20 : karaoke ? -16 : -2;
     score[i] = s;
   }
   const cost = (i, j) => {
@@ -899,7 +1000,7 @@ function emitLyrics(notes, starts) {
         continue;
       }
       let t = n.syl.text.replace(UNSAFE_CHARS_G, '').replace(/\s+/g, '‿');
-      if (t.length > SONG_LIMITS.token - 2) t = t.slice(0, SONG_LIMITS.token - 2);
+      t = cutText(t, SONG_LIMITS.token - 2);
       if (t === '~') t = '∼';
       // A literal hyphen or equals sign at the end would read as a join marker.
       t = t.replace(/-$/, '‐').replace(/=$/, '＝');
@@ -938,7 +1039,7 @@ function finish(line, kind, opts) {
   if (!hasLyrics) {
     notes.forEach((n) => (n.syl = null));
     warnings.push(withSyl ? 'Only a few notes have words, so the song is sung on “la”.' : 'No words were found in this file, so the song is sung on “la”.');
-  } else notes = keepSung(notes, measures, warnings);
+  } else notes = keepSung(notes, measures, warnings, !!line.vocal);
 
   let { chords, tempos, keys } = line;
   ({ notes, measures, chords, tempos, keys } = squeezeGaps(notes, measures, chords, tempos || [], keys || [], warnings));

@@ -71,6 +71,8 @@ export function parseMelody(src) {
     notes.push({ m: parsePitch(p), beat, beats });
     beat += beats;
   }
+  // A "//" after the last note starts no phrase.
+  if (phraseStarts.length > 1 && phraseStarts[phraseStarts.length - 1] === notes.length) phraseStarts.pop();
   const phrases = phraseStarts.map((s, i) => [s, i + 1 < phraseStarts.length ? phraseStarts[i + 1] : notes.length]);
   return { notes, phrases, totalBeats: beat };
 }

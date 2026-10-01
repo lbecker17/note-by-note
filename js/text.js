@@ -82,10 +82,15 @@ export function toBytes(data) {
 export const UNSAFE_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff\ufff9-\ufffb]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 export const UNSAFE_CHARS_G = new RegExp(UNSAFE_CHARS.source, 'g');
 
+// The first `max` code units of a string, without cutting a character in half (emoji and
+// other astral characters take two code units).
+export function cutText(s, max) {
+  if (s.length <= max) return s;
+  return s.slice(0, /[\ud800-\udbff]/.test(s[max - 1]) ? max - 1 : max);
+}
+
 // Display text from a file: unsafe characters removed, whitespace runs folded to one space.
 export function cleanText(s, max = 200) {
   const t = String(s).replace(UNSAFE_CHARS_G, '').replace(/[\s\u00a0]+/g, ' ').trim();
-  if (t.length <= max) return t;
-  // Don't cut a character in half (emoji and other astral characters take two code units).
-  return t.slice(0, /[\ud800-\udbff]/.test(t[max - 1]) ? max - 1 : max).trim();
+  return cutText(t, max).trim();
 }
