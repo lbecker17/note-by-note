@@ -109,30 +109,33 @@ function matchStep(range, degrees = [0, 4, 7, 2, 5, 9]) {
   });
 }
 
-function holdStep(range, holds, { vowel = 'ah', title = 'Hold it steady' } = {}) {
+// swell: each note grows and shrinks (the player's cue says so); intro and cue override the defaults.
+function holdStep(range, holds, { vowel = 'ah', title = 'Hold it steady', intro, cue, swell = false } = {}) {
   const T = fitTonic(range, 0, 4);
   const b = new Builder(60);
   holds.forEach(([deg, secs], i) => {
-    b.cue(`${secs} seconds · ${i + 1} of ${holds.length}`);
+    b.cue(cue ? cue(secs, i, holds.length) : `${secs} seconds · ${i + 1} of ${holds.length}`);
     b.listen(T + deg, 1.5);
     b.click(true);
     b.rest(1);
-    b.sing(T + deg, secs, { hold: true });
+    b.sing(T + deg, secs, swell ? { hold: true, swell: true } : { hold: true });
     b.rest(2);
   });
   return b.build({
     title,
     vowel,
     tonic: T,
-    intro: `Breathe in low, then hold each note on ${QUOTE(vowel)}. Keep the line flat and level to the end.`,
+    intro: intro || `Breathe in, then hold each note on ${QUOTE(vowel)}. Keep the line flat and level to the end.`,
   });
 }
 
-function patternStep(range, { title, degrees, patterns, keys = 3, bpm = 90, vowel = 'ah', minor = false, span, last = 2, intro }) {
+// descendKeys: each round starts a little lower instead of a little higher.
+function patternStep(range, { title, degrees, patterns, keys = 3, bpm = 90, vowel = 'ah', minor = false, span, last = 2, intro, descendKeys = false }) {
   const pats = patterns || [degrees];
   const hi = span != null ? span : Math.max(...pats.flat());
   const lo = Math.min(0, ...pats.flat());
-  const tonics = keyLadder(range, lo, hi, keys);
+  let tonics = keyLadder(range, lo, hi, keys);
+  if (descendKeys) tonics = tonics.slice().reverse();
   const b = new Builder(bpm);
   tonics.forEach((T, k) => {
     b.key(T).cue(tonics.length > 1 ? `Key ${k + 1} of ${tonics.length}` : '');
@@ -141,15 +144,25 @@ function patternStep(range, { title, degrees, patterns, keys = 3, bpm = 90, vowe
   return b.build({ title, vowel, tonic: tonics[0], minor, intro });
 }
 
-function sirenStep(range, rounds = 3, { title = 'Sirens' } = {}) {
+// The singer's working band: the stored range with up to `top` semitones taken off the top,
+// so slides and patterns stay clear of the very highest note. Narrow ranges keep more room to move.
+export function safeBand(range, top = 2) {
+  const span = range.high - range.low;
+  const cut = span >= 12 ? top : span >= 8 ? 1 : 0;
+  return { low: range.low, high: range.high - cut };
+}
+
+// Up-and-down slides around the middle of the band. widths are fractions of the band's half-span,
+// one per round, so they can start small and widen; a slide never leaves the band.
+function sirenStep(range, { widths = [0.4, 0.6, 0.8, 1], title = 'Sirens', vowel = 'hum', intro = '' } = {}) {
   const b = new Builder(60);
   const mid = (range.low + range.high) / 2;
-  const half = Math.max(3, (range.high - range.low) / 2 - 1);
-  for (let r = 0; r < rounds; r++) {
-    const w = rounds === 1 ? half : half * (0.55 + (0.45 * r) / (rounds - 1));
-    const a = Math.round(mid - w);
-    const z = Math.round(mid + w);
-    b.cue(`Slide ${r + 1} of ${rounds}`);
+  const half = (range.high - range.low) / 2;
+  widths.forEach((f, r) => {
+    const w = Math.max(1.5, half * f);
+    const a = Math.max(range.low, Math.round(mid - w));
+    const z = Math.min(range.high, Math.round(mid + w));
+    b.cue(widths.length > 1 ? `Slide ${r + 1} of ${widths.length}` : '');
     b.glide('listen', a, z, 2);
     b.glide('listen', z, a, 2);
     b.click(true);
@@ -157,21 +170,39 @@ function sirenStep(range, rounds = 3, { title = 'Sirens' } = {}) {
     b.glide('sing', a, z, 2);
     b.glide('sing', z, a, 2);
     b.rest(1.5);
-  }
-  return b.build({
-    title,
-    vowel: 'ng',
-    tonic: Math.round(mid - half),
-    intro: `Slide smoothly up and down like a siren. Hum on ${QUOTE('ng')} or do a lip trill. No breaks in the sound.`,
   });
+  return b.build({ title, vowel, tonic: Math.round(mid - half), intro });
 }
 
-function staccatoStep(range, keys = 3) {
+// A slow, smooth slide from the upper middle of the band down to the lower middle.
+function slideDownStep(range, rounds = 3, { title = 'Slow slide down', vowel = 'oo', intro = '' } = {}) {
+  const b = new Builder(60);
+  const span = range.high - range.low;
+  const z = range.high - Math.round(span * 0.2);
+  const a = range.low + Math.round(span * 0.25);
+  for (let r = 0; r < rounds; r++) {
+    b.cue(`Slide ${r + 1} of ${rounds}`);
+    b.glide('listen', z, a, 3);
+    b.click(true);
+    b.rest(1);
+    b.glide('sing', z, a, 3);
+    b.rest(1.5);
+  }
+  return b.build({ title, vowel, tonic: a, intro });
+}
+
+// A step with nothing to sing: picture cards with a countdown. The player shows them instead of
+// the lane, doesn't score them, and the warm-up check skips them.
+function moveStep(cards, { title = 'Wake up your body', intro = '' } = {}) {
+  const end = cards.reduce((sum, c) => sum + c.secs, 0);
+  return { kind: 'move', title, intro, cards, events: [], audio: [], cues: [], end, vowel: null, tonic: 60 };
+}
+
+function staccatoStep(range, keys = 3, { title = 'Short and sharp', intro, degs = [0, 4, 7, 4, 0] } = {}) {
   const b = new Builder(100);
-  const tonics = keyLadder(range, 0, 7, keys);
+  const tonics = keyLadder(range, 0, Math.max(...degs), keys);
   tonics.forEach((T, k) => {
     b.key(T).cue(`Key ${k + 1} of ${tonics.length}`);
-    const degs = [0, 4, 7, 4, 0];
     for (const d of degs) {
       b.listen(T + d, 0.5);
       b.rest(0.5);
@@ -185,10 +216,10 @@ function staccatoStep(range, keys = 3) {
     b.rest(1.5);
   });
   return b.build({
-    title: 'Short and sharp',
+    title,
     vowel: 'ha',
     tonic: tonics[0],
-    intro: `Short, bouncy notes on ${QUOTE('ha')}. Let your belly kick each one out, then stop cleanly.`,
+    intro: intro || `Short, bouncy notes on ${QUOTE('ha')}. Let your belly kick each one out, then stop cleanly.`,
   });
 }
 
@@ -354,9 +385,16 @@ export const LESSONS = {
   sirens: {
     id: 'sirens',
     title: 'Sirens',
-    blurb: 'Slide from low to high and back without a break.',
+    blurb: 'Slide up and down without a break. Gentle, never pushed.',
     glyph: { type: 'glide' },
-    build: (range) => [sirenStep(range, 3)],
+    // Four rounds that widen gradually, and the top stays a semitone under your highest note.
+    build: (range) => [
+      sirenStep(safeBand(range, 1), {
+        widths: [0.4, 0.6, 0.8, 1],
+        vowel: 'hum',
+        intro: 'Hum with your lips closed, or do motorboat lips, and slide up and down like a siren. Only go as high as feels easy. If it feels tight or scratchy, make the slide smaller, or stop and have a drink of water.',
+      }),
+    ],
   },
   staccato: {
     id: 'staccato',
@@ -375,29 +413,105 @@ export const UNITS = [
 
 export const ORDER = UNITS.flatMap((u) => u.lessons);
 
-export const WARMUP = {
-  id: 'warmup',
-  title: 'Daily warm-up',
-  blurb: 'Sirens, scales, an arpeggio and a long note. About three minutes.',
-  minutes: 3, // the one place the warm-up's length lives: Today, Songs and the lock all read it
-  build: (range) => [
-    sirenStep(range, 3, { title: 'Sirens' }),
-    patternStep(range, {
+// ---------- Daily warm-up ----------
+// About 4 minutes: body and breath, small hum slides, a light "oo" pattern from high to low,
+// a five-note scale, the control move of the day, then one big siren once the voice is warm.
+// Everything sung stays inside safeBand(range, 2), so nothing touches the very top note.
+
+export const MOVE_CARDS = [
+  { id: 'shoulders', title: 'Shoulder rolls', say: 'Roll your shoulders up, back and down. Slowly, three times.', secs: 12 },
+  { id: 'jaw', title: 'Loose jaw', say: 'Rub your cheeks in little circles. Let your jaw hang loose.', secs: 10 },
+  { id: 'yawn', title: 'Yawn and sigh', say: 'Big yawn, then a gentle sigh from high to low.', secs: 10 },
+  { id: 'breath', title: 'Slow hiss', say: `Breathe in through your nose. Then hiss ${QUOTE('sssss')} slowly until the air runs out. Shoulders stay down.`, secs: 18 },
+];
+
+// One control move a day, by Date#getDay() (0 is Sunday), so "Tuesday is bouncy day".
+export const CONTROL_BY_DAY = ['slide', 'hold', 'bounce', 'swell', 'hold', 'bounce', 'swell'];
+
+export const CONTROL_TITLES = {
+  hold: 'Hold it steady',
+  bounce: `Bouncy ${QUOTE('ha')}`,
+  swell: 'Grow and shrink',
+  slide: 'Slow slide down',
+};
+
+// band: the warm-up's safe band. tight: too narrow for five-note shapes.
+export const CONTROLS = {
+  hold: (band) =>
+    holdStep(band, [[2, 5], [4, 6]], {
+      vowel: 'oo',
+      title: CONTROL_TITLES.hold,
+      intro: `Control of the day. Breathe in, then hold each note on ${QUOTE('oo')}. Keep the line flat right to the end.`,
+    }),
+  bounce: (band, tight) =>
+    staccatoStep(band, 2, {
+      title: CONTROL_TITLES.bounce,
+      degs: tight ? [0, 2, 4, 2, 0] : [0, 4, 7, 4, 0],
+      intro: `Control of the day. Short, bouncy notes on ${QUOTE('ha')}. Start each one cleanly and stop it cleanly.`,
+    }),
+  swell: (band) =>
+    holdStep(band, [[2, 6], [4, 6]], {
+      vowel: 'ah',
+      title: CONTROL_TITLES.swell,
+      swell: true,
+      cue: (secs, i, n) => `Soft, louder, then soft · ${i + 1} of ${n}`,
+      intro: 'Control of the day. Start soft, grow a little louder, then fade away. Keep the line flat. Watch the level bar grow and shrink.',
+    }),
+  slide: (band) =>
+    slideDownStep(band, 3, {
+      title: CONTROL_TITLES.slide,
+      intro: `Control of the day. Slide slowly down on ${QUOTE('oo')}, smooth like a lift, no bumps.`,
+    }),
+};
+
+export const controlFor = (date = new Date()) => CONTROL_BY_DAY[date.getDay()];
+
+export function buildWarmup(range, date = new Date()) {
+  const band = safeBand(range, 2);
+  const ctl = controlFor(date);
+  const tight = band.high - band.low < 7;
+  return [
+    moveStep(MOVE_CARDS, {
+      intro: 'Warm-ups get your voice ready, like stretching before sport. Sing gently, at a medium volume. If your throat feels scratchy or sore, stop and have a drink of water.',
+    }),
+    sirenStep(band, {
+      widths: [0.4, 0.55, 0.7],
+      title: 'Hum slides',
+      vowel: 'hum',
+      intro: 'Hum with your lips closed, or do motorboat lips. Slide up and down like a siren, small and gentle. Only go as high as feels easy.',
+    }),
+    patternStep(band, {
+      title: `Light ${QUOTE('oo')} down`,
+      degrees: tight ? [4, 2, 0] : [7, 5, 4, 2, 0],
+      keys: 3,
+      bpm: 100,
+      vowel: 'oo',
+      descendKeys: true,
+      intro: `Light and soft on ${QUOTE('oo')}, from high to low. Each round starts a little lower.`,
+    }),
+    patternStep(band, {
       title: 'Five-note scale',
-      degrees: [0, 2, 4, 5, 7, 5, 4, 2, 0],
+      degrees: tight ? [0, 2, 4, 2, 0] : [0, 2, 4, 5, 7, 5, 4, 2, 0],
       keys: 4,
       bpm: 100,
       vowel: 'mee',
-      intro: `Up five notes and back on ${QUOTE('mee')}.`,
+      intro: `Up five notes and back on ${QUOTE('mee')}. Each round starts a little higher.`,
     }),
-    patternStep(range, {
-      title: 'Arpeggio',
-      patterns: [[0, 4, 7, 4, 0]],
-      keys: 4,
-      bpm: 92,
-      vowel: 'nay',
-      intro: `Do, mi, sol and back on ${QUOTE('nay')}.`,
+    CONTROLS[ctl](band, tight),
+    sirenStep(band, {
+      widths: [1],
+      title: 'Big siren',
+      vowel: 'hum',
+      intro: 'One big slide to finish. Go as high as feels easy, and no higher.',
     }),
-    holdStep(range, [[2, 6], [4, 8]], { title: 'Long notes', vowel: 'ah' }),
-  ],
+  ];
+}
+
+export const WARMUP = {
+  id: 'warmup',
+  title: 'Daily warm-up',
+  blurb: 'Wake up, slide, scale, and today’s control move. About 4 minutes.',
+  minutes: 4, // the one place the warm-up's length lives: Today, Songs and the lock all read it
+  controlTitle: (date = new Date()) => CONTROL_TITLES[controlFor(date)],
+  build: (range, date = new Date()) => buildWarmup(range, date),
 };

@@ -1,11 +1,11 @@
 import { AudioEngine } from './audio.js';
-import { LESSONS, UNITS, ORDER, WARMUP } from './lessons.js';
+import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './lessons.js';
 import { SONGS, buildSong, difficulty, songGlyph } from './songs.js';
 import { Lane, drawOverview } from './lane.js';
 import { letterName, label, family, prefersFlats, voiceType, spanWords, pc } from './music.js';
-import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard } from './score.js';
-import { store, today, week } from './store.js';
-import { ICON, PHASE_ICON, MARK, SQUIGGLE, STAFF, BURST, confetti, rating, hum } from './art.js';
+import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck } from './score.js';
+import { store, today, week, warmedToday } from './store.js';
+import { ICON, PHASE_ICON, MARK, SQUIGGLE, STAFF, BURST, AROUND, confetti, rating, hum, WARM_STEPS, CONTROL_STEP, MOVE_ART, moveRing } from './art.js';
 
 const audio = new AudioEngine();
 const root = document.getElementById('app');
@@ -28,6 +28,7 @@ const TABS = ['today', 'lessons', 'songs'];
 let current = null;
 let sheet = null;
 let pendingOpen = null;
+let pendingSong = null; // the song a child tapped while locked; the warm-up done sheet offers it
 let wakeLock = null;
 
 const esc = (s) =>
@@ -57,31 +58,19 @@ const sset = (k, v) => {
 };
 
 // ---------- Daily warm-up and the song lock ----------
-// Every lock and "done today" visual reads these two functions. They're placeholders until the
-// lock itself lands (warm-up spec §4); then they become:
-//   warmedUpToday() → store.data.warm?.day === today()
-//   songsUnlocked() → S().warmupLock === false || warmedUpToday()
-function warmedUpToday() {
-  return false;
-}
-function songsUnlocked() {
-  return true;
-}
+// Songs open once today's warm-up has counted (the app heard every sung part), until local
+// midnight. Lessons, the warm-up and the range test never lock. A grown-up can switch the lock
+// off in Settings. Every lock and "done today" visual, and the gate in openItem, read these.
 const lockEnabled = () => S().warmupLock !== false;
+const warmedUpToday = () => warmedToday();
+const songsUnlocked = () => !lockEnabled() || warmedUpToday();
 
-// The warm-up's steps as pictures, for the Today hero and the "Up next" card. This list matches
-// today's four-step warm-up. The six-step warm-up (warm-up spec §2) replaces it with WARM_STEPS
-// from art.js, step 5 taken from CONTROL_STEP for today's control and marked { today: true }.
-const WARM_TRAIL = [
-  { icon: 'siren', label: 'Siren', title: 'Sirens' },
-  { icon: 'scale', label: 'Scale', title: 'Five-note scale' },
-  { icon: 'ladder', label: 'Arpeggio', title: 'Arpeggio' },
-  { icon: 'hold', label: 'Hold', title: 'Long notes' },
-];
-const warmTrail = () => WARM_TRAIL;
-// Today's control move ({ title }), once the warm-up has one.
-const todayControl = () => null;
+// The warm-up's steps as pictures, for the Today hero and the "Up next" card. Step 5 is the
+// control move of the day (ctl: 'hold' | 'bounce' | 'swell' | 'slide'), marked { today: true }.
+const warmTrail = (ctl = controlFor()) => WARM_STEPS.map((s) => (s.key === 'control' ? { ...s, ...CONTROL_STEP[ctl], today: true } : s));
+const todayControl = () => ({ title: WARMUP.controlTitle() });
 const warmLength = () => `About ${WARMUP.minutes} minutes`;
+const clockTime = (ms) => new Date(ms).toLocaleTimeString('en-AU', { hour: 'numeric', minute: '2-digit' });
 
 // ---------- Small pictures ----------
 
@@ -235,17 +224,33 @@ function needRangeSheet() {
      ${presetsHTML()}
      <p class="presets-note">${VOICE_CHANGING}</p>`,
     {},
-    { label: 'Find your range', onClose: () => (pendingOpen = null) }
+    {
+      label: 'Find your range',
+      onClose: () => {
+        pendingOpen = null;
+        pendingSong = null;
+      },
+    }
   );
 }
 
-function settingsSheet() {
+// The grown-up check for turning the warm-up lock off: a times-table sum with numbers from 6 to 9.
+// It stops a 4-to-7-year-old; a teenager can answer it, and the copy says so.
+const newGate = (err = false) => ({ a: 6 + Math.floor(Math.random() * 4), b: 6 + Math.floor(Math.random() * 4), err });
+
+// gate: null, or the sum on show while a grown-up turns the lock off.
+function settingsSheet(gate = null) {
   const s = S();
   const seg = (k, opts) =>
     `<div class="seg" role="radiogroup">${opts
       .map(([v, l]) => `<button role="radio" aria-checked="${s[k] === v}" class="${s[k] === v ? 'on' : ''}" data-act="set" data-k="${k}" data-v="${v}">${l}</button>`)
       .join('')}</div>`;
   const range = store.data.range;
+  const lockOn = lockEnabled();
+  const warm = store.data.warm;
+  const status = warmedUpToday()
+    ? `${ICON.check}Today: warmed up${warm.at ? ` at ${clockTime(warm.at)}` : ''}`
+    : 'Not yet today';
   const html = `
     <h2>Settings</h2>
     <div class="field">
@@ -263,6 +268,25 @@ function settingsSheet() {
       <button class="btn small danger" data-act="reset">Reset</button>
     </div>
     <h3 class="group-h">For grown-ups</h3>
+    <div class="field lock-field">
+      <div>
+        <b id="lock-label">Warm-up before songs</b>
+        ${gate ? '' : '<p>Songs open after today’s warm-up. Lessons are always open. Resets at midnight.</p>'}
+        <p class="lock-today${warmedUpToday() ? ' done' : ''}">${status}</p>
+      </div>
+      <button class="switch ${lockOn ? 'on' : ''}" role="switch" aria-checked="${lockOn}" aria-labelledby="lock-label" data-act="lock-switch"><i></i></button>
+    </div>
+    ${
+      gate
+        ? `<div class="gate">
+            ${gate.err ? '<p class="err" role="alert">Not quite. Try this one:</p>' : ''}
+            <label for="gate">Grown-ups: what is ${gate.a} × ${gate.b}?</label>
+            <input id="gate" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" enterkeyhint="done">
+            <button class="btn secondary" data-act="gate">Turn off</button>
+          </div>`
+        : ''
+    }
+    <p class="lock-note">This is a gentle nudge, not a lock. A determined teenager can get around it, for example by clearing Safari’s website data.</p>
     <button class="field link-row" data-act="care"><span>${ICON.heart}<b>Look after your voice</b></span>${ICON.chev}</button>
     <p class="about">Note by Note ${VERSION} · Nothing you sing is recorded or leaves this device.</p>
     <button class="btn primary wide" data-act="sheet-close">Done</button>`;
@@ -294,10 +318,47 @@ function settingsSheet() {
         store.reset();
         settingsSheet();
       },
-      care: () => careSheet(null, settingsSheet),
+      care: () => careSheet(null, () => settingsSheet()),
+      // On: switching off shows the grown-up check (tapping again cancels it). Off: back on straight away.
+      'lock-switch': () => {
+        if (!lockEnabled()) store.setSetting('warmupLock', true);
+        else if (!gate) {
+          settingsSheet(newGate());
+          return focusIn('#gate');
+        }
+        settingsSheet();
+        focusIn('[data-act="lock-switch"]');
+      },
+      gate: () => checkGate(),
     },
     { label: 'Settings', key: 'settings', cls: 'settings', onClose: () => current && current.refresh && current.refresh() }
   );
+  function checkGate() {
+    const input = sheet && sheet.el.querySelector('#gate');
+    const answer = input ? parseInt(input.value.trim(), 10) : NaN;
+    if (answer === gate.a * gate.b) {
+      store.setSetting('warmupLock', false);
+      settingsSheet();
+      focusIn('[data-act="lock-switch"]');
+    } else {
+      settingsSheet(newGate(true));
+      focusIn('#gate');
+    }
+  }
+  const input = gate && sheet && sheet.el.querySelector('#gate');
+  if (input)
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        checkGate();
+      }
+    });
+}
+
+// Focus something in the open sheet without scrolling it (after a sheet re-renders in place).
+function focusIn(sel) {
+  const el = sheet && sheet.el.querySelector(sel);
+  if (el) el.focus({ preventScroll: true });
 }
 
 // ---------- "Look after your voice" (warm-up spec §5.2) ----------
@@ -324,7 +385,7 @@ const CARE_GROWNUPS = `
   </ul>
   <p>Hoarseness in children usually comes from voice-use habits or colds, not singing technique. A croaky voice from a cold usually settles within 1–2 weeks. (Sources: RCH Kids Health Info, BVA, ASHA, Seattle Children’s.)</p>
   <h3>How much singing?</h3>
-  <p>No safe daily amount has been established for children or adults. Little and often is best, with breaks. A short warm-up and 10–20 minutes of lessons and songs is a sensible day. Stop when the voice feels tired.</p>
+  <p>No safe daily amount has been established for children or adults. Little and often is best, with breaks. A ${WARMUP.minutes}-minute warm-up and 10–20 minutes of lessons and songs is a sensible day. Stop when the voice feels tired.</p>
   <h3>When to see your GP</h3>
   <ul>
     <li>A hoarse or croaky voice that is getting worse, or not getting better.</li>
@@ -361,7 +422,9 @@ const CARE_GROWNUPS = `
     <li>Redo the range test every few weeks while the voice is changing. The app will remind you. (VoiceScience; Williams, Welch &amp; Howard 2020; Gackle; Cooksey.)</li>
   </ul>
   <h3>Preventer inhalers</h3>
-  <p>If your child uses a preventer (steroid) inhaler and you notice hoarseness, mention it to your GP or pharmacist.</p>`;
+  <p>If your child uses a preventer (steroid) inhaler and you notice hoarseness, mention it to your GP or pharmacist.</p>
+  <h3>The warm-up lock</h3>
+  <p>Songs open after the day’s warm-up. Lessons are always open. You can turn this off in Settings, under For grown-ups. It is a nudge, not security.</p>`;
 
 // section: 'rest' opens at the "Sick? Rest." card. back: re-opens the sheet this one replaced.
 function careSheet(section = null, back = null) {
@@ -409,6 +472,14 @@ function goBack() {
   else goHome();
 }
 
+// Close the screen and land on a tab, from its top (e.g. "Go to Songs" after the warm-up).
+function goToTab(v) {
+  tab = v;
+  sset('nbn:tab', v);
+  scrollMem[v] = 0;
+  goBack();
+}
+
 window.addEventListener('popstate', () => {
   closeSheet(true);
   if (!current || current.name !== 'home') goHome();
@@ -417,11 +488,62 @@ window.addEventListener('popstate', () => {
 function openItem(kind, id) {
   if (kind === 'free') return show(freeCtrl());
   if (kind === 'lesson' && id === 'range') return show(rangeCtrl());
+  if (kind === 'song' && !songsUnlocked()) return lockSheet({ kind, id });
   if (!store.data.range) {
     pendingOpen = { kind, id };
     return needRangeSheet();
   }
   show(playerCtrl({ kind, id }));
+}
+
+// A locked song was tapped (from Songs, or a "Next" button). The song is remembered so the
+// warm-up's done sheet can offer it straight away.
+function lockSheet(target) {
+  pendingSong = target;
+  openSheet(
+    `${hum('sing')}
+     <h2>Warm up first</h2>
+     <p>Singers warm up before songs, like stretching before sport. It takes about ${WARMUP.minutes} minutes. Then every song is open until midnight.</p>
+     <p>Today’s control: <span class="ctl">${esc(WARMUP.controlTitle())}</span></p>
+     <button class="btn primary big wide" data-act="lock-warm">${ICON.play}Start warm-up</button>
+     <button class="btn text wide" data-act="sheet-close">Not now</button>
+     <button class="care-link" data-act="lock-care">${ICON.heart}Throat sore today? Rest your voice</button>`,
+    {
+      'lock-warm': () => {
+        closeSheet(true);
+        openItem('warmup', 'warmup');
+      },
+      // A sore throat means rest, not the warm-up: open the care page at its "rest" card.
+      'lock-care': () => {
+        pendingSong = null;
+        careSheet('rest');
+      },
+    },
+    { cls: 'lock', label: 'Warm up first', onClose: () => (pendingSong = null) }
+  );
+}
+
+// The Child preset also sets How strict to Relaxed while it's still on the default, since young
+// singers' pitch is still developing. Returns true when it did.
+function applyPreset(key) {
+  store.setRange({ ...PRESETS[key] }, key);
+  if (key !== 'child' || S().strict !== 'standard') return false;
+  store.setSetting('strict', 'relaxed');
+  return true;
+}
+
+// Says so once, after whatever the preset tap opened (or went back to) has settled.
+function relaxedNote() {
+  setTimeout(() => {
+    if (sheet) return;
+    openSheet(
+      `<h2>How strict: Relaxed</h2>
+       <p>We set How strict to Relaxed, which suits young singers. Change it any time in Settings.</p>
+       <button class="btn primary big wide" data-act="sheet-close">OK</button>`,
+      {},
+      { cls: 'centered', label: 'How strict' }
+    );
+  }, 400);
 }
 
 function afterRangeSaved(replace) {
@@ -447,9 +569,10 @@ const GLOBAL = {
     show(rangeCtrl(), !(current && current.name === 'range'));
   },
   preset: (el) => {
-    store.setRange({ ...PRESETS[el.dataset.v] }, el.dataset.v);
+    const relaxed = applyPreset(el.dataset.v);
     closeSheet(true);
     if (!afterRangeSaved(false) && current && current.refresh) current.refresh();
+    if (relaxed) relaxedNote();
   },
 };
 
@@ -604,7 +727,7 @@ function heroHTML() {
   const trail = warmTrail();
   if (warmedUpToday()) {
     const warm = store.data.warm;
-    const at = warm && warm.at ? new Date(warm.at).toLocaleTimeString('en-AU', { hour: 'numeric', minute: '2-digit' }) : null;
+    const at = warm && warm.at ? clockTime(warm.at) : null;
     const lock = lockEnabled();
     return `<section class="hero done" aria-label="Daily warm-up, done today">
       ${STAFF}${hum('happy')}
@@ -633,7 +756,7 @@ function heroHTML() {
     <p class="sub">${warmLength()}.${ctl ? `<br>Today: <b>${esc(ctl.title)}</b>` : ''}</p>
     ${stepsHTML(trail, false)}
     <button class="btn ${noRange ? 'secondary' : 'primary'} big wide" data-act="open" data-kind="warmup" data-id="warmup">${ICON.play}Start warm-up</button>
-    <p class="safe-line">${ICON.heart}Sing easy and comfy. Stop if anything hurts.</p>
+    <button class="safe-line" data-act="care" aria-label="Sing easy and comfy. Stop if anything hurts. Look after your voice">${ICON.heart}<span>Sing easy and comfy. Stop if anything hurts.</span></button>
   </section>`;
 }
 
@@ -867,7 +990,10 @@ function homeCtrl() {
 
 function buildPlan(kind, id, mode) {
   const range = store.data.range;
-  if (kind === 'warmup') return { id: 'warmup', title: WARMUP.title, steps: WARMUP.build(range) };
+  if (kind === 'warmup') {
+    const date = new Date();
+    return { id: 'warmup', title: WARMUP.title, ctl: controlFor(date), steps: WARMUP.build(range, date) };
+  }
   if (kind === 'song') {
     const song = SONGS.find((s) => s.id === id);
     return { id: 'song:' + id, title: song.title, song, steps: buildSong(song, range, { mode, headphones: S().headphones }) };
@@ -918,6 +1044,7 @@ function cueWriter(cueEl) {
 const BTN_LOOK = {
   start: ['btn primary big wide', () => `${ICON.play}Start`],
   again: ['btn primary big wide', () => `${ICON.play}Start again`],
+  carry: ['btn primary big wide', () => `${ICON.play}Carry on`],
   stop: ['btn quiet big wide', () => `${ICON.stop}Stop`],
   done: ['btn quiet big wide', () => 'Done'],
 };
@@ -960,6 +1087,15 @@ function playerCtrl({ kind, id }) {
   let lastLyr = '';
   let lastLevel = -1;
   let tol = tolerance();
+  // Warm-up only: the finished steps kept after an interruption, for "Carry on" ({ results, at }).
+  let kept = null;
+  // Move cards (a step with nothing to sing): which card, and when it runs out (audio clock).
+  let cardIdx = 0;
+  let cardEnd = 0;
+  let lastSecs = -1;
+  // The song a locked tap asked for, offered on the warm-up's done sheet.
+  const forSong = kind === 'warmup' ? pendingSong : null;
+  if (kind === 'warmup') pendingSong = null;
   const shortCredit = plan.song && plan.song.credit ? plan.song.credit.split(' · ')[0] : '';
 
   document.body.dataset.screen = 'player';
@@ -975,6 +1111,7 @@ function playerCtrl({ kind, id }) {
       <canvas id="lane"></canvas>
       <div class="countin" id="countin" hidden></div>
       <div class="between" id="between" hidden></div>
+      <div class="move" id="move" hidden></div>
     </div>
     <p class="lyrics" id="lyrics" ${plan.song ? '' : 'hidden'}></p>
     <div class="readout">
@@ -991,12 +1128,15 @@ function playerCtrl({ kind, id }) {
           : ''
       }
       <button class="btn primary big wide" data-act="start" id="startBtn"></button>
+      <button class="btn text wide" data-act="restart" id="restartBtn" hidden>Start over</button>
     </div>
   </section>`;
 
   const $ = (s) => root.querySelector(s);
   const el = {
     player: $('.player'),
+    move: $('#move'),
+    restart: $('#restartBtn'),
     cue: $('#cue'),
     sub: $('#p-sub'),
     note: $('#note'),
@@ -1012,12 +1152,16 @@ function playerCtrl({ kind, id }) {
   const setTune = tuneWriter(el.cents);
   const lane = new Lane($('#lane'));
   const step = () => plan.steps[stepIdx];
-  const modelFor = (st) => ({
-    events: st.events,
-    tonic: st.tonic,
-    minor: !!st.minor,
-    names: S().names,
-  });
+  // A move step has nothing to sing and its cards cover the lane, so it gets a plain free lane.
+  const modelFor = (st) =>
+    st.kind === 'move'
+      ? { events: [], free: true, center: (store.data.range.low + store.data.range.high) / 2 }
+      : {
+          events: st.events,
+          tonic: st.tonic,
+          minor: !!st.minor,
+          names: S().names,
+        };
   lane.setModel(modelFor(step()));
   const unwatch = watchSize(lane, $('.lane-wrap'));
   const mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -1082,6 +1226,7 @@ function playerCtrl({ kind, id }) {
 
   function subtitle(t) {
     const st = step();
+    if (st.kind === 'move' && state === 'moving') return `${st.title} · ${stepIdx + 1} of ${plan.steps.length} · ${st.cards[cardIdx].title}`;
     const parts = [];
     if (plan.steps.length > 1) parts.push(`Step ${stepIdx + 1} of ${plan.steps.length} · ${st.title}`);
     const c = cueAt(st, Math.max(0, t));
@@ -1101,12 +1246,28 @@ function playerCtrl({ kind, id }) {
     el.player.dataset.state = 'ready';
     setCue(step().intro || '', '');
     setText(el.sub, subtitle(0));
-    setBtn(el.start, results.length ? 'again' : 'start');
+    setBtn(el.start, kept ? 'carry' : results.length ? 'again' : 'start');
+    el.restart.hidden = !kept;
     el.countin.hidden = true;
     el.between.hidden = true;
+    showStepKind(step());
+    // Before Start, a move step shows what's coming (its first picture) instead of an empty lane.
+    if (step().kind === 'move') {
+      const st = step();
+      el.move.innerHTML = `<div class="move-pic">${MOVE_ART[st.cards[0].id] || ''}</div>
+        <h3>${esc(st.title)}</h3>
+        <p>${st.cards.length} quick moves for your body and breath. Then we sing.</p>
+        <div class="move-foot"><span class="move-dots" aria-hidden="true">${st.cards.map(() => '<i></i>').join('')}</span></div>`;
+      el.move.hidden = false;
+    } else el.move.hidden = true;
     lastLyr = '';
-    setProgress(-1);
+    setProgress(kept ? kept.at : -1);
     renderLyrics(previewTime(step()));
+  }
+
+  // data-step="move" hides the lane's canvas (its panel sits in the same box).
+  function showStepKind(st) {
+    el.player.dataset.step = st.kind === 'move' ? 'move' : 'sing';
   }
 
   function clearHits() {
@@ -1130,17 +1291,87 @@ function playerCtrl({ kind, id }) {
     uiIdx = 0;
     live = null;
     lastLyr = '';
+    setBtn(el.start, 'stop');
+    el.restart.hidden = true;
+    el.between.hidden = true;
+    showStepKind(st);
+    if (st.kind === 'move') return startMove(st);
     audio.openBus();
     audio.tracker.reset();
     T0 = audio.now() + LEAD;
     state = 'running';
     el.player.dataset.state = 'running';
-    setBtn(el.start, 'stop');
-    el.between.hidden = true;
+  }
+
+  // ---- Move cards: a picture, what to do, a countdown ring and Next. The mic stays on (the
+  // level bar moves) but nothing is kept or scored, and the warm-up check skips the step.
+  let moveBits = null;
+  function startMove(st) {
+    state = 'moving';
+    el.player.dataset.state = 'moving';
+    el.countin.hidden = true;
+    T0 = audio.now();
+    el.move.innerHTML = `<div class="move-pic"></div>
+      <h3></h3>
+      <p aria-live="polite"></p>
+      <div class="move-foot"><span aria-hidden="true">${moveRing(0, 0)}</span><span class="move-dots" role="img"></span></div>
+      <button class="btn primary" data-act="move-next">Next</button>`;
+    moveBits = {
+      pic: el.move.querySelector('.move-pic'),
+      h: el.move.querySelector('h3'),
+      say: el.move.querySelector('p'),
+      dots: el.move.querySelector('.move-dots'),
+      arc: el.move.querySelector('.move-ring circle:last-of-type'),
+      secs: el.move.querySelector('.move-ring b'),
+    };
+    el.move.hidden = false;
+    cardIdx = 0;
+    showCard(st);
+    setCue(st.title, '');
+  }
+
+  function showCard(st) {
+    const card = st.cards[cardIdx];
+    cardEnd = audio.now() + card.secs;
+    lastSecs = -1;
+    moveBits.pic.innerHTML = MOVE_ART[card.id] || '';
+    moveBits.h.textContent = card.title;
+    moveBits.say.innerHTML = cueHTML(card.say);
+    moveBits.dots.innerHTML = st.cards.map((_, i) => `<i class="${i < cardIdx ? 'done' : i === cardIdx ? 'on' : ''}"></i>`).join('');
+    moveBits.dots.setAttribute('aria-label', `Card ${cardIdx + 1} of ${st.cards.length}`);
+    setText(el.sub, subtitle(0));
+    moveTick(st, audio.now());
+  }
+
+  function moveTick(st, now) {
+    const card = st.cards[cardIdx];
+    const left = cardEnd - now;
+    const frac = clamp01(1 - left / card.secs);
+    const secs = Math.max(0, Math.ceil(left));
+    if (secs !== lastSecs) {
+      lastSecs = secs;
+      setText(moveBits.secs, String(secs));
+    }
+    moveBits.arc.setAttribute('stroke-dashoffset', (163.4 * (1 - frac)).toFixed(1));
+    setProgress(stepIdx, (cardIdx + frac) / st.cards.length);
+    return left;
+  }
+
+  // Next card, or on to the next step after the last one.
+  function nextCard() {
+    const st = step();
+    if (cardIdx + 1 < st.cards.length) {
+      cardIdx++;
+      showCard(st);
+    } else {
+      el.move.hidden = true;
+      endStep();
+    }
   }
 
   function begin() {
     tol = tolerance();
+    kept = null;
     results = [];
     stepIdx = 0;
     clearHits();
@@ -1148,11 +1379,27 @@ function playerCtrl({ kind, id }) {
     requestWake();
   }
 
-  function stop(message) {
+  // After an interruption, the warm-up picks up at the step it was on: the steps already
+  // finished still count, so a phone call doesn't cost the child their warm-up.
+  function carryOn() {
+    const k = kept;
+    if (!k) return begin();
+    kept = null;
+    tol = tolerance();
+    results = k.results;
+    stepIdx = k.at;
+    for (const st of plan.steps.slice(k.at)) for (const e of st.events) delete e.hits;
+    startStep();
+    requestWake();
+  }
+
+  // keep: { results, at } to offer "Carry on" (warm-up only), else null.
+  function stop(message, keep = null) {
     audio.closeBus();
     releaseWake();
     results = [];
-    stepIdx = 0;
+    kept = keep;
+    stepIdx = keep ? keep.at : 0;
     frames = [];
     live = null;
     clearHits();
@@ -1236,7 +1483,7 @@ function playerCtrl({ kind, id }) {
     else if (cur) {
       if (cur.role === 'listen') text = cur.m2 != null ? 'Listen to the slide' : 'Listen';
       else if (cur.m2 != null) text = 'Your turn: slide with it';
-      else if (cur.hold) text = `Hold it · ${Math.max(1, Math.ceil(cur.t + cur.d - t))}`;
+      else if (cur.hold) text = `${cur.swell ? 'Grow, then shrink' : 'Hold it'} · ${Math.max(1, Math.ceil(cur.t + cur.d - t))}`;
       else if (plan.song) text = 'Your turn';
       else text = `Your turn: sing on “${st.vowel}”`;
     } else if (!next) text = 'Nicely done';
@@ -1308,7 +1555,9 @@ function playerCtrl({ kind, id }) {
       const i = stepIdx + 1;
       const nx = plan.steps[i];
       lane.setModel(modelFor(nx));
-      const pic = plan.id === 'warmup' && warmTrail()[i] ? `<span class="bico">${ICON[warmTrail()[i].icon]}</span>` : '';
+      showStepKind(nx);
+      const trail = plan.id === 'warmup' ? warmTrail(plan.ctl) : [];
+      const pic = trail[i] ? `<span class="bico">${ICON[trail[i].icon]}</span>` : '';
       el.between.innerHTML = `${pic}<span class="eyebrow">Up next · step ${i + 1} of ${plan.steps.length}</span><h3>${esc(nx.title)}</h3><p>${cueHTML(nx.intro || '')}</p><span class="between-count" id="bcount" aria-hidden="true">4</span><button class="btn text" data-act="skip">Start now</button>`;
       el.between.hidden = false;
       betweenUntil = audio.now() + 4;
@@ -1323,6 +1572,7 @@ function playerCtrl({ kind, id }) {
     audio.closeBus();
     releaseWake();
     const sum = summarize(results);
+    if (plan.id === 'warmup') return finishWarmup(sum);
     // A run the mic barely heard still shows its result, but doesn't count as practice.
     const heard = wasHeard(sum);
     const prev = store.data.progress[plan.id];
@@ -1404,6 +1654,136 @@ function playerCtrl({ kind, id }) {
     requestAnimationFrame(() => drawOverview(bd.querySelector('.replay'), results));
   }
 
+  // ---- The daily warm-up's ending: it counts only if the app heard every sung part (warmupCheck).
+  // Then it opens songs until midnight and counts as a practice day. No score headline: it isn't a test.
+  function finishWarmup(sum) {
+    const check = warmupCheck(results);
+    if (check.ok) {
+      store.setWarm({ day: today(), at: Date.now(), heard: +check.coverage.toFixed(2), ctl: plan.ctl });
+      store.record('warmup', sum.score);
+      cheer();
+    }
+    setBtn(el.start, 'again');
+    setCue(check.ok ? 'Warmed up' : NOT_HEARD, '');
+    setProgress(seg.n, 1, true);
+    warmupSheet(sum, check);
+  }
+
+  // A quiet rising do, mi, sol, do from the five-note scale's first key.
+  function cheer() {
+    if (!audio.ctx) return;
+    const scale = plan.steps.find((st) => st.title === 'Five-note scale');
+    const T = scale ? scale.tonic : 60;
+    audio.openBus();
+    const t0 = audio.now() + 0.1;
+    [0, 4, 7, 12].forEach((d, i) => audio.guide(T + d, t0 + i * 0.17, i === 3 ? 0.6 : 0.2, 0.11));
+  }
+
+  // The day's control move, measured for the done sheet: [value, what it is].
+  function controlStat(sum, check) {
+    const p = check.perStep.find((x) => x.title === CONTROL_TITLES[plan.ctl]);
+    if (plan.ctl === 'hold') return [sum.longest != null ? `${sum.longest.toFixed(1)} s` : '–', 'longest steady hold'];
+    if (plan.ctl === 'swell') return [sum.steadiness != null ? `${Math.round(sum.steadiness * 100)}%` : '–', 'held steady'];
+    if (plan.ctl === 'bounce') return [p ? `${p.heard} of ${p.total}` : '–', 'bouncy “ha” notes'];
+    return [p ? `${p.heard} of ${p.total}` : '–', 'slides'];
+  }
+
+  // The range re-test row on the done sheet: when the re-test is due, or the range looks narrow
+  // (a warm voice is the best time to test). "Later" puts both off for a week.
+  function warmNudge() {
+    const d = store.data;
+    if (!d.range) return null;
+    const due = rangeDue();
+    if (due) return due;
+    const snoozed = d.nudge && d.nudge.range && daysBetween(d.nudge.range, today()) < 7;
+    if (!snoozed && d.range.high - d.range.low < 9) return 'Your range looks quite narrow. Most voices can do more once they’re warm. Check it now?';
+    return null;
+  }
+
+  // settled: shown again (after the care sheet or "Later"), so no confetti the second time.
+  function warmupSheet(sum, check, settled = false) {
+    const lock = lockEnabled();
+    const song = forSong && SONGS.find((x) => x.id === forSong.id);
+    const acts = {
+      again: () => {
+        closeSheet(true);
+        stop();
+      },
+      done: () => {
+        closeSheet(true);
+        goBack();
+      },
+      songs: () => {
+        closeSheet(true);
+        if (song) openItemReplace('song', song.id);
+        else goToTab('songs');
+      },
+      copy: (btn) => copyReport(btn, sum),
+      care: () => careSheet(null, () => warmupSheet(sum, check, true)),
+      'nudge-later': () => {
+        store.putOffNudge('range');
+        warmupSheet(sum, check, true);
+      },
+    };
+    const links = `<div class="sheet-links">
+        <button class="btn text" data-act="copy">Copy results for Claude</button>
+        <button class="care-link" data-act="care">${ICON.heart}Look after your voice</button>
+      </div>`;
+    if (!check.ok) {
+      openSheet(
+        `<p class="eyebrow">${esc(WARMUP.title)}</p>
+         ${hum('sing')}
+         <h2>${NOT_HEARD}</h2>
+         ${check.missed.length ? `<p>I didn’t hear you in:</p><div class="missed">${check.missed.map((t) => `<span>${esc(t)}</span>`).join('')}</div>` : ''}
+         <p>Sing each note right to the end of its bar, at a medium volume, with the phone about an arm’s length away.</p>
+         ${lock ? '<p>Songs open after a warm-up I can hear.</p>' : ''}
+         <div class="sheet-actions">
+           <button class="btn secondary" data-act="done">Done</button>
+           <button class="btn primary" data-act="again">Try again</button>
+         </div>
+         ${links}`,
+        acts,
+        { cls: 'warm-miss', label: 'Warm-up not heard', key: 'warm', onClose: () => stop() }
+      );
+      return;
+    }
+    const [v, what] = controlStat(sum, check);
+    const nudge = warmNudge();
+    const width = Math.min(window.innerWidth, 560);
+    openSheet(
+      `<p class="eyebrow">${esc(WARMUP.title)}</p>
+       ${hum('happy')}
+       <h2>Warmed up!</h2>
+       ${lock ? `<span class="unlock-chip">${ICON.unlock}Songs are open until midnight</span>` : '<p>Your voice is ready.</p>'}
+       <div class="stats two">
+         <div><b>${Math.round(check.coverage * 100)}%</b><span>voice heard</span></div>
+         <div><b>${esc(v)}</b><span>${esc(what)}</span></div>
+       </div>
+       ${
+         nudge
+           ? `<section class="card nudge" aria-label="Check your range">
+               <i>${ICON.grow}</i>
+               <div><p>${esc(nudge)}</p><div class="row"><button class="btn secondary small" data-act="range">Check my range</button><button class="btn text small" data-act="nudge-later">Later</button></div></div>
+             </section>`
+           : ''
+       }
+       <div class="sheet-actions">
+         <button class="btn secondary" data-act="done">Done</button>
+         <button class="btn primary" data-act="songs">${ICON.songs}${song ? `Sing ${esc(song.title)}` : 'Go to Songs'}</button>
+       </div>
+       <p class="care-line">Throat scratchy or sore? Stop for today and have a drink of water.</p>
+       ${links}`,
+      acts,
+      {
+        cls: `warm-done${settled ? ' settled' : ''}`,
+        label: 'Warm-up done',
+        key: 'warm',
+        onClose: () => stop(),
+        before: settled ? '' : confetti(AROUND, [50, 130], width),
+      }
+    );
+  }
+
   async function copyReport(btn, sum) {
     const range = store.data.range;
     const text = reportText({
@@ -1432,10 +1812,20 @@ function playerCtrl({ kind, id }) {
     name: 'player',
     actions: {
       start: () => {
-        if (state === 'running' || state === 'between') return stop();
+        if (state === 'running' || state === 'between' || state === 'moving') return stop();
+        audio.unlock();
+        const go = kept ? carryOn : begin;
+        if (!audio.micOn) return micSheet(go);
+        go();
+      },
+      restart: () => {
+        kept = null;
         audio.unlock();
         if (!audio.micOn) return micSheet(begin);
         begin();
+      },
+      'move-next': () => {
+        if (state === 'moving') nextCard();
       },
       hp: (btn) => {
         const on = !S().headphones;
@@ -1483,6 +1873,13 @@ function playerCtrl({ kind, id }) {
         readout(r, cur && cur.role === 'sing' ? targetAt(cur, t) : null, st, t);
         progressAt(Math.max(0, t));
         if (t > st.end + 0.35) endStep();
+      } else if (state === 'moving') {
+        // A soft accented click when a card runs out, so non-readers hear when to switch.
+        if (moveTick(step(), now) <= 0) {
+          audio.play({ kind: 'click', accent: true }, now + 0.01);
+          nextCard();
+        }
+        if (state === 'moving') readout(r, null, step(), 0);
       } else if (state === 'between') {
         const nx = plan.steps[stepIdx + 1];
         const left = betweenUntil - now;
@@ -1502,10 +1899,15 @@ function playerCtrl({ kind, id }) {
       }
     },
     pause() {
-      if (state === 'running' || state === 'between') stop('Stopped because the app lost focus. Tap Start to go again.');
+      if (state !== 'running' && state !== 'between' && state !== 'moving') return;
+      const at = state === 'between' ? stepIdx + 1 : stepIdx;
+      const keep = plan.id === 'warmup' && results.length ? { results: results.slice(), at } : null;
+      if (keep) stop('Paused because the app lost focus. Tap Carry on to pick up where you left off.', keep);
+      else stop('Stopped because the app lost focus. Tap Start to go again.');
     },
     probe() {
       const st = step();
+      if (state === 'moving') return { state, t: audio.now() - T0, step: stepIdx, card: cardIdx, role: null, target: null };
       const t = audio.now() - T0;
       const cur = st.events.find((e) => t >= e.t && t < e.t + e.d);
       return { state, t, step: stepIdx, role: cur ? cur.role : null, target: cur ? targetAt(cur, t) : null };
@@ -1526,6 +1928,7 @@ function playerCtrl({ kind, id }) {
 
 function openItemReplace(kind, id) {
   // Swap the current screen without growing the history stack.
+  if (kind === 'song' && !songsUnlocked()) return lockSheet({ kind, id });
   if (!store.data.range) return openItem(kind, id);
   if (current && current.destroy) current.destroy();
   current = kind === 'lesson' && id === 'range' ? rangeCtrl() : playerCtrl({ kind, id });
@@ -1717,9 +2120,10 @@ function rangeCtrl() {
            <p class="presets-note">${VOICE_CHANGING}</p>`,
           {
             'r-preset': (b) => {
-              store.setRange({ ...PRESETS[b.dataset.v] }, b.dataset.v);
+              const relaxed = applyPreset(b.dataset.v);
               closeSheet(true);
               if (!afterRangeSaved(true)) goBack();
+              if (relaxed) relaxedNote();
             },
           },
           { label: 'Typical ranges' }

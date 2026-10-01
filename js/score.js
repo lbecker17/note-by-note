@@ -165,6 +165,31 @@ export function wasHeard(sum) {
   return heardShare(sum) >= HEARD_MIN;
 }
 
+// ---------- Did the daily warm-up count? ----------
+// It checks that the singer took part, not whether they were in tune:
+//   1. every sung step: at least half its notes and slides had a voiced frame near them, and
+//   2. the voice was heard for at least HEARD_MIN of the sung time (the same rule as practice days).
+// Steps with nothing to sing (the move cards) are never checked.
+export const STEP_HEARD_MIN = 0.5;
+
+function noteHeard(ev, frames) {
+  const a = ev.t - 0.1, z = ev.t + ev.d + 0.15;
+  return frames.some((f) => f.m != null && f.t >= a && f.t <= z);
+}
+
+// results: [{ step, notes, frames }] from the player.
+export function warmupCheck(results) {
+  const sung = results.filter((r) => r.step.kind !== 'move' && r.step.events.some((e) => e.role === 'sing'));
+  const perStep = sung.map((r) => {
+    const evs = r.step.events.filter((e) => e.role === 'sing');
+    const heard = evs.filter((e) => noteHeard(e, r.frames)).length;
+    return { title: r.step.title, heard, total: evs.length, share: heard / evs.length };
+  });
+  const sum = summarize(sung);
+  const missed = perStep.filter((p) => p.share < STEP_HEARD_MIN).map((p) => p.title);
+  return { ok: sung.length > 0 && missed.length === 0 && wasHeard(sum), coverage: heardShare(sum), perStep, missed };
+}
+
 export function verdict(score) {
   if (score >= 0.85) return 'Spot on';
   if (score >= 0.65) return 'Nicely done';

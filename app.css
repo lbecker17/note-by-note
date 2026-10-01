@@ -342,6 +342,9 @@ body[data-screen="player"] .tabbar { display: none; }
 .step.today i { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
 .safe-line { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 12px; font: 700 14px/1.3 var(--font-body); color: var(--hero-fg-2); text-align: center; } /* NEW (graft) */
 .safe-line svg { width: 16px; height: 16px; color: var(--accent); flex: none; }
+/* The safety line opens "Look after your voice" */
+button.safe-line { width: 100%; min-height: 44px; margin: 4px 0 -8px; padding: 0; border: 0; background: none; }
+button.safe-line span { text-decoration: underline; text-decoration-color: var(--hero-line); text-underline-offset: 3px; }
 .hero.done { background: var(--done-bg); }
 .hero.done .chip { color: var(--good); box-shadow: inset 0 0 0 1px var(--done-line); }
 .hero.done .sub { color: var(--done-fg-2); max-width: 54%; }
@@ -525,7 +528,7 @@ body[data-screen="player"] .tabbar { display: none; }
 .cue .phase svg { width: 22px; height: 22px; }
 .cue[data-phase="sing"] .phase { background: var(--accent-soft); color: var(--accent-ink); box-shadow: inset 0 0 0 2px var(--accent); }
 .cue:not([data-phase]) .phase, .cue[data-phase=""] .phase { display: none; }
-.cue .say, .between .say { display: inline-block; padding: 0 8px 2px; border-radius: 10px; background: var(--accent-soft); color: var(--accent-ink); }
+.cue .say, .between .say, .move .say { display: inline-block; padding: 0 8px 2px; border-radius: 10px; background: var(--accent-soft); color: var(--accent-ink); }
 .say-w { white-space: nowrap; }
 .player[data-state="ready"] .cue { font-size: 17px; font-weight: 600; color: var(--fg-2); }
 .lane-wrap { position: relative; flex: 1; min-height: 200px; margin: 0 12px; border-radius: var(--r-lg); overflow: hidden; background: var(--lane-bg); border: 1px solid var(--line); box-shadow: var(--shadow); }
@@ -541,7 +544,7 @@ body[data-screen="player"] .tabbar { display: none; }
 .between p { color: var(--fg-2); max-width: 32ch; font-size: 15px; }
 .between .between-count { font: 600 44px/1 var(--font-display); color: var(--fg); margin: 4px 0; }
 /* "Wake up your body" move cards NEW */
-.player[data-state="moving"] .lane-wrap canvas { visibility: hidden; }
+.player[data-state="moving"] .lane-wrap canvas, .player[data-step="move"] .lane-wrap canvas { visibility: hidden; }
 .move { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 18px 20px; text-align: center; }
 .move .move-art { width: 140px; height: 140px; }
 .move h3 { margin-top: 4px; font: 600 26px/1.1 var(--font-display); letter-spacing: -0.01em; }
@@ -626,6 +629,11 @@ body[data-screen="player"] .tabbar { display: none; }
   font: 800 20px/1 var(--font-body); text-align: center;
 }
 .gate .err { grid-column: 1 / -1; color: var(--danger); font-size: 14px; font-weight: 700; }
+/* The warm-up lock row: today's status and the honest note under it */
+.field .lock-today { display: flex; align-items: center; gap: 4px; margin-top: 6px; font-weight: 700; color: var(--fg-2); }
+.field .lock-today.done { color: var(--good); }
+.lock-today svg { width: 16px; height: 16px; flex: none; }
+.lock-note { font-size: 13px; color: var(--muted); margin-top: -8px; }
 .about { font-size: 13px; text-align: center; color: var(--muted); }
 
 /* Results */
@@ -664,6 +672,8 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
 .missed { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
 .missed span { padding: 3px 10px; border-radius: var(--r-pill); background: var(--surface-2); color: var(--fg-2); font: 800 13px/1.3 var(--font-body); }
 .sheet .ctl { font-weight: 800; color: var(--fg); }
+.sheet .nudge { text-align: left; box-shadow: none; background: var(--bg); }
+.sheet.lock .btn.text { margin-top: -8px; }
 /* Care sheet NEW */
 .care-grid { display: flex; flex-direction: column; gap: 8px; }
 .care-card { display: grid; grid-template-columns: 44px 1fr; gap: 12px; align-items: start; background: var(--bg); border: 1px solid var(--line); border-radius: 18px; padding: 12px; }
@@ -746,4 +756,17 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
   .cue { min-height: 0; padding-block: 6px 8px; }
   .lyrics { min-height: 0; font-size: 17px; }
   .move .move-art { width: 104px; height: 104px; }
+}
+/* Move cards on short screens (iPhone SE): smaller picture and ring; if it still doesn't fit, the
+   panel scrolls rather than hiding the Next button (auto margins keep it centred when it fits). */
+.move { justify-content: flex-start; overflow-y: auto; }
+.move > :first-child { margin-top: auto; }
+.move > :last-child { margin-bottom: auto; }
+@media (max-height: 700px) {
+  .move { gap: 6px; padding: 10px 14px; }
+  .move .move-art { width: 84px; height: 84px; }
+  .move h3 { font-size: 22px; }
+  .move p { font-size: 15px; }
+  .move-ring, .move-ring svg { width: 52px; height: 52px; }
+  .move-ring b { font-size: 20px; }
 }
