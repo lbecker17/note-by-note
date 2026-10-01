@@ -5,9 +5,9 @@
 // Everything here is pure and deterministic: plain data in, plain data out,
 // no DOM, no Web Audio and no randomness, so it runs the same in Node tests.
 
-import { pc } from './music.js';
+import { pc, MAJOR } from './music.js';
 
-// Tempos the child picks from, rather than us guessing one from free-time singing.
+// Tempos the child picks from for playback. The beat itself comes from the singing.
 export const TEMPOS = { slow: 72, medium: 96, fast: 120 };
 
 // ---------- Finding notes ----------
@@ -28,22 +28,21 @@ const HOLE_CONSONANT = 0.03; // half a typical consonant before a note, in secon
 const LEVEL_DIP = 0.35; // a level this far under the singing either side is a break between notes
 const SCOOP_LONG = 0.3; // seconds: a slide shorter than this that lands on a note is a scoop into it
 const SLIDE_MAX = 1.5; // semitones between two pieces that may still be one note on a slide
-const SPOKEN = 0.35; // seconds: a take of 8 or more sounds, none this long and many sliding, is speech
+const SPOKEN = 0.35; // seconds: syllables are shorter than this, and most sung tunes hold some notes longer
+const SYLLABLE = 0.22; // seconds: the middle length of a run of spoken syllables is under this
 const LONELY = 0.3; // seconds of silence either side that leave a sound on its own
 const BLIP_SMEAR = 0.02; // seconds a lone short sound looks longer than it was
 
-// frames: [{ t, m, rms? }] in time order, m a MIDI float or null.
-// Returns { notes: [{ t0, t1, m, p, conf }], sungSeconds, glideShare, tuning }.
-// m is the measured centre of each note. p is the note it was aiming for: the take is first
-// moved by the singer's own tuning (see tuneNotes), so a child who sings everything a little
-// sharp still gets the notes they meant. `tuning` (semitones) is that correction at the start
-// of the take; it follows the singer from phrase to phrase, and when it has wandered more than
-// half a semitone p follows the new key, as a listener would. A note that sits well between
-// two semitones goes to the one the tune uses (see aimedNotes), so p is within a semitone of
-// m but is not always Math.round(m - tuning).
+// frames: [{ t, m, rms? }], m a MIDI float or null.
+// Returns { notes: [{ t0, t1, m, p, conf, tune }], sungSeconds, glideShare, tuning }.
+// m is the measured centre of a note and p the note it was aiming for. tune is the singer's
+// tuning for that note's phrase (semitones; `tuning` is the first phrase's), so p is
+// Math.round(m - tune), except that a note sitting well between two semitones goes to the one
+// the tune uses (aimedNotes). p is always within a semitone of m.
 export function findNotes(frames, opts = {}) {
   const o = { ...NOTE_OPTS, ...opts };
-  if (!Array.isArray(frames) || !frames.length) return { notes: [], sungSeconds: 0, glideShare: 0, tuning: 0 };
+  frames = inOrder(frames);
+  if (!frames.length) return { notes: [], sungSeconds: 0, glideShare: 0, tuning: 0 };
   const dt = framePeriod(frames);
   const { runs, sung } = voicedRuns(frames, o.gap, dt);
   let glide = 0;
@@ -61,17 +60,14 @@ export function findNotes(frames, opts = {}) {
     run.lonely = before > LONELY && after > LONELY;
   });
   for (const run of kept) {
-    const segs = segmentRun(run, o.penalty, dt);
+    const segs = scoopSplit(run, segmentRun(run, o.penalty, dt));
     const res = runNotes(run, segs, o);
     glide += res.glide;
     found = found.concat(res.notes);
   }
+  if (spoken(found)) found = [];
 
-  // Talking, not singing: a run of syllables, none held as long as a sung note usually is at
-  // least once in a tune, and many sliding through their pitch. That is speech, not a tune.
-  if (found.length >= 8 && found.every((n) => n.t1 - n.t0 < SPOKEN) && found.filter((n) => n.slides).length >= 0.25 * found.length) found = [];
-
-  const { aimed, miss, tuning } = tuneNotes(found);
+  const { aimed, miss, tuning, off } = tuneNotes(found);
 
   const notes = [];
   for (let i = 0; i < found.length; i++) {
@@ -88,7 +84,7 @@ export function findNotes(frames, opts = {}) {
       prev.t1 = n.t1;
       continue;
     }
-    notes.push({ t0: n.t0, t1: n.t1, m: n.m, p, conf: n.conf, miss: miss[i] });
+    notes.push({ t0: n.t0, t1: n.t1, m: n.m, p, conf: n.conf, tune: off[i], miss: miss[i] });
   }
   for (const n of notes) {
     // A note far from the semitone it was taken for (after tuning) is a less certain guess.
@@ -97,6 +93,7 @@ export function findNotes(frames, opts = {}) {
     n.m = round(n.m, 3);
     n.t0 = round(n.t0, 4);
     n.t1 = round(n.t1, 4);
+    n.tune = round(n.tune, 3);
   }
   return {
     notes,
@@ -104,6 +101,30 @@ export function findNotes(frames, opts = {}) {
     glideShare: sung > 0 ? round(Math.min(1, glide / sung), 3) : 0,
     tuning: round(tuning, 3),
   };
+}
+
+// Talking, not singing: eight or more syllables, mostly shorter than sung notes, at most one
+// held as long as a tune nearly always holds a few, and many sliding right through their pitch.
+function spoken(found) {
+  const n = found.length;
+  if (n < 8) return false;
+  const lengths = found.map((x) => x.t1 - x.t0).sort((a, b) => a - b);
+  const held = n - lowerBound(lengths, SPOKEN);
+  return held <= (n >= 12 ? 1 : 0) && lengths[n >> 1] < SYLLABLE && found.filter((x) => x.slides).length >= 0.2 * n;
+}
+
+// Frames with a usable time, in time order. Free sing pushes them in order; a frame with no
+// time, or a clock that jumps, must not cut the rest of the take off.
+function inOrder(frames) {
+  if (!Array.isArray(frames)) return [];
+  const ok = [];
+  let sorted = true;
+  for (const f of frames) {
+    if (!f || typeof f.t !== 'number' || !Number.isFinite(f.t)) continue;
+    if (ok.length && f.t < ok[ok.length - 1].t) sorted = false;
+    ok.push(f);
+  }
+  return sorted ? ok : ok.sort((a, b) => a.t - b.t);
 }
 
 // Long notes say more about the tuning than short ones, up to a point.
@@ -119,19 +140,13 @@ const DRIFT = 0.15; // typical move in tuning from one phrase to the next (semit
 const LEAN = 0.6; // largest move between two phrases worth considering
 const NOTE_SD = 0.3; // first guess at how far a note lands from the semitone meant
 
-// The singer's tuning, phrase by phrase, and the note each piece was aiming for.
-// A tuning is how far the singer sits from A440 equal temperament (semitones), and the right
-// one is the one that puts the notes in a key: so every tuning is scored against every major
-// scale (a minor key shares its relative major's notes), each note counting as whichever
-// nearby semitone fits better, a scale note being far likelier than any other. This beats
-// averaging how far each note sits from its nearest semitone (a circular mean): that only
-// works when the notes land within a quarter of a semitone or so, and children's often don't.
-// Singers drift, so after a breath (a silence of PHRASE_GAP or more) the tuning may move, by
-// about DRIFT per phrase, best path through the take found by dynamic programming. The take
-// starts within half a semitone of A440 by definition (that picks which notes are which);
-// when it later wanders past half a semitone, p moves with it, into the key the singer is
-// now in. Returns, per piece, the note p, how far it sat from that note after tuning (miss),
-// and the tuning at the start of the take.
+// The singer's tuning (semitones from A440) phrase by phrase, and the note each piece was
+// aiming for. The right tuning is the one that puts the notes in some major scale; a circular
+// mean of how far notes sit from their semitones fails once they land a third of a semitone
+// off, as children's often do. After a breath the tuning may drift (best path by dynamic
+// programming); past half a semitone, p follows the singer into the new key.
+// Returns per piece the note p and how far it sat from it (miss), the tuning at the start,
+// and each piece's tuning as p sees it (off).
 function tuneNotes(found) {
   const N = found.length;
   const w = found.map(tuneWeight);
@@ -140,7 +155,7 @@ function tuneNotes(found) {
     const { mu, R } = circularMean(found.map((n) => n.m), w);
     const tuning = R > 0.25 ? mu : 0;
     const aimed = found.map((n) => Math.round(n.m - tuning));
-    return { aimed, miss: found.map((n, i) => Math.abs(n.m - tuning - aimed[i])), tuning };
+    return { aimed, miss: found.map((n, i) => Math.abs(n.m - tuning - aimed[i])), tuning, off: found.map(() => tuning) };
   }
   // Phrases: a new one after a long enough silence.
   const phrase = new Int32Array(N);
@@ -156,7 +171,8 @@ function tuneNotes(found) {
     const p = q[i] + Math.round(off[i] - off[0]);
     return Math.min(Math.floor(n.m + 1), Math.max(Math.ceil(n.m - 1), p));
   });
-  return { aimed, miss: y.map((v, i) => Math.abs(v.m - q[i])), tuning: off[0] };
+  // Each note's tuning as p sees it: once it has drifted past half a semitone, p has moved key.
+  return { aimed, miss: y.map((v, i) => Math.abs(v.m - q[i])), tuning: off[0], off: off.map((v) => v - Math.round(v - off[0])) };
 }
 
 // How far notes sit from their nearest semitone after tuning, as the width (sd) of a bell
@@ -254,15 +270,11 @@ function circularMean(xs, ws) {
   return wsum > 0 ? { mu: Math.atan2(s, c) / (2 * Math.PI), R: Math.hypot(c, s) / wsum } : { mu: 0, R: 0 };
 }
 
-// The note each piece was aiming for, from pitches already moved by the singer's tuning
-// (found[i].m). Rounding is right for a steady singer, but children (and tired adults) land
-// a third or more of a semitone off quite often, and then plain rounding picks a note the
-// tune never uses. So each note weighs how close it is to each semitone (a bell curve `sig`
-// wide, this singer's own scatter) against how much the take uses that pitch class: its own
-// sung pitch classes, plus the scale its pitches fit. An accurate singer's chromatic note
-// stays put (it is close to its semitone); a wobbly note between two semitones goes to the
-// one in the tune. The answer is never more than a semitone from the pitch.
-const MAJOR = [0, 2, 4, 5, 7, 9, 11];
+// The note each piece was aiming for, from pitches already moved by the singer's tuning.
+// Plain rounding picks notes the tune never uses when a child lands a third of a semitone
+// off, so each note weighs its closeness to each semitone (this singer's scatter, `sig`)
+// against how much the rest of the take uses that pitch class and the scale it fits. An
+// accurate singer's chromatic note stays put. Never more than a semitone from the pitch.
 const SCALE_CLOSE = 1; // scales whose fit is within this (log-likelihood, seconds) of the best still count
 const TAIL = 0.6; // width (sd, semitones) of the occasional note that lands well off: anywhere within a semitone or so
 function aimedNotes(found, sig) {
@@ -360,14 +372,10 @@ function framePeriod(frames) {
 }
 
 // Stretches of voiced frames. Short dropouts are bridged; a longer silence starts a new run.
-// Free sing pushes a frame on every screen refresh, null when nothing is sung, so silence
-// shows up as null frames. A stretch with no frames at all is the browser missing refreshes
-// (a dropped frame, or a stall of a few hundred ms): nobody heard anything, so it is not
-// evidence of a break and the line is bridged across it, up to MAX_STALL.
-// Everything per frame is worked out in this one pass, into shared arrays that each run
-// views a slice of, which keeps a long take quick: the time each frame stands for (w; a
-// bridged hole doesn't count as singing), running sums for smoothing (PW, PX), and whether
-// the run has any big jump in it (only those can hold an octave slip).
+// Silence comes as null frames; a stretch with no frames at all is the browser missing
+// refreshes, which is no evidence of a break, so it is bridged up to MAX_STALL. One pass
+// fills shared arrays that each run views a slice of (time per frame w, running sums PW and
+// PX for smoothing, and whether a run has a jump big enough to hold an octave slip).
 function voicedRuns(frames, gap, dt) {
   const N = frames.length;
   const T = new Float64Array(N);
@@ -439,12 +447,10 @@ function voicedRuns(frames, gap, dt) {
   return { runs, sung };
 }
 
-// A short unvoiced patch where the sound carried on at the singer's own level, with the same
-// note either side: a breathy or rough moment the pitch detector lost, not a break between
-// notes. A real break (a consonant, a breath, a stop) drops well below the sung level, under
-// half of it; a hiss louder than the voice is a consonant or breath too. Needs rms; without
-// it, a gap is a gap.
-// frames[i] is the first voiced frame after the patch; the run so far is T/X/R[start, n).
+// A short unvoiced patch where the sound carried on at the singer's level with the same note
+// either side: a breathy moment the detector lost, not a break. A real break (consonant,
+// breath, stop) drops under half the sung level, and a hiss louder than the voice is one too.
+// Needs rms. frames[i] is the first voiced frame after the patch; the run is T/X/R[start, n).
 function lostVoice(frames, i, R, X, T, start, n, d, lo, hi) {
   if (!(d <= 0.25) || !(lo >= 0) || !(hi >= 0)) return false;
   const before = [];
@@ -466,10 +472,9 @@ function lostVoice(frames, i, R, X, T, start, n, d, lo, hi) {
   return lo >= 0.55 * level && hi <= 1.5 * level && Math.abs(quantile(pa, 0.5) - quantile(pb, 0.5)) < 1;
 }
 
-// The detector keeps naming a pitch for a moment after a sound stops, while its window still
-// holds the end of it (or the room is still ringing), and the level then falls to a small
-// fraction of the singing. Those frames are an echo, not the voice: without them a short blip
-// shows its true length (and is dropped as one), and a note ends where the singing did.
+// The detector keeps naming a pitch for a moment after a sound stops, at a small fraction of
+// the sung level. Dropping that echo lets a blip show its true length and a note end where
+// the singing did.
 function trimFade(run, dt, fade) {
   const { r } = run;
   const n = r.length;
@@ -509,11 +514,9 @@ function weigh(run, dt) {
   }
 }
 
-// Fold short octave jumps back onto the line and drop wild frames. A running median over
-// about a quarter of a second is the reference: it keeps real leaps (a median keeps edges)
-// but ignores a jump that lasts less than half its window.
-// Only runs with a jump of 4.5 semitones or more come here: slips and wild frames always
-// start with one. (That also keeps a steep scoop at the start of a run from looking like a slip.)
+// Fold short octave jumps back onto the line and drop wild frames, against a running median
+// over about a quarter of a second (it keeps real leaps but ignores shorter jumps). Only runs
+// with a jump of 4.5 semitones or more come here, so a steep scoop is never taken for a slip.
 function clean(run, dt) {
   const { t, x, r } = run;
   const med = runningMedian(x, Math.max(2, Math.round(0.12 / dt)));
@@ -568,12 +571,10 @@ function lowerBound(a, v) {
   return lo;
 }
 
-// Best piecewise-constant fit to the pitch line: least squares plus a fixed price per piece,
-// solved exactly by dynamic programming. A step between notes saves far more than the price;
-// vibrato swings around its centre and never pays for a cut. Glides come out as staircases,
-// which runNotes recognises. Above about 90 frames a second, neighbouring frames are averaged
-// in blocks first: the cuts only need to be roughly right (boundaries are refined at full
-// rate later) and the work falls with the square of the block size.
+// Best piecewise-constant fit to the pitch line: least squares plus a price per piece, by
+// dynamic programming. A step between notes saves far more than the price; vibrato never pays
+// for a cut; glides come out as staircases for runNotes to find. Above about 90 frames a
+// second, frames are averaged in pairs first: boundaries are refined later at full rate.
 function segmentRun(run, lambda, dt) {
   const { t, x, w } = run;
   const N = x.length;
@@ -646,7 +647,6 @@ function segStats(run, a, b) {
   let sx = 0;
   let stt = 0;
   let stx = 0;
-  let lo = Infinity;
   const t0 = t[a];
   for (let i = a; i < b; i++) {
     const u = t[i] - t0;
@@ -655,7 +655,6 @@ function segStats(run, a, b) {
     sx += w[i] * x[i];
     stt += w[i] * u * u;
     stx += w[i] * u * x[i];
-    if (x[i] < lo) lo = x[i];
   }
   const mu = sx / sw;
   const tc = st / sw;
@@ -664,7 +663,109 @@ function segStats(run, a, b) {
   const t1 = t[b - 1] + w[b - 1];
   const dur = t1 - t0;
   const rise = beta * dur;
-  return { a, b, t0, t1, dur, mu, tc, lo, beta, rise, sloped: Math.abs(rise) >= 0.6 && Math.abs(beta) >= 1.5, glide: false };
+  return { a, b, t0, t1, dur, mu, tc, beta, rise, sloped: Math.abs(rise) >= 0.6 && Math.abs(beta) >= 1.5, glide: false };
+}
+
+// A short note with a big scoop into it (or a fall at its end) can come out of segmentRun as
+// one leaning piece, often with the start of the next note's scoop on the end. Split off the
+// held part, so it counts as a note and a run of such notes is not taken for one long glide.
+function scoopSplit(run, segs) {
+  const { x } = run;
+  const out = [];
+  for (const whole of segs) {
+    let { a, b } = whole;
+    // segmentRun cuts between blocks of frames, so an end frame may belong to the next note.
+    const head = b - a >= 6 && Math.abs(x[a] - x[a + 1]) > 1;
+    const tail = b - a >= 6 && Math.abs(x[b - 1] - x[b - 2]) > 1;
+    if (head) out.push(segStats(run, a, ++a));
+    if (tail) b--;
+    const s = head || tail ? segStats(run, a, b) : whole;
+    const cut = s.dur >= 0.15 && s.dur <= 0.6 ? heldPart(run, s) : null;
+    if (!cut) out.push(s);
+    for (let i = 0; cut && i < 3; i++) {
+      if (cut[i + 1] === cut[i]) continue;
+      const piece = segStats(run, cut[i], cut[i + 1]);
+      piece.held = i === 1; // a held note, however short, not a wobble on the way to one
+      out.push(piece);
+    }
+    if (tail) out.push(segStats(run, b, b + 1));
+  }
+  return out;
+}
+
+// [a, i, j, b] when piece s is a slide into a held pitch [i, j) and/or a slide on from it,
+// else null. The held part is at least 80 ms and a third of the piece, stays within a third
+// of a semitone and explains the piece far better than a straight line does. The slides
+// together cover more than a short note's vibrato could swing in the same time, and go one
+// way (vibrato turns back).
+function heldPart(run, s) {
+  const { t, x, w } = run;
+  const { a, b } = s;
+  const n = b - a;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let k = a; k < b; k++) {
+    lo = Math.min(lo, x[k]);
+    hi = Math.max(hi, x[k]);
+  }
+  if (hi - lo < 0.8) return null;
+  // Running sums for line and level fits of any stretch of the piece.
+  const W = new Float64Array(n + 1);
+  const U = new Float64Array(n + 1);
+  const X = new Float64Array(n + 1);
+  const UU = new Float64Array(n + 1);
+  const UX = new Float64Array(n + 1);
+  const XX = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    const u = t[a + i] - t[a];
+    const v = x[a + i] - s.mu;
+    const wi = w[a + i];
+    W[i + 1] = W[i] + wi;
+    U[i + 1] = U[i] + wi * u;
+    X[i + 1] = X[i] + wi * v;
+    UU[i + 1] = UU[i] + wi * u * u;
+    UX[i + 1] = UX[i] + wi * u * v;
+    XX[i + 1] = XX[i] + wi * v * v;
+  }
+  const level = (i, j) => XX[j] - XX[i] - (X[j] - X[i]) ** 2 / (W[j] - W[i]);
+  const line = (i, j) => {
+    if (i === j) return 0;
+    const sw = W[j] - W[i];
+    const vt = UU[j] - UU[i] - (U[j] - U[i]) ** 2 / sw;
+    const cov = UX[j] - UX[i] - ((U[j] - U[i]) * (X[j] - X[i])) / sw;
+    return level(i, j) - (vt > 1e-12 ? (cov * cov) / vt : 0);
+  };
+  const minHeld = Math.max(0.08, s.dur / 3);
+  const limit = 0.4 * line(0, n);
+  // The best split with a slide before the held part only, after it only, and both.
+  const best = [null, null, null];
+  const starts = [0];
+  for (let i = 3; i <= n - 6; i++) starts.push(i);
+  for (const i of starts) {
+    for (let j = i + 3; j <= n; j = j === n - 3 ? n : j + 1) {
+      if ((i === 0 && j === n) || t[a + j - 1] + w[a + j - 1] - t[a + i] < minHeld) continue;
+      const err = line(0, i) + level(i, j) + line(j, n);
+      const f = i && j < n ? 2 : i ? 0 : 1;
+      if (err < limit && (!best[f] || err < best[f].err)) best[f] = { i, j, err };
+    }
+  }
+  for (const c of best.filter(Boolean).sort((p, q) => p.err - q.err)) {
+    const hold = Float64Array.from(x.subarray(a + c.i, a + c.j)).sort();
+    if (quantile(hold, 0.9, true) - quantile(hold, 0.1, true) > 0.33) continue;
+    const held = quantile(hold, 0.5, true);
+    // How far each slide's outer end is from the held pitch, signed so that a slide going the
+    // same way as the tune counts positive: a scoop up into a note that goes on up, say.
+    const into = c.i ? segStats(run, a, a + c.i) : null;
+    const on = c.j < n ? segStats(run, a + c.j, b) : null;
+    const before = into ? held - (into.mu - into.rise / 2) : 0;
+    const after = on ? on.mu + on.rise / 2 - held : 0;
+    const dir = Math.sign(before + after);
+    if (into && Math.sign(into.rise) !== Math.sign(before)) continue;
+    if (on && Math.sign(on.rise) !== Math.sign(after)) continue;
+    if (into && on && (Math.sign(before) !== dir || Math.sign(after) !== dir)) continue;
+    if (Math.abs(before + after) >= 0.8) return [a, a + c.i, a + c.j, b];
+  }
+  return null;
 }
 
 // Consecutive pieces of one glide: same direction, about the same speed, and each starts
@@ -844,12 +945,13 @@ function changedInHole(run, k) {
   return Math.abs(x[k] - quantile(ahead, 0.5)) < Math.abs(x[k] - x[k - 1]);
 }
 
-// Whether frames [a, b) slide steadily through half a semitone or more: a straight line
-// through them explains most of how they move (vibrato and a scoop into a held pitch don't).
+// Whether frames [a, b) slide through half a semitone or more the way a spoken syllable does:
+// in a straight line, one way only (vibrato turns back) and right through to the end (a
+// scoop into a held pitch stops moving).
 function slides(run, a, b) {
   const { t, x, w } = run;
   const st = segStats(run, a, b);
-  if (!(Math.abs(st.rise) >= 0.5)) return false;
+  if (!(Math.abs(st.rise) >= 0.5) || b - a < 4) return false;
   let total = 0;
   let left = 0;
   for (let i = a; i < b; i++) {
@@ -857,7 +959,18 @@ function slides(run, a, b) {
     total += w[i] * (x[i] - st.mu) ** 2;
     left += w[i] * (x[i] - line) ** 2;
   }
-  return left <= 0.3 * total;
+  if (left > 0.3 * total) return false;
+  const dir = Math.sign(st.beta);
+  let top = -Infinity;
+  for (let i = a; i < b; i++) {
+    const v = (dir * (x[Math.max(a, i - 1)] + x[i] + x[Math.min(b - 1, i + 1)])) / 3;
+    if (top - v >= 0.15) return false;
+    top = Math.max(top, v);
+  }
+  const c = lowerBound(t, t[a] + 0.4 * st.dur);
+  if (b - c < 3) return false;
+  const tail = segStats(run, c, b);
+  return dir * tail.beta >= 0.5 * Math.abs(st.beta);
 }
 
 // How far from its centre a note's own frames stray: a little for a steady voice, more with vibrato.
@@ -910,7 +1023,7 @@ function islandNotes(run, list, o, core) {
     // two others is judged on its middle, and as a slide only if it carries much of the step.
     const change =
       under || over
-        ? c.sloped || c.dur < 0.1 || spread(c, 0) >= 0.6
+        ? c.sloped || (c.dur < 0.1 && !c.held) || spread(c, 0.2) >= 0.6
         : spread(c, 0.2) >= 0.5 || (c.sloped && Math.abs(c.rise) >= 0.5 * Math.abs(r.mu - l.mu));
     if (change) {
       c.core = false;
@@ -920,7 +1033,7 @@ function islandNotes(run, list, o, core) {
   // Likewise a short piece at either end that leads into (or out of) a longer note at another
   // level is that note's scoop (or fall): when it wobbles, or when it is very short and below.
   for (const [c, n] of [[cores[0], cores[1]], [cores[cores.length - 1], cores[cores.length - 2]]]) {
-    if (!n || !c.core || c.dur >= 0.15 || n.dur < c.dur || Math.abs(c.mu - n.mu) < o.mergeTol || Math.abs(c.mu - n.mu) > 3) continue;
+    if (!n || !c.core || c.held || c.dur >= 0.15 || n.dur < c.dur || Math.abs(c.mu - n.mu) < o.mergeTol || Math.abs(c.mu - n.mu) > 3) continue;
     if (c.sloped || spread(c, 0) >= 0.6 || (c.dur < 0.12 && n.mu - c.mu <= 2.5)) c.core = false;
   }
   // A longer slide (up to SCOOP_LONG) that heads straight for the next steady note and lands
@@ -1131,25 +1244,60 @@ function levelHolds(run, i, j, ref) {
 }
 
 // Split a note where the pitch (or, when we have it, the level) dips clearly and comes
-// back to the same note: that is two repeated notes sung without a break.
+// back to the same note: that is two repeated notes sung without a break. The dips are all
+// found in one pass, then taken deepest first, each judged within the stretch of the note
+// that the dips already taken leave around it. (Finding one dip and starting again on each
+// half took time growing with the square of a long chant on one note.)
 function splitDips(run, nt, o, core) {
-  const dip = findDip(run, nt.a, nt.b, o) || levelDip(run, nt.a, nt.b);
-  if (!dip) return [nt];
-  // Frames in the dip don't count towards either note's pitch.
-  for (let j = dip.i; j <= dip.j; j++) core[j] = 0;
-  const k = dip.k;
-  const before = splitDips(run, { a: nt.a, b: k, mu: nt.mu, split: nt.split }, o, core);
-  return before.concat(splitDips(run, { a: k, b: nt.b, mu: nt.mu, split: true }, o, core));
+  const ks = []; // where the notes after the dips taken so far start, in order
+  const dips = [];
+  const take = (find, list) => {
+    for (const c of list) {
+      const at = lowerBound(ks, c.k + 1);
+      const d = find(at ? ks[at - 1] : nt.a, at < ks.length ? ks[at] : nt.b, c.k);
+      if (!d) continue;
+      const pos = lowerBound(ks, d.k);
+      if (ks[pos] === d.k) continue;
+      ks.splice(pos, 0, d.k);
+      dips.push(d);
+    }
+  };
+  const st = dipStats(run, nt.a, nt.b, o);
+  if (st) take((lo, hi, k) => pitchDip(run, lo, hi, k, o, st), candidates(run, nt.a, nt.b, (k) => pitchDip(run, nt.a, nt.b, k, o, st)));
+  if (canLevelDip(run, nt.a, nt.b)) take((lo, hi, k) => levelDip(run, lo, hi, k), candidates(run, nt.a, nt.b, (k) => levelDip(run, nt.a, nt.b, k)));
+  if (!ks.length) return [nt];
+  // Frames in a dip don't count towards either note's pitch.
+  for (const d of dips) for (let j = d.i; j <= d.j; j++) core[j] = 0;
+  const out = [];
+  let a = nt.a;
+  for (const k of ks) {
+    out.push({ a, b: k, mu: nt.mu, split: a === nt.a ? nt.split : true });
+    a = k;
+  }
+  out.push({ a, b: nt.b, mu: nt.mu, split: true });
+  return out;
 }
 
-function findDip(run, a, b, o) {
+// Every frame of [a, b) where test finds a dip, deepest first.
+function candidates(run, a, b, test) {
+  const list = [];
+  for (let k = a; k < b; k++) {
+    const d = test(k);
+    if (d) list.push({ k, depth: d.depth });
+  }
+  return list.sort((p, q) => q.depth - p.depth || p.k - q.k);
+}
+
+// What a pitch dip in note [a, b) is measured against: the note's level, its loudness and its
+// vibrato depth. Null when the note can have no pitch dip.
+function dipStats(run, a, b, o) {
   const { t, x, r } = run;
   if (b - a < 6 || t[b - 1] - t[a] < 2 * o.minNote + 0.05) return null;
-  const sorted = Float64Array.from(x.slice(a, b)).sort();
+  const sorted = Float64Array.from(x.subarray(a, b)).sort();
   const level = quantile(sorted, 0.5, true);
   let haveRms = true;
   for (let k = a; k < b && haveRms; k++) if (!(r[k] >= 0)) haveRms = false;
-  const loud = haveRms ? Float64Array.from(r.slice(a, b)).sort() : null;
+  const loud = haveRms ? Float64Array.from(r.subarray(a, b)).sort() : null;
   const rmsLevel = haveRms ? quantile(loud, 0.5, true) : 0;
   // A level that keeps dropping out is too erratic to say where a note starts.
   if (haveRms && lowerBound(loud, 0.35 * rmsLevel) > 0.1 * loud.length) haveRms = false;
@@ -1159,92 +1307,83 @@ function findDip(run, a, b, o) {
   if ((low === 0 || low > 0.4 * sorted.length) && !(haveRms && loud[0] < 0.35 * rmsLevel)) return null;
   // The note's vibrato depth, leaving out the dips we are looking for. A line that wanders
   // by more than a semitone has no level for a dip to fall from.
-  const kept = sorted.filter((v) => v > level - 0.7);
+  const kept = sorted.subarray(low);
   const noteSwing = kept.length > 3 ? 0.71 * (quantile(kept, 0.75, true) - quantile(kept, 0.25, true)) : 0;
   if (noteSwing > 1) return null;
-  let best = null;
-  for (let k = a; k < b; k++) {
-    if (t[k] - t[a] < o.minNote || t[b - 1] - t[k] < o.minNote) continue;
-    const pitchy = x[k] <= level - 0.7;
-    const quiet = haveRms && r[k] < 0.35 * rmsLevel;
-    if (!pitchy && !quiet) continue;
-    const v = pitchy ? x : r;
-    // The lowest point within 25 ms either side
-    let ok = true;
-    for (let j = k - 1; j >= a && t[k] - t[j] <= 0.025 && ok; j--) if (v[j] < v[k]) ok = false;
-    for (let j = k + 1; j < b && t[j] - t[k] <= 0.025 && ok; j++) if (v[j] <= v[k]) ok = false;
-    if (!ok) continue;
-    const L = context(run, a, b, t[k] - 0.25, t[k] - 0.05);
-    const R = context(run, a, b, t[k] + 0.05, t[k] + 0.25);
-    if (!L || !R || Math.abs(L.mid - R.mid) > o.mergeTol) continue;
-    let depth = 0;
-    let span = null;
-    if (pitchy) {
-      const d = Math.min(L.mid, R.mid) - x[k];
-      // Deeper than any vibrato swing on either side, and wider than a one-frame glitch.
-      if (d >= Math.max(0.7, Math.max(L.swing, R.swing, noteSwing) + 0.3)) {
-        span = below(run, x, a, b, k, Math.min(L.mid, R.mid) - d / 2);
-        if (span && haveRms && levelHolds(run, Math.max(a, span.i - 1), Math.min(b - 1, span.j + 1), Math.min(L.rms, R.rms))) span = null;
-        if (span) depth = d;
-      }
-    }
-    if (!depth && quiet && L.rms > 0 && R.rms > 0 && r[k] < 0.35 * Math.min(L.rms, R.rms)) {
-      span = below(run, r, a, b, k, 0.5 * Math.min(L.rms, R.rms));
-      if (span) depth = 1;
-    }
-    if (depth && (!best || depth > best.depth)) best = { k, i: span.i, j: span.j, depth };
-  }
-  return best;
+  return { level, haveRms, rmsLevel, noteSwing };
 }
 
-// A sharp dip in level between two stretches of singing: a consonant ("la la", "da da") or a
-// note sung again. It falls below LEVEL_DIP of the loudest singing within a fifth of a second
-// on both sides, which the level inside a held note almost never does (vibrato and breathy
-// patches stay above half). This works on short notes, which findDip can't judge: it needs a
-// quarter of a second either side to know the pitch level. Needs rms; NaN or missing levels
-// mean no dip. Returns where the new note starts (k) and the dip's frames (i..j).
-function levelDip(run, a, b) {
+// A dip in pitch (or a quiet moment) at frame k inside [a, b), with stats from dipStats:
+// { k, i, j, depth } where the dip's frames are i..j and the next note starts at k.
+function pitchDip(run, a, b, k, o, st) {
+  const { t, x, r } = run;
+  if (b - a < 6 || t[b - 1] - t[a] < 2 * o.minNote + 0.05) return null;
+  if (t[k] - t[a] < o.minNote || t[b - 1] - t[k] < o.minNote) return null;
+  const pitchy = x[k] <= st.level - 0.7;
+  const quiet = st.haveRms && r[k] < 0.35 * st.rmsLevel;
+  if (!pitchy && !quiet) return null;
+  const v = pitchy ? x : r;
+  // The lowest point within 25 ms either side
+  for (let j = k - 1; j >= a && t[k] - t[j] <= 0.025; j--) if (v[j] < v[k]) return null;
+  for (let j = k + 1; j < b && t[j] - t[k] <= 0.025; j++) if (v[j] <= v[k]) return null;
+  const L = context(run, a, b, t[k] - 0.25, t[k] - 0.05);
+  const R = context(run, a, b, t[k] + 0.05, t[k] + 0.25);
+  if (!L || !R || Math.abs(L.mid - R.mid) > o.mergeTol) return null;
+  if (pitchy) {
+    const d = Math.min(L.mid, R.mid) - x[k];
+    // Deeper than any vibrato swing on either side, and wider than a one-frame glitch.
+    if (d >= Math.max(0.7, Math.max(L.swing, R.swing, st.noteSwing) + 0.3)) {
+      const span = below(run, x, a, b, k, Math.min(L.mid, R.mid) - d / 2);
+      if (span && !(st.haveRms && levelHolds(run, Math.max(a, span.i - 1), Math.min(b - 1, span.j + 1), Math.min(L.rms, R.rms)))) return { k, i: span.i, j: span.j, depth: d };
+    }
+  }
+  if (quiet && L.rms > 0 && R.rms > 0 && r[k] < 0.35 * Math.min(L.rms, R.rms)) {
+    const span = below(run, r, a, b, k, 0.5 * Math.min(L.rms, R.rms));
+    if (span) return { k, i: span.i, j: span.j, depth: 1 };
+  }
+  return null;
+}
+
+// Whether note [a, b) has a level all through, which levelDip needs.
+function canLevelDip(run, a, b) {
+  const { t, r } = run;
+  if (b - a < 6 || t[b - 1] - t[a] < 0.12) return false;
+  for (let k = a; k < b; k++) if (!(r[k] >= 0)) return false;
+  return true;
+}
+
+// A sharp dip in level at frame i inside [a, b): a consonant ("la la") or a note sung again.
+// It falls below LEVEL_DIP of the loudest singing within a fifth of a second either side,
+// which a held note's level almost never does. Unlike pitchDip it works on short notes.
+// Returns where the new note starts (k), the dip's frames (i..j) and its depth.
+function levelDip(run, a, b, i) {
   const { t, r, g } = run;
   const edge = 0.06;
-  if (b - a < 6 || t[b - 1] - t[a] < 2 * edge) return null;
-  let top = 0;
-  for (let k = a; k < b; k++) {
-    if (!(r[k] >= 0)) return null;
-    top = Math.max(top, r[k]);
+  if (b - a < 6 || t[b - 1] - t[a] < 2 * edge || i <= a || i >= b - 1) return null;
+  if (t[i] - t[a] < edge || t[b - 1] - t[i] < edge) return null;
+  const v = Math.min(r[i], g[i]);
+  let L = 0;
+  let R = 0;
+  let nl = 0;
+  let nr = 0;
+  for (let j = i - 1; j >= a && t[i] - t[j] <= 0.2; j--) {
+    L = Math.max(L, r[j]);
+    nl++;
+    if (t[i] - t[j] <= 0.025 && Math.min(r[j], g[j]) < v) return null;
   }
-  let best = null;
-  for (let k = a + 1; k < b - 1; k++) {
-    if (t[k] - t[a] < edge || t[b - 1] - t[k] < edge) continue;
-    const v = Math.min(r[k], g[k]);
-    if (!(v < LEVEL_DIP * top)) continue; // not even under the loudest frame: no dip here
-    let L = 0;
-    let R = 0;
-    let nl = 0;
-    let nr = 0;
-    let lowest = true;
-    for (let j = k - 1; j >= a && t[k] - t[j] <= 0.2; j--) {
-      L = Math.max(L, r[j]);
-      nl++;
-      if (t[k] - t[j] <= 0.025 && Math.min(r[j], g[j]) < v) lowest = false;
-    }
-    for (let j = k + 1; j < b && t[j] - t[k] <= 0.2; j++) {
-      R = Math.max(R, r[j]);
-      nr++;
-      if (t[j] - t[k] <= 0.025 && Math.min(r[j], g[j]) <= v) lowest = false;
-    }
-    if (!lowest || nl < 3 || nr < 3) continue;
-    const ratio = v / Math.min(L, R);
-    if (ratio < LEVEL_DIP && (!best || ratio < best.ratio)) best = { k, ratio, R };
+  for (let j = i + 1; j < b && t[j] - t[i] <= 0.2; j++) {
+    R = Math.max(R, r[j]);
+    nr++;
+    if (t[j] - t[i] <= 0.025 && Math.min(r[j], g[j]) <= v) return null;
   }
-  if (!best) return null;
+  if (nl < 3 || nr < 3 || !(v < LEVEL_DIP * Math.min(L, R))) return null;
   // The new note starts once the level is back up, or right at the dip when its bottom was
   // in the unvoiced frames just before.
-  const i = best.k;
   let k = i;
   if (!(g[i] < r[i])) {
-    while (k + 1 < b && t[k + 1] - t[i] <= 0.06 && r[k] < 0.5 * best.R) k++;
+    while (k + 1 < b && t[k + 1] - t[i] <= 0.06 && r[k] < 0.5 * R) k++;
   }
-  return { k, i, j: Math.max(i, k - 1), depth: 1 - best.ratio };
+  return { k, i, j: Math.max(i, k - 1), depth: 1 - v / Math.min(L, R) };
 }
 
 // The stretch around frame k where v stays under `limit`, if it is more than one frame
@@ -1406,19 +1545,22 @@ function corr(h, prof, tonic) {
 }
 
 // Duration-weighted Krumhansl–Schmuckler, plus nudges that matter for short tunes: songs
-// nearly always end on the home note and usually start on a note of the home chord. Without
-// them a short major tune is often read as its relative minor (same notes, other home).
+// nearly always end on the home note and usually start on a note of the home chord (without
+// them a short major tune is often read as its relative minor), and a key whose own third
+// is missing while the other third is sung is the other mode.
 // Returns the best guess even when it isn't sure; `enough` says whether to tell anyone.
 export function findKey(notes) {
-  const { keys, clear } = rankKeys(notes);
+  const { keys, clear, pitches } = rankKeys(notes);
   if (!keys.length) return { tonic: 0, mode: 'major', confidence: 0, enough: false };
   const best = keys[0];
   const margin = best.score - keys[1].score;
   const clamp = (v) => Math.min(1, Math.max(0, v));
-  // The nudge for ending on the home note is 0.2, so a key has to win by more than most of
-  // that nudge before we say it out loud.
-  const confidence = clamp(Math.min(1, clear / 10) * (0.4 * clamp((best.r - 0.3) / 0.5) + 0.6 * clamp(margin / 0.3)));
-  const enough = clear >= 8 && margin >= 0.15 && best.r >= 0.5;
+  // Three notes of a scale fit several keys equally well (a small child's three-note tune).
+  const few = Math.min(1, pitches / 4);
+  const confidence = clamp(Math.min(1, clear / 10) * few * (0.4 * clamp((best.r - 0.3) / 0.5) + 0.6 * clamp(margin / 0.3)));
+  // Saying it out loud takes a dozen clear notes (eight when the key wins by a mile), four
+  // pitch classes, and a win by more than most of the 0.2 nudge for ending on the home note.
+  const enough = (clear >= 12 || (clear >= 8 && margin >= 0.4)) && pitches >= 4 && margin >= 0.15 && best.r >= 0.5;
   return { tonic: best.tonic, mode: best.mode, confidence: round(confidence, 2), enough };
 }
 
@@ -1436,7 +1578,8 @@ function rankKeys(notes) {
     // Cap very long notes so one held note doesn't decide the key on its own.
     h[pc(p)] += Math.min(d, 2) * (0.5 + 0.5 * conf);
   }
-  if (!list.length) return { keys: [], clear: 0 };
+  if (!list.length) return { keys: [], clear: 0, pitches: 0 };
+  const total = h.reduce((a, b) => a + b, 0);
   const clear = list.filter((n) => n.conf >= 0.45);
   const ends = clear.length ? clear : list;
   const first = pc(ends[0].p);
@@ -1453,116 +1596,466 @@ function rankKeys(notes) {
       else if (triad.includes(last)) bonus += 0.05;
       if (first === tonic) bonus += 0.05;
       else if (triad.includes(first)) bonus += 0.02;
+      // The key's own third hardly sung while the other third is: the other mode.
+      const own = h[(tonic + third) % 12];
+      const other = h[(tonic + 7 - third) % 12];
+      if (other > 2 * own + 0.02 * total) bonus -= 0.3 * Math.min(1, (other - 2 * own) / (0.04 * total));
       keys.push({ tonic, mode, r, score: r + bonus });
     }
   }
   // Ties (rare) go to major, then the lower tonic, so the answer never depends on sort order.
   keys.sort((a, b) => b.score - a.score || (a.mode === b.mode ? 0 : a.mode === 'major' ? -1 : 1) || a.tonic - b.tonic);
-  return { keys, clear: clear.length };
+  return { keys, clear: clear.length, pitches: h.filter((v) => v >= 0.03 * total).length };
 }
 
 // ---------- Rhythm ----------
 
-// Snap notes to an eighth-note grid at the tempo the child picked. The grid's phase is the
-// one that best fits the note starts; the first note lands on beat 0 and offset is the time
-// of beat 0, so beat b sits at offset + b × 60 / bpm seconds. Notes keep their order, never
-// overlap and are at least an eighth long; silences of an eighth or more stay as rests.
-export function quantize(notes, { bpm = TEMPOS.medium, beatsPerBar = 4 } = {}) {
-  bpm = Number.isFinite(bpm) && bpm > 0 ? bpm : TEMPOS.medium;
-  beatsPerBar = Number.isInteger(beatsPerBar) && beatsPerBar > 0 ? beatsPerBar : 4;
+// Snap notes to an eighth-note grid. Free sing has no click, so the beat comes from the
+// singing: the pulse its starts fit, followed as the singer speeds up and slows down. The
+// picked `bpm` is used as the grid only when the singing kept to it; arrange() plays at the
+// picked speed. beatsPerBar is 3 or 4 when given, else whichever the tune fits. Bar lines go
+// where long notes and phrase ends fall, so a tune may start with a pickup (first beat > 0).
+// Returns { bpm, beatsPerBar, meterSure, offset, notes: [{ beat, beats, p }] }: bpm is the
+// sung tempo and offset the time of beat 0, so beat b sits near offset + b × 60 / bpm in the
+// take. Notes keep their order, never overlap, are at least an eighth long, and none is dropped.
+export function quantize(notes, { bpm = TEMPOS.medium, beatsPerBar } = {}) {
+  const pick = Number.isFinite(bpm) && bpm > 0 ? Math.min(240, Math.max(40, bpm)) : TEMPOS.medium;
+  const fixed = beatsPerBar === 3 || beatsPerBar === 4 ? beatsPerBar : Number.isInteger(beatsPerBar) && beatsPerBar > 0 && beatsPerBar <= 12 ? beatsPerBar : 0;
   const list = (notes || [])
-    .filter((n) => n && Number.isFinite(n.t0) && n.t1 > n.t0 && noteP(n) != null)
+    .filter((n) => n && Number.isFinite(n.t0) && Number.isFinite(n.t1) && n.t1 > n.t0 && noteP(n) != null)
     .slice()
     .sort((a, b) => a.t0 - b.t0);
-  if (!list.length) return { bpm, beatsPerBar, offset: 0, notes: [] };
-  const g = 30 / bpm; // one eighth note in seconds
+  if (!list.length) return { bpm: pick, beatsPerBar: fixed || 4, meterSure: !!fixed, offset: 0, notes: [] };
+  // Starts closer together than 20 ms are one moment.
+  const on = list.map((n) => n.t0);
+  for (let i = 1; i < on.length; i++) on[i] = Math.max(on[i], on[i - 1] + 0.02);
 
-  let phase = 0;
-  let bestCost = Infinity;
-  const STEPS = 48;
-  for (let k = 0; k < STEPS; k++) {
-    const ph = (k / STEPS) * g;
-    let cost = 0;
-    for (const n of list) {
-      let f = ((n.t0 - ph) / g) % 1;
-      if (f < 0) f += 1;
-      const d = Math.min(f, 1 - f);
-      // Starts of longer, surer notes are the better guide to where the beat is.
-      cost += Math.sqrt(Math.min(1, n.t1 - n.t0)) * (Number.isFinite(n.conf) ? 0.5 + n.conf : 1) * d * d;
-    }
-    if (cost < bestCost - 1e-12) {
-      bestCost = cost;
-      phase = ph;
-    }
+  const g0 = pulse(list, on, 30 / pick);
+  // A singer who kept time gets one even grid (it can't be thrown by a note found twice);
+  // one who sped up and slowed down gets a pulse followed from note to note.
+  const even = steadyGrid(list, on, g0, 30 / pick);
+  const fit = (L) => (even ? { ...barPlace(list, on, even.s, even.G, L), g: list.map(() => even.G) } : track(list, on, g0, L));
+  // Bars of 4 beats, or 3 when the tune sits better in them: its notes fall better in 3/4
+  // bars, and its rhythms come round again after one, two or four of them.
+  let best;
+  let lean = 0;
+  if (fixed) best = { ...fit(2 * fixed), bpb: fixed };
+  else {
+    const four = fit(8);
+    const three = fit(6);
+    lean = four.cost - three.cost + RECUR * (recurs(four.s, 6) - recurs(four.s, 8));
+    best = lean > 0 ? { ...three, bpb: 3 } : { ...four, bpb: 4 };
   }
-  let offset = phase + g * Math.round((list[0].t0 - phase) / g);
-
-  // Starts first.
-  const out = [];
-  let lastStart = -Infinity;
+  const { s, g, bpb } = best;
+  // The grid's overall tempo and where it sits: a straight line through (position, time).
+  let sw = 0;
+  let ss = 0;
+  let st = 0;
+  let sss = 0;
+  let sst = 0;
   list.forEach((n, i) => {
-    const exact = (n.t0 - offset) / g;
-    let s = Math.round(exact);
-    // When the next note wants the same grid point and this one was nearly halfway between
-    // two, take the earlier one: a dotted rhythm becomes two eighths, not a late squash.
-    const next = list[i + 1];
-    if (next && Math.round((next.t0 - offset) / g) <= s && s - 1 > lastStart && exact - (s - 1) <= 0.75) s -= 1;
-    if (s <= lastStart) {
-      s = lastStart + 1;
-      if (s - exact > 1) return; // a burst of quick notes: this one gives way to the one before
-    }
-    out.push({ s, n });
-    lastStart = s;
+    const w = Math.min(1, n.t1 - n.t0);
+    sw += w;
+    ss += w * s[i];
+    st += w * on[i];
+    sss += w * s[i] * s[i];
+    sst += w * s[i] * on[i];
   });
-  // That can pull the first note back an eighth; beat 0 is always the first note.
-  const first = out[0].s;
-  offset += first * g;
-  for (const o of out) o.s -= first;
+  const den = sw * sss - ss * ss;
+  const G = even ? even.G : den > 1e-9 ? Math.max(0.05, (sw * sst - ss * st) / den) : g0;
+  const start = (st - G * ss) / sw;
 
   // Then lengths. Singers leave a little air before the next note (a consonant, a breath
   // between words), and the note still lasts until the next one starts. Only a silence of
   // more than about half an eighth that is also more than a quarter of the note's own slot
   // is a rest (or staccato), and then the note keeps the length it was sung.
-  out.forEach((o, i) => {
-    const next = out[i + 1];
-    const { n } = o;
-    let e = Math.round((n.t1 - offset) / g);
-    if (next) {
-      const gap = next.n.t0 - n.t1;
-      if (gap < 0.6 * g || gap < 0.25 * (next.n.t0 - n.t0)) e = next.s;
-      e = Math.min(e, next.s);
-    }
-    o.e = Math.max(e, o.s + 1);
+  const e = list.map((n, i) => {
+    const len = Math.max(1, Math.round((n.t1 - on[i]) / g[i]));
+    if (i + 1 === list.length) return s[i] + len;
+    const gap = on[i + 1] - n.t1;
+    if (gap < 0.6 * g[i] || gap < 0.25 * (on[i + 1] - on[i])) return s[i + 1];
+    return Math.min(s[i + 1], s[i] + len);
   });
+  // A last note held a little past a bar line ends on it.
+  const L = 2 * bpb;
+  const n = list.length - 1;
+  const bar = L * Math.floor(e[n] / L);
+  if (bar > s[n] && e[n] - bar <= 2) e[n] = bar;
+  const ps = evenRepeats(list, s, list.map(noteP));
   return {
-    bpm,
-    beatsPerBar,
-    offset: round(offset, 4),
-    notes: out.map((o) => ({ beat: o.s / 2 + 0, beats: (o.e - o.s) / 2, p: noteP(o.n) })),
+    bpm: round(30 / G, 2),
+    beatsPerBar: bpb,
+    // Whether the bars are a clear call; when not, the child could be asked "1-2-3 or 1-2-3-4?".
+    meterSure: !!fixed || Math.abs(lean) >= 2,
+    offset: round(start, 4),
+    notes: list.map((x, i) => ({ beat: s[i] / 2, beats: (e[i] - s[i]) / 2, p: ps[i] })),
   };
+}
+const RECUR = 8; // weight of rhythms recurring bar by bar, against how well notes fall in bars
+
+// The share of notes whose length (in eighths, up to a bar) comes again exactly one, two or
+// four bars of `bar` eighths later, at the best of the three.
+function recurs(s, bar) {
+  const len = new Map();
+  s.forEach((v, i) => len.set(v, i + 1 < s.length ? Math.min(8, s[i + 1] - v) : 8));
+  let best = 0;
+  for (const lag of [bar, 2 * bar, 4 * bar]) {
+    let same = 0;
+    for (const [v, l] of len) if (len.get(v + lag) === l) same++;
+    best = Math.max(best, same / s.length);
+  }
+  return best;
+}
+
+// A motif sung again (the same rhythm from the same first note, every other note within a
+// semitone) is played the same both times: where the two differ, each gets the semitone
+// nearest the average of what was sung in all its repeats, so a small child's wobble doesn't
+// turn one tune into two. Needs the measured pitches (m); notes without them are kept.
+function evenRepeats(list, s, ps) {
+  const N = list.length;
+  const x = list.map((n) => (Number.isFinite(n.m) ? n.m - (Number.isFinite(n.tune) ? n.tune : 0) : NaN));
+  const sum = x.map((v) => v);
+  const count = x.map(() => 1);
+  for (let i = 0; i + 2 < N; i++) {
+    for (let j = i + 3; j + 2 < N && j < i + 64; j++) {
+      if (ps[j] !== ps[i]) continue;
+      let L = 1;
+      while (L < 8 && i + L < j && j + L < N && s[i + L] - s[i + L - 1] === s[j + L] - s[j + L - 1] && Math.abs(ps[i + L] - ps[j + L]) <= 1) L++;
+      if (L < 3) continue;
+      for (let t = 1; t < L; t++) {
+        if (ps[i + t] === ps[j + t] || !Number.isFinite(x[i + t]) || !Number.isFinite(x[j + t])) continue;
+        sum[i + t] += x[j + t];
+        count[i + t]++;
+        sum[j + t] += x[i + t];
+        count[j + t]++;
+      }
+    }
+  }
+  return ps.map((p, i) => (count[i] > 1 ? Math.min(p + 1, Math.max(p - 1, Math.round(sum[i] / count[i]))) : p));
+}
+
+// The length of an eighth note (seconds) that the note starts fit best: the coarsest pulse
+// they keep to (the shortest note value), then of it and its halves the one nearest a middling
+// tempo. Fit is measured over a few seconds at a time, so a singer who drifts still has one.
+const PULSE_MIN = 0.15; // seconds per eighth: 200 bpm
+const PULSE_MAX = 0.6; // 50 bpm
+function pulse(list, on, picked) {
+  const N = list.length;
+  const fallback = Math.min(PULSE_MAX, Math.max(PULSE_MIN, picked));
+  if (N < 4) return fallback;
+  const w = list.map((n) => Math.sqrt(Math.min(1, n.t1 - n.t0)) * (Number.isFinite(n.conf) ? 0.5 + n.conf : 1));
+  const windows = [];
+  for (let a = 0; a < N; ) {
+    let b = a + 1;
+    while (b < N && on[b] - on[a] < 6) b++;
+    windows.push([a, b]);
+    a = b;
+  }
+  let all = 0;
+  for (const x of w) all += x;
+  // Agreement of the starts with a pulse of length g: 1 when every start is on it.
+  const fit = (g) => {
+    let sum = 0;
+    for (const [a, b] of windows) {
+      let c = 0;
+      let z = 0;
+      for (let i = a; i < b; i++) {
+        const ang = (2 * Math.PI * (on[i] - on[a])) / g;
+        c += w[i] * Math.cos(ang);
+        z += w[i] * Math.sin(ang);
+      }
+      sum += Math.hypot(c, z);
+    }
+    return sum / all;
+  };
+  // A coarse sweep, then a closer look around each good peak.
+  const coarse = [];
+  for (let g = PULSE_MIN / 2; g <= PULSE_MAX * 2; g *= 1.02) coarse.push({ g, r: fit(g) });
+  const top0 = Math.max(...coarse.map((x) => x.r));
+  const peaks = [];
+  for (let i = 1; i + 1 < coarse.length; i++) {
+    const x = coarse[i];
+    if (x.r < coarse[i - 1].r || x.r < coarse[i + 1].r || x.r < 0.6 * top0) continue;
+    let best = x;
+    for (let f = 0.98; f <= 1.02; f += 0.0025) {
+      const r = fit(x.g * f);
+      if (r > best.r) best = { g: x.g * f, r };
+    }
+    peaks.push(best);
+  }
+  if (!peaks.length) return fallback;
+  const top = Math.max(...peaks.map((x) => x.r));
+  if (top < 0.3) return fallback;
+  // The coarsest pulse that fits nearly as well as the best: the shortest note value.
+  let g = 0;
+  for (const x of peaks) if (x.r >= 0.85 * top && x.g > g) g = x.g;
+  // Of that pulse and its halves, the one nearest a middling tempo: the beat a listener
+  // would tap, whatever speed the song is then played at.
+  const middle = 30 / TEMPOS.medium;
+  while (g > PULSE_MAX || (g / 2 >= PULSE_MIN && Math.abs(Math.log(g / 2 / middle)) < Math.abs(Math.log(g / middle)))) g /= 2;
+  while (g < PULSE_MIN) g *= 2;
+  return g;
+}
+
+// Positions (eighths from the first note) on one even grid of eighths G, when the singing kept
+// to the picked tempo (within 3%) all through: most starts within a fifth of an eighth of
+// the grid. Null otherwise.
+function steadyGrid(list, on, g0, picked) {
+  const N = list.length;
+  if (N < 4 || Math.abs(Math.log(g0 / picked)) >= 0.03) return null;
+  const G = picked;
+  const w = list.map((n) => Math.sqrt(Math.min(1, n.t1 - n.t0)) * (Number.isFinite(n.conf) ? 0.5 + n.conf : 1));
+  // The grid's phase that best fits the starts.
+  let phase = 0;
+  let low = Infinity;
+  for (let k = 0; k < 48; k++) {
+    const ph = on[0] + (k / 48) * G;
+    let c = 0;
+    for (let i = 0; i < N; i++) {
+      let f = ((on[i] - ph) / G) % 1;
+      if (f < 0) f += 1;
+      const d = Math.min(f, 1 - f);
+      c += w[i] * d * d;
+    }
+    if (c < low - 1e-12) {
+      low = c;
+      phase = ph;
+    }
+  }
+  let s = [];
+  for (let pass = 0; pass < 2; pass++) {
+    s = snap(on, phase, G);
+    // Then the grid's phase that fits those positions best.
+    let sw = 0;
+    let off = 0;
+    for (let i = 0; i < N; i++) {
+      sw += w[i];
+      off += w[i] * (on[i] - s[i] * G);
+    }
+    phase = off / sw;
+  }
+  // How far the starts sit from the grid, leaving out the worst quarter (a note found twice,
+  // a late entry after a breath).
+  const miss = on.map((t, i) => Math.abs(t - phase - s[i] * G) / G).sort((a, b) => a - b);
+  if (miss[Math.floor(0.75 * (N - 1))] > 0.2) return null;
+  const s0 = s[0];
+  return { s: s.map((v) => v - s0), G };
+}
+
+// Grid positions for starts on a grid of eighths G whose position 0 is at time phase. Notes
+// keep their order and never share an eighth; when two want the same one and the first was
+// nearly halfway between two, it takes the earlier one (a dotted rhythm becomes two eighths,
+// not a late squash); otherwise the later note moves on, pushing the next along if needed.
+function snap(on, phase, G) {
+  const s = [];
+  let last = -Infinity;
+  for (let i = 0; i < on.length; i++) {
+    const exact = (on[i] - phase) / G;
+    let k = Math.round(exact);
+    const next = i + 1 < on.length ? Math.round((on[i + 1] - phase) / G) : Infinity;
+    if (next <= k && k - 1 > last && exact - (k - 1) <= 0.75) k -= 1;
+    k = Math.max(k, last + 1);
+    s.push(k);
+    last = k;
+  }
+  return s;
+}
+
+// Where in a bar of L eighths notes at positions s (first at 0) best start, priced as track()
+// prices a path: notes on strong beats, nothing held across a bar line, and a pickup only when
+// it earns its place. Returns the positions counted from a downbeat and the price.
+function barPlace(list, on, s, G, L) {
+  const N = list.length;
+  const T = METRE[L] || Array.from({ length: L }, (_, m) => (m === 0 ? 0 : m % 2 ? 1.5 : 1));
+  let best = null;
+  for (let m0 = 0; m0 < L; m0++) {
+    let cost = m0 ? PICKUP : 0;
+    for (let i = 0; i < N; i++) {
+      const m = (m0 + s[i]) % L;
+      cost += T[m] * Math.min(3, Math.max(0.5, ((i + 1 < N ? on[i + 1] : list[i].t1) - on[i]) / (2 * G)));
+      if (i + 1 < N) {
+        const k = s[i + 1] - s[i];
+        const held = Math.min(k, Math.max(1, Math.round((list[i].t1 - on[i]) / G)));
+        if (m + held > L) cost += CROSS;
+      }
+    }
+    if (!best || cost < best.cost - 1e-9) best = { s: s.map((v) => v + m0), cost };
+  }
+  return best;
+}
+
+// Grid positions counted from a downbeat (so the first one says where in the bar the tune
+// starts) and the eighth's length at each note, for bars of L eighths. The pulse keeps time
+// but may slowly speed up or slow down, and start afresh after a breath; notes lean towards
+// strong beats, long ones most, and the first towards a downbeat unless it earns a pickup.
+// Dynamic programming over (tempo, place in the bar), keeping only paths near the best.
+const TEMPO_STEP = 1.02;
+const TEMPO_REACH = 12; // tempo states either side of the pulse found: about ±27%
+const BEAM = 4; // paths kept: those within this of the best so far
+// The price of a gap of k eighths between two starts: even counts (quarters, halves) are the
+// commonest, odd ones a little rarer, anything longer is a rest, and two starts in one eighth
+// (k = 0) dearest of all.
+const K_COST = [4, 0, 0.1, 0.9, 0.4, 1.6, 0.9, 2, 0.9];
+const RESTART = 3; // what starting the pulse again after a breath costs
+// The price of a note starting on each eighth of the bar.
+const METRE = { 8: [0, 1.5, 1, 1.5, 0.2, 1.5, 1, 1.5], 6: [0, 1.5, 1, 1.5, 1, 1.5] };
+const PICKUP = 1.5; // a tune that doesn't start on a downbeat
+const CROSS = 1; // a note held across a bar line
+function track(list, on, g0, L) {
+  const N = list.length;
+  const J = 2 * TEMPO_REACH + 1;
+  const S = J * L;
+  const gs = Array.from({ length: J }, (_, j) => g0 * TEMPO_STEP ** (j - TEMPO_REACH));
+  const twoSig2 = gs.map((g) => 2 * (0.03 + 0.08 * g) ** 2);
+  const lr = Math.log(TEMPO_STEP);
+  const drift = [0, 1, 4].map((d) => (d * lr * lr) / (2 * 0.02 * 0.02));
+  const T = METRE[L] || Array.from({ length: L }, (_, m) => (m === 0 ? 0 : m % 2 ? 1.5 : 1));
+  // How much a note leans on its place in the bar: by how long until the next one (a rest or
+  // breath after it counts, so a phrase end leans hard), in beats.
+  const accent = (i, g) => Math.min(3, Math.max(0.5, ((i + 1 < N ? on[i + 1] : list[i].t1) - on[i]) / (2 * g)));
+  // Live paths (cell = tempo × L + place in bar, cost, how far the note fell from the pulse),
+  // and for every note the live cells with the cell and step each came from.
+  const live = new Int32Array(S);
+  const costs = new Float64Array(S);
+  const errs = new Float64Array(S);
+  let n = 0;
+  for (let j = 0; j < J; j++) {
+    for (let m = 0; m < L; m++) {
+      live[n] = j * L + m;
+      costs[n++] = ((j - TEMPO_REACH) * lr) ** 2 / (2 * 0.12 * 0.12) + T[m] * accent(0, gs[j]) + (m ? PICKUP : 0);
+    }
+  }
+  const histCell = [live.slice(0, n)];
+  const histBack = [null];
+  const histK = [null];
+  const next = new Float64Array(S).fill(Infinity);
+  const nerr = new Float64Array(S);
+  const nback = new Int32Array(S);
+  const nk = new Int32Array(S);
+  const touched = new Int32Array(S);
+  const acc = new Float64Array(J);
+  for (let i = 1; i < N; i++) {
+    let nt = 0;
+    const breath = on[i] - list[i - 1].t1 >= 0.25 || on[i] - on[i - 1] > 3;
+    const dur = list[i - 1].t1 - on[i - 1];
+    for (let j = 0; j < J; j++) acc[j] = accent(i, gs[j]);
+    for (let a = 0; a < n; a++) {
+      const m0 = live[a] % L;
+      const j0 = (live[a] / L) | 0;
+      const pulseAt = on[i - 1] - errs[a];
+      const span = on[i] - pulseAt;
+      for (let j = Math.max(0, j0 - 2); j <= Math.min(J - 1, j0 + 2); j++) {
+        const g = Math.sqrt(gs[j0] * gs[j]);
+        const x = span / g;
+        // k = 0: two notes in one eighth (a quick ornament, or a note found twice), which
+        // quantize then pulls apart; costly, but cheaper than bending the pulse round it.
+        const k0 = x < 0 ? 0 : Math.floor(x);
+        const dj = drift[j > j0 ? j - j0 : j0 - j];
+        for (let k = k0; k <= k0 + 1; k++) {
+          let e = span - k * g;
+          let timing = (e * e) / twoSig2[j];
+          if (breath && timing > RESTART) {
+            timing = RESTART;
+            e = 0;
+          }
+          const m = (m0 + k) % L;
+          // The note before, held across a bar line: rare in the tunes children sing.
+          const held = Math.min(k, Math.max(1, Math.round(dur / g)));
+          const total = costs[a] + timing + dj / k + (k < K_COST.length ? K_COST[k] : 1.2) + T[m] * acc[j] + (m0 + held > L ? CROSS : 0);
+          const cell = j * L + m;
+          if (total < next[cell]) {
+            if (next[cell] === Infinity) touched[nt++] = cell;
+            next[cell] = total;
+            nerr[cell] = e;
+            nback[cell] = a;
+            nk[cell] = k;
+          }
+        }
+      }
+    }
+    let low = Infinity;
+    for (let x = 0; x < nt; x++) low = Math.min(low, next[touched[x]]);
+    const cells = new Int32Array(nt);
+    const back = new Int32Array(nt);
+    const ks = new Int32Array(nt);
+    n = 0;
+    for (let x = 0; x < nt; x++) {
+      const cell = touched[x];
+      if (next[cell] <= low + BEAM) {
+        cells[n] = cell;
+        back[n] = nback[cell];
+        ks[n] = nk[cell];
+        live[n] = cell;
+        costs[n] = next[cell];
+        errs[n++] = nerr[cell];
+      }
+      next[cell] = Infinity;
+    }
+    histCell.push(cells.subarray(0, n));
+    histBack.push(back.subarray(0, n));
+    histK.push(ks.subarray(0, n));
+  }
+  let a = 0;
+  for (let x = 1; x < n; x++) if (costs[x] < costs[a]) a = x;
+  const cost = costs[a];
+  const s = new Array(N).fill(0);
+  const g = new Array(N).fill(g0);
+  const k = new Array(N).fill(0);
+  for (let i = N - 1; i >= 0; i--) {
+    g[i] = gs[(histCell[i][a] / L) | 0];
+    if (i === 0) {
+      s[0] = histCell[0][a] % L;
+      break;
+    }
+    k[i] = histK[i][a];
+    a = histBack[i][a];
+  }
+  // Notes that shared an eighth move on to the next free one, pushing the next along if needed.
+  let at = s[0];
+  for (let i = 1; i < N; i++) {
+    at += k[i];
+    s[i] = Math.max(at, s[i - 1] + 1);
+  }
+  return { s, g, cost };
 }
 
 // ---------- Chords ----------
 
+// The chords on offer, with a small lean each (so that between chords that fit a note equally,
+// the familiar one wins) and an order for ties. The first is home, the third the dominant.
 const CHORDS = {
   major: [
-    { numeral: 'I', step: 0, quality: '' },
-    { numeral: 'IV', step: 5, quality: '' },
-    { numeral: 'V', step: 7, quality: '' },
-    { numeral: 'vi', step: 9, quality: 'm' },
+    { numeral: 'I', step: 0, quality: '', lean: 0.06 },
+    { numeral: 'IV', step: 5, quality: '', lean: 0.02 },
+    { numeral: 'V', step: 7, quality: '', lean: 0.02 },
+    { numeral: 'vi', step: 9, quality: 'm', lean: -0.06 },
   ],
-  // Minor keys borrow a major V, as most minor tunes do.
+  // Minor keys borrow a major V when the tune sings the leading note. A tune that sings the
+  // flat seventh instead (most folk tunes in minor) gets a minor v, and VII and III, the
+  // natural minor's own major chords: i-VII is the sound of a sea shanty.
   minor: [
-    { numeral: 'i', step: 0, quality: 'm' },
-    { numeral: 'iv', step: 5, quality: 'm' },
-    { numeral: 'V', step: 7, quality: '' },
-    { numeral: 'VI', step: 8, quality: '' },
+    { numeral: 'i', step: 0, quality: 'm', lean: 0.06 },
+    { numeral: 'iv', step: 5, quality: 'm', lean: 0.01 },
+    { numeral: 'V', step: 7, quality: '', lean: 0.02 },
+    { numeral: 'VI', step: 8, quality: '', lean: -0.04 },
+    { numeral: 'VII', step: 10, quality: '', lean: 0 },
+    { numeral: 'III', step: 3, quality: '', lean: -0.06 },
+  ],
+  // When the key is in doubt: bare fifths (no third to clash with a mode we got wrong) on
+  // home, the fourth and the fifth.
+  open: [
+    { numeral: 'I', step: 0, quality: '5', lean: 0.06 },
+    { numeral: 'IV', step: 5, quality: '5', lean: 0 },
+    { numeral: 'V', step: 7, quality: '5', lean: 0.02 },
   ],
 };
-const PREFER = [0, 2, 1, 3]; // when two chords still tie: I, then V, IV, vi
+const DOMINANT = 2;
 
+// Pitch classes of a chord: a triad, or root and fifth for quality '5'.
 function triad(root, quality) {
-  return [root % 12, (root + (quality === 'm' ? 3 : 4)) % 12, (root + 7) % 12];
+  const r = pc(root);
+  if (quality === '5') return [r, (r + 7) % 12];
+  return [r, (r + (quality === 'm' ? 3 : 4)) % 12, (r + 7) % 12];
 }
 
 function strength(pos, bpb) {
@@ -1574,9 +2067,8 @@ function strength(pos, bpb) {
 // How well a chord fits the melody between two beats. Chord tones score, a note a semitone
 // above (or below) a chord tone clashes, other notes are passing notes and cost a little.
 // Long notes and notes on strong beats count most. Chord tones score nearly the same so the
-// small preference for I, then V and IV, decides between chords that share the note, which
-// gives the familiar nursery harmony: do mi sol on I, re ti on V, fa la on IV.
-const FAVOUR = [0.06, 0.02, 0.02, -0.06]; // I IV V vi
+// small lean of each chord decides between chords that share the note, which gives the
+// familiar nursery harmony: do mi sol on I, re ti on V, fa la on IV.
 function fitSpan(notes, start, from, to, tones, bpb) {
   let s = 0;
   let wsum = 0;
@@ -1597,22 +2089,39 @@ function fitSpan(notes, start, from, to, tones, bpb) {
   return { s, w: wsum };
 }
 
-// One chord per bar from I IV V vi (i iv V VI in minor), two when the halves of a bar
-// clearly want different chords. Starts on I when it fits, ends on I, and likes V just
-// before that last I. Returns [{ bar, beat, beats, root, quality, numeral }].
+// About one chord a bar: I IV V vi in major, i iv V (or v) VI VII III in minor, bare fifths
+// when the key is in doubt. Two chords when the halves of a bar clearly want different ones.
+// Starts on I when it fits, ends on I, and likes V just before that last I. A pickup before
+// the first downbeat has no chord. Returns [{ bar, beat, beats, root, quality, numeral }].
 export function harmonize(q, key) {
   const notes = ((q && q.notes) || [])
-    .filter((n) => n && Number.isFinite(n.beat) && n.beats > 0 && noteP(n) != null)
+    .filter((n) => n && Number.isFinite(n.beat) && n.beat >= 0 && n.beats > 0 && noteP(n) != null)
     .sort((a, b) => a.beat - b.beat);
   if (!notes.length) return [];
-  const bpb = q.beatsPerBar > 0 ? q.beatsPerBar : 4;
+  const bpb = Number.isInteger(q.beatsPerBar) && q.beatsPerBar > 0 ? q.beatsPerBar : 4;
   key = key && Number.isFinite(key.tonic) ? key : findKey(notes);
-  const set = CHORDS[key.mode === 'minor' ? 'minor' : 'major'];
-  const tones = set.map((c) => triad(key.tonic + c.step, c.quality));
+  const tonic = pc(key.tonic);
+  const minor = key.mode === 'minor';
+  const doubt = key.enough === false;
+  let set = CHORDS[doubt ? 'open' : minor ? 'minor' : 'major'];
+  if (minor && !doubt) {
+    // The flat seventh sung more than the leading note: a natural minor tune, with a minor v
+    // and the major chords on the seventh and third. Otherwise the harmonic minor's i iv V VI.
+    const h = new Array(12).fill(0);
+    for (const n of notes) h[pc(n.p - tonic)] += n.beats;
+    if (h[10] > h[11]) set = set.map((c, i) => (i === DOMINANT ? { ...c, numeral: 'v', quality: 'm' } : c));
+    else set = set.slice(0, 4);
+  }
+  const tones = set.map((c) => triad(tonic + c.step, c.quality));
+  // Tied chords go home first, then to the dominant, then in the order listed.
+  const prefer = [0, DOMINANT, ...set.map((_, i) => i).filter((i) => i !== 0 && i !== DOMINANT)];
   let end = 0;
   for (const n of notes) end = Math.max(end, n.beat + n.beats);
   const bars = Math.max(1, Math.ceil(end / bpb - 1e-9));
   const half = Math.ceil(bpb / 2);
+  // A tune that starts late in its first bar has a pickup: that bar has no chord.
+  const firstBar = notes[0].beat >= bpb / 2 && bars > 1 ? 1 : 0;
+  const startBeat = firstBar ? bpb : Math.floor(notes[0].beat);
 
   // Notes are in order and don't overlap, so each span only needs the notes from the one
   // sounding at its start.
@@ -1626,13 +2135,13 @@ export function harmonize(q, key) {
     }
     return tones.map((tn, i) => {
       const f = fitSpan(notes, lo, from, to, tn, bpb);
-      return { s: f.s + FAVOUR[i] * f.w, w: f.w };
+      return { s: f.s + set[i].lean * f.w, w: f.w };
     });
   };
   const pick = (sc, prevIdx) => {
-    let best = PREFER[0];
+    let best = prefer[0];
     let bestS = -Infinity;
-    for (const i of PREFER) {
+    for (const i of prefer) {
       // A little loyalty to the chord already playing, so the harmony doesn't flicker.
       const s = sc[i].s + (i === prevIdx ? 0.05 * sc[i].w : 0);
       if (s > bestS + 1e-9) {
@@ -1645,18 +2154,19 @@ export function harmonize(q, key) {
 
   const spans = [];
   let prevIdx = 0;
-  for (let bar = 0; bar < bars; bar++) {
-    const from = bar * bpb;
-    const whole = score(from, from + bpb);
+  for (let bar = firstBar; bar < bars; bar++) {
+    const from = Math.max(bar * bpb, startBeat);
+    const to = (bar + 1) * bpb;
+    const whole = score(from, to);
     const w = whole[0].w;
     if (w === 0) {
-      spans.push({ bar, beat: from, beats: bpb, idx: prevIdx, sc: whole });
+      spans.push({ bar, beat: from, beats: to - from, idx: prevIdx, sc: whole });
       continue;
     }
     const one = pick(whole, prevIdx);
-    if (bpb >= 3) {
+    if (bpb >= 3 && to - from === bpb) {
       const A = score(from, from + half);
-      const B = score(from + half, from + bpb);
+      const B = score(from + half, to);
       if (A[0].w > 0 && B[0].w > 0) {
         const x = pick(A, prevIdx);
         const y = pick(B, x);
@@ -1668,42 +2178,65 @@ export function harmonize(q, key) {
         }
       }
     }
-    spans.push({ bar, beat: from, beats: bpb, idx: one, sc: whole });
+    spans.push({ bar, beat: from, beats: to - from, idx: one, sc: whole });
     prevIdx = one;
   }
 
+  // A span of one note sung over and over says little about its chord: when it fits the
+  // next span's chord about as well as its own, it takes that one (it leads into it).
+  for (let i = spans.length - 2; i >= 0; i--) {
+    const sp = spans[i];
+    const next = spans[i + 1].idx;
+    const sung = notes.filter((n) => n.beat >= sp.beat && n.beat < sp.beat + sp.beats);
+    if (sung.length < 2 || sung.some((n) => pc(n.p) !== pc(sung[0].p))) continue;
+    if (sp.idx !== next && sp.sc[next].s >= sp.sc[sp.idx].s - 0.05 * sp.sc[sp.idx].w) sp.idx = next;
+  }
   const bestOf = (sc) => Math.max(...sc.map((v) => v.s));
   // Start at home when home fits.
   const s0 = spans[0];
   if (s0.sc[0].s >= bestOf(s0.sc) - 0.25 * s0.sc[0].w) s0.idx = 0;
-  // End at home. If the last bar's first half clearly wants another chord, give it that
-  // chord and finish on I in the second half.
+  // End at home. If the last bar's first half clearly wants another chord, or its melody
+  // steps home from re or ti there, give that half the dominant (or what fits) and finish
+  // on I in the second half.
   const lastBar = bars - 1;
   while (spans.length > 1 && spans[spans.length - 1].bar === lastBar && spans[spans.length - 2].bar === lastBar) spans.pop();
   const last = spans[spans.length - 1];
-  last.beat = lastBar * bpb;
-  last.beats = bpb;
+  const barStart = Math.max(lastBar * bpb, startBeat);
+  last.beat = barStart;
+  last.beats = (lastBar + 1) * bpb - barStart;
   last.idx = 0;
-  if (bpb >= 3 && spans.length > 1) {
-    const A = score(last.beat, last.beat + half);
-    const B = score(last.beat + half, last.beat + bpb);
-    if (A[0].w > 0 && B[0].w > 0 && bestOf(A) - A[0].s >= 0.3 * A[0].w) {
+  if (bpb >= 3 && spans.length > 1 && last.beats === bpb) {
+    const A = score(barStart, barStart + half);
+    const B = score(barStart + half, barStart + bpb);
+    const inA = notes.filter((n) => n.beat >= barStart && n.beat < barStart + half);
+    const lastNote = notes[notes.length - 1];
+    const leading = inA.length && lastNote.beat >= barStart + half && [2, 11].includes(pc(inA[inA.length - 1].p - tonic));
+    if (A[0].w > 0 && B[0].w > 0 && (bestOf(A) - A[0].s >= 0.3 * A[0].w || (leading && A[DOMINANT].s >= A[0].s - 0.1 * A[0].w))) {
       last.beats = half;
       last.sc = A;
-      last.idx = pick(A, -1);
-      spans.push({ bar: lastBar, beat: last.beat + half, beats: bpb - half, idx: 0, sc: B });
+      last.idx = leading ? DOMINANT : pick(A, -1);
+      spans.push({ bar: lastBar, beat: barStart + half, beats: bpb - half, idx: 0, sc: B });
     }
   }
   // V just before the final I, when V fits about as well as anything (but a two-bar tune
   // still starts at home).
   const pen = spans[spans.length - 2];
-  if (pen && !(pen === s0 && s0.idx === 0) && (pen.sc[2].w === 0 || pen.sc[2].s >= bestOf(pen.sc) - 0.2 * pen.sc[2].w)) pen.idx = 2;
+  if (pen && !(pen === s0 && s0.idx === 0) && (pen.sc[DOMINANT].w === 0 || pen.sc[DOMINANT].s >= bestOf(pen.sc) - 0.2 * pen.sc[DOMINANT].w)) pen.idx = DOMINANT;
+  // With the key in doubt, end on a chord the last note belongs to, if one does.
+  if (doubt) {
+    const fin = spans[spans.length - 1];
+    const q = pc(notes[notes.length - 1].p);
+    if (!tones[fin.idx].includes(q)) {
+      const other = prefer.find((i) => tones[i].includes(q));
+      if (other != null) fin.idx = other;
+    }
+  }
 
   return spans.map((s) => ({
     bar: s.bar,
     beat: s.beat,
     beats: s.beats,
-    root: (key.tonic + set[s.idx].step) % 12,
+    root: (tonic + set[s.idx].step) % 12,
     quality: set[s.idx].quality,
     numeral: set[s.idx].numeral,
   }));
@@ -1711,19 +2244,43 @@ export function harmonize(q, key) {
 
 // ---------- Arrangement ----------
 
-// Close triad around middle C, moving as little as possible from the last chord:
-// phone speakers play this register well and it stays out of the way of a child's voice.
-function voiceChord(root, quality, prev) {
+// The tune is played in the singer's octave or higher, so that it sits on top of the band:
+// its lower notes at B3 or above (a man's voice comes up an octave, a child's stays put).
+const MELODY_FLOOR = 59;
+function melodyShift(ps) {
+  if (!ps.length) return 0;
+  const s = ps.slice().sort((a, b) => a - b);
+  const low = s[Math.floor(0.1 * (s.length - 1))];
+  return low < MELODY_FLOOR ? 12 * Math.ceil((MELODY_FLOOR - low) / 12) : 0;
+}
+
+// A close chord around middle C (a bare fifth as root and fifth, with the root again on top
+// when there is room), kept under the tune where it can be (`below`: the lowest tune note it
+// plays under) and moving as little as possible from the last chord. Phone speakers play
+// this register well.
+function voiceChord(root, quality, prev, below = Infinity) {
   const tones = triad(root, quality);
+  const shapes = [];
+  for (let low = 48; low <= 64; low++) {
+    if (!tones.includes(pc(low))) continue;
+    if (tones.length === 2) {
+      if (pc(low) === tones[0]) shapes.push([low, low + 7], [low, low + 7, low + 12]);
+      continue;
+    }
+    const v = [low];
+    for (let m = low + 1; v.length < 3; m++) if (tones.includes(pc(m))) v.push(m);
+    shapes.push(v);
+  }
   let best = null;
   let bestCost = Infinity;
-  for (let low = 55; low <= 64; low++) {
-    if (!tones.includes(low % 12)) continue;
-    const v = [low];
-    for (let m = low + 1; v.length < 3; m++) if (tones.includes(m % 12)) v.push(m);
-    if (v[2] > 72) continue;
-    const centre = Math.abs((v[0] + v[2]) / 2 - 62);
-    const cost = prev ? v.reduce((s, m, i) => s + Math.abs(m - prev[i]), 0) + 0.3 * centre : centre;
+  for (const v of shapes) {
+    const top = v[v.length - 1];
+    if (top > 76) continue;
+    const centre = Math.abs((v[0] + top) / 2 - 61);
+    let cost = (prev ? v.reduce((s, m, i) => s + Math.abs(m - prev[Math.min(i, prev.length - 1)]), 0) : 0) + 0.3 * centre + (v.length < 3 ? 1 : 0);
+    // Over or into the tune masks it; far under it leaves a hole.
+    if (top >= below) cost += 3 * (top - below + 1);
+    else if (top < below - 9) cost += 0.3 * (below - 9 - top);
     if (cost < bestCost) {
       bestCost = cost;
       best = v;
@@ -1735,37 +2292,57 @@ function voiceChord(root, quality, prev) {
 // The root between E2 and D#3: low enough to sound like a bass, high enough that a phone
 // speaker can still hint at it through its harmonics.
 function bassNote(root) {
-  const m = 36 + (((root % 12) + 12) % 12);
+  const m = 36 + pc(root);
   return m < 40 ? m + 12 : m;
 }
 
 // Timed events for audio.js: the tune (piano), chords, bass and, for 'pop', a drum kit.
-// 'gentle' has no drums and softer, held chords. countIn adds one bar of clicks first.
+// 'gentle' has no drums and softer, held chords; 'auto' (the default) is pop, or gentle when
+// the key is in doubt. bpm is the speed to play at (the tempo the child picked); without it the
+// song goes at the speed it was sung. countIn adds a bar of clicks before the first downbeat
+// (and the beats of a pickup bar before the tune comes in). A pickup is played on its own: no
+// chord, no drums until the first full bar.
 // events: [{ kind, t, d, m?, ms?, vel, accent? }], t and d in seconds from 0, vel 0..1.
-export function arrange(q, chords, key, { style = 'pop', countIn = false } = {}) {
-  const bpm = q && q.bpm > 0 ? q.bpm : TEMPOS.medium;
-  const bpb = q && q.beatsPerBar > 0 ? q.beatsPerBar : 4;
-  const spb = 60 / bpm;
-  const lead = countIn ? bpb * spb : 0;
-  const at = (beat) => lead + beat * spb;
-  const gentle = style === 'gentle';
+export function arrange(q, chords, key, { style = 'auto', countIn = false, bpm } = {}) {
+  const play = Number.isFinite(bpm) && bpm > 0 ? Math.min(240, Math.max(40, bpm)) : q && q.bpm > 0 ? q.bpm : TEMPOS.medium;
+  const bpb = q && Number.isInteger(q.beatsPerBar) && q.beatsPerBar > 0 ? q.beatsPerBar : 4;
+  const spb = 60 / play;
+  const notes = ((q && q.notes) || []).filter((n) => n && Number.isFinite(n.beat) && n.beat >= 0 && n.beats > 0 && noteP(n) != null);
+  if (!chords || !chords.length) chords = notes.length ? harmonize(q, key) : [];
+  chords = chords.filter((c) => c && Number.isFinite(c.beat) && c.beat >= 0 && c.beats > 0 && Number.isFinite(c.root));
+  const gentle = style === 'gentle' || (style !== 'pop' && !!key && key.enough === false);
   const events = [];
+  const first = Math.min(notes.length ? Math.floor(notes[0].beat) : Infinity, chords.length ? chords[0].beat : Infinity);
+  if (first === Infinity) return { bpm: round(play, 2), duration: 0, events };
+  const origin = countIn ? Math.floor(first / bpb) * bpb - bpb : first;
+  const at = (beat) => (beat - origin) * spb;
 
-  if (countIn) for (let i = 0; i < bpb; i++) events.push({ kind: 'click', t: i * spb, d: 0.05, vel: i ? 0.7 : 1, accent: i === 0 });
+  if (countIn) for (let b = origin; b < first; b++) events.push({ kind: 'click', t: at(b), d: 0.05, vel: b % bpb ? 0.7 : 1, accent: b % bpb === 0 });
 
-  const notes = (q && q.notes) || [];
+  const shift = melodyShift(notes.map(noteP));
   let end = 0;
   for (const n of notes) {
-    events.push({ kind: 'melody', t: at(n.beat), d: n.beats * spb, m: noteP(n), vel: 0.9 });
+    events.push({ kind: 'melody', t: at(n.beat), d: n.beats * spb, m: noteP(n) + shift, vel: 0.9 });
     end = Math.max(end, n.beat + n.beats);
   }
-  if (!chords || !chords.length) chords = notes.length ? harmonize(q, key) : [];
   for (const c of chords) end = Math.max(end, c.beat + c.beats);
   const total = Math.ceil(end / bpb - 1e-9) * bpb;
 
+  // The tune notes sounding in [from, to): the lowest of them, and whether one is held
+  // through `beat` from before it (a long note the chords should not cover).
+  let ni = 0;
+  const lowestIn = (from, to) => {
+    while (ni < notes.length && notes[ni].beat + notes[ni].beats <= from) ni++;
+    let low = Infinity;
+    for (let k = ni; k < notes.length && notes[k].beat < to; k++) low = Math.min(low, noteP(notes[k]) + shift);
+    return low;
+  };
+  const heldAt = (beat) => notes.some((n) => n.beat < beat && n.beat + n.beats > beat + 0.5 && n.beats >= 2);
+
   let prev = null;
   chords.forEach((c, i) => {
-    const ms = voiceChord(c.root, c.quality, prev);
+    const ms = voiceChord(c.root, c.quality, prev, lowestIn(c.beat, c.beat + c.beats));
+    if (!ms) return;
     prev = ms;
     const bass = bassNote(c.root);
     const final = i === chords.length - 1;
@@ -1780,8 +2357,15 @@ export function arrange(q, chords, key, { style = 'pop', countIn = false } = {})
       events.push({ kind: 'bass', t: at(c.beat), d: c.beats * spb + ring, m: bass, vel: 0.6 });
       return;
     }
-    // Pop: the chord on every beat, the bass on each half bar.
-    for (let b = 0; b < c.beats; b++) events.push({ kind: 'chord', t: at(c.beat + b), d: 0.9 * spb, ms, vel: b === 0 ? 0.55 : 0.42 });
+    // Pop: the chord on every beat, the bass on each half bar. Under a long tune note the
+    // chord only comes back on the strong beats, and softly, so the note isn't buried.
+    for (let b = 0; b < c.beats; b++) {
+      const beat = c.beat + b;
+      const strong = beat % bpb === 0 || (bpb % 2 === 0 && beat % bpb === bpb / 2);
+      const held = b > 0 && heldAt(beat);
+      if (held && !strong) continue;
+      events.push({ kind: 'chord', t: at(beat), d: 0.9 * spb, ms, vel: b === 0 ? 0.55 : held ? 0.3 : 0.42 });
+    }
     const step = bpb % 2 === 0 ? bpb / 2 : bpb;
     for (let b = 0; b < c.beats; b += step) {
       events.push({ kind: 'bass', t: at(c.beat + b), d: Math.min(step, c.beats - b) * spb * 0.95, m: bass, vel: 0.7 });
@@ -1790,7 +2374,8 @@ export function arrange(q, chords, key, { style = 'pop', countIn = false } = {})
 
   if (!gentle && total > 0) {
     const lastBar = total - bpb;
-    for (let bar = 0; bar < total; bar += bpb) {
+    // Drums start with the first full bar: a pickup comes in on its own.
+    for (let bar = Math.ceil(first / bpb) * bpb; bar < total; bar += bpb) {
       if (bar === lastBar && bar > 0) {
         events.push({ kind: 'kick', t: at(bar), d: 0.3, vel: 0.85 }); // the last bar just lands
         continue;
@@ -1806,9 +2391,10 @@ export function arrange(q, chords, key, { style = 'pop', countIn = false } = {})
   }
 
   events.sort((a, b) => a.t - b.t);
-  let duration = lead + total * spb;
+  let duration = at(total);
   for (const e of events) duration = Math.max(duration, e.t + e.d);
-  return { bpm, duration: round(duration, 3), events };
+  // Rounded up, so that every event ends within it.
+  return { bpm: round(play, 2), duration: Math.ceil(duration * 1000 - 1e-6) / 1000, events };
 }
 
 // ---------- Feedback ----------
@@ -1818,13 +2404,17 @@ export function describe(notes, key) {
   const list = (notes || []).filter((n) => noteP(n) != null);
   if (!list.length) return { seconds: 0, notes: 0, distinct: 0, low: null, high: null, span: 0, endsHome: false, shape: 'flat' };
   const ps = list.map(noteP);
-  const low = Math.min(...ps);
-  const high = Math.max(...ps);
+  let low = Infinity;
+  let high = -Infinity;
+  for (const p of ps) {
+    low = Math.min(low, p);
+    high = Math.max(high, p);
+  }
   const first = list[0];
   const lastN = list[list.length - 1];
   const seconds = Number.isFinite(first.t0) && Number.isFinite(lastN.t1) ? lastN.t1 - first.t0 : 0;
   const endPc = pc(ps[ps.length - 1]);
-  const endsHome = endPc === pc(ps[0]) || !!(key && key.enough && endPc === key.tonic);
+  const endsHome = endPc === pc(ps[0]) || !!(key && key.enough && Number.isFinite(key.tonic) && endPc === pc(key.tonic));
   return {
     seconds: round(Math.max(0, seconds), 1),
     notes: list.length,

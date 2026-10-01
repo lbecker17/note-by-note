@@ -465,6 +465,26 @@ test('findNotes: the app songs, sung with a little vibrato and scoop', () => {
   }
 });
 
+// The whole chain on a take: the middle time of a few runs (the first run of a fresh
+// process also pays for compiling the code).
+function timeChain(frames, runs = 5) {
+  const times = [];
+  let out = null;
+  for (let k = 0; k < runs; k++) {
+    const t0 = performance.now();
+    const res = findNotes(frames);
+    const key = findKey(res.notes);
+    const q = quantize(res.notes, { bpm: TEMPOS.medium });
+    const chords = harmonize(q, key);
+    const song = arrange(q, chords, key, { style: 'pop', countIn: true });
+    describe(res.notes, key);
+    times.push(performance.now() - t0);
+    out = { res, song };
+  }
+  times.sort((x, y) => x - y);
+  return { ms: times[times.length >> 1], ...out };
+}
+
 test('findNotes: deterministic, and quick on a 3-minute take', () => {
   const rnd = random(4);
   const parts = [];
@@ -478,21 +498,92 @@ test('findNotes: deterministic, and quick on a 3-minute take', () => {
     parts.push(p);
     t += p.d + p.gap;
   }
-  const { frames } = sing(parts, { jitter: 0.08 });
+  const { frames } = sing(parts, { jitter: 0.08, rms: true });
   assert.ok(frames.length > 21000);
-  const t0 = performance.now();
-  const res = findNotes(frames);
-  const key = findKey(res.notes);
-  const q = quantize(res.notes, { bpm: TEMPOS.medium });
-  const chords = harmonize(q, key);
-  const song = arrange(q, chords, key, { countIn: true });
-  describe(res.notes, key);
-  const ms = performance.now() - t0;
-  // The budget is well under 100 ms; this bound only catches a big slowdown on a busy machine.
-  assert.ok(ms < 400, `took ${ms.toFixed(0)} ms`);
+  const { ms, res, song } = timeChain(frames);
+  // The budget is under 100 ms; the bound leaves room for a busy machine.
+  assert.ok(ms < 150, `took ${ms.toFixed(0)} ms`);
   assert.ok(res.notes.length > 150);
   assert.ok(song.events.length > 1000);
   assert.deepEqual(findNotes(frames), res);
+});
+
+test('findNotes: quick on 3 minutes of "la la la" on one note', () => {
+  // Every note split from the next only by a dip in level: the case that once took seconds.
+  const parts = Array.from({ length: 1125 }, () => ({ p: 62, d: 0.16, rmsDip: [0.12, 0.04] }));
+  const { frames } = sing(parts, { rms: true });
+  const { ms, res } = timeChain(frames, 3);
+  assert.ok(ms < 150, `took ${ms.toFixed(0)} ms`);
+  assert.ok(res.notes.length > 1000, `${res.notes.length} notes`);
+});
+
+test('findNotes: quick sung notes with scoops or vibrato are a tune, not speech', () => {
+  const tune = [60, 62, 64, 65, 67, 65, 64, 62, 60, 64, 67, 64, 60, 62, 64, 60];
+  // A scoop up a semitone and a half into every quarter-second note, with consonants between.
+  const scooped = sing(tune.map((p) => ({ p, d: 0.25, gap: 0.07, scoop: [1.5, 0.1] })));
+  assert.deepEqual(ps(findNotes(scooped.frames)), tune);
+  for (const [d, gap, scoop] of [[0.25, 0, [2, 0.1]], [0.2, 0.07, [2, 0.1]]]) {
+    assert.deepEqual(ps(findNotes(sing(tune.map((p) => ({ p, d, gap, scoop }))).frames)), tune, `d ${d} gap ${gap}`);
+  }
+  // Wide, slow vibrato on fifth-of-a-second notes: each slides through half a cycle.
+  // (Under one vibrato cycle per note, the odd centre lands nearer the next semitone.)
+  const ten = tune.slice(0, 10);
+  for (let seed = 1; seed <= 6; seed++) {
+    const res = findNotes(sing(ten.map((p) => ({ p, d: 0.2, gap: 0.08, vib: [0.6, 4] })), { seed }).frames);
+    assert.equal(res.notes.length, ten.length, `seed ${seed}`);
+    assert.ok(ps(res).filter((p, i) => p === ten[i]).length >= 8, `seed ${seed}: ${ps(res)}`);
+  }
+  // A tired child's notes that each sag a little are still sung.
+  const sag = findNotes(sing(tune.map((p) => ({ p, d: 0.3, gap: 0.04, slide: 0.6 }))).frames);
+  assert.ok(sag.notes.length >= 15, `${sag.notes.length} notes`);
+});
+
+test('findNotes: short legato notes each with a big scoop are notes, not one glide', () => {
+  const tune = [60, 62, 64, 65, 67, 65, 64, 62, 60, 64, 67, 64, 60, 62, 64, 60];
+  for (const gap of [0, 0.03]) {
+    const res = findNotes(sing(tune.map((p) => ({ p, d: 0.2, gap, scoop: [1.5, 0.1] }))).frames);
+    assert.equal(res.notes.length, tune.length, `gap ${gap}`);
+    assert.ok(res.glideShare < 0.05, `glideShare ${res.glideShare}`);
+  }
+});
+
+test('findNotes: frame times that are out of order, repeated or broken', () => {
+  const { frames } = sing([60, 62, 64, 65, 67].map((p) => ({ p, d: 0.4 })));
+  const want = [60, 62, 64, 65, 67];
+  const edit = (fn) => {
+    const copy = frames.map((f) => ({ ...f }));
+    fn(copy);
+    return ps(findNotes(copy));
+  };
+  // One frame whose clock is off (never finite, or far in the future) is just that frame.
+  assert.deepEqual(edit((f) => (f[5].t = Infinity)), want);
+  assert.deepEqual(edit((f) => (f[5].t = 1e6)), want);
+  assert.deepEqual(edit((f) => (f[5].t = NaN)), want);
+  assert.deepEqual(edit((f) => (f[40].t = '1.2')), want);
+  // Frames handed over backwards, or each one twice, are the same take.
+  assert.deepEqual(ps(findNotes(frames.slice().reverse())), want);
+  assert.deepEqual(ps(findNotes(frames.flatMap((f) => [f, { ...f }]))), want);
+  // A pitch that is not a number is no pitch.
+  assert.deepEqual(edit((f) => [10, 70, 150].forEach((i) => (f[i].m = i === 70 ? Infinity : NaN))), want);
+  // One frame is never a note.
+  assert.deepEqual(findNotes([{ t: 0, m: 60 }]).notes, []);
+});
+
+test('findNotes: each note carries the tuning it was read in', () => {
+  const sharp = findNotes(sing(SCALE.map((p) => ({ p, d: 0.4 })), { sharp: 0.42 }).frames);
+  for (const n of sharp.notes) {
+    assert.ok(Math.abs(n.tune - 0.42) < 0.05, `tune ${n.tune}`);
+    assert.equal(n.p, Math.round(n.m - n.tune));
+  }
+  // A singer who drifts: later phrases carry their own tuning, within half a semitone.
+  const phrase = [60, 62, 64, 65, 67, 65, 64, 62, 60];
+  const parts = [];
+  [0, 0.3, 0.6, 0.9].forEach((drift) => phrase.forEach((p, i) => parts.push({ p, d: 0.3, gap: i === phrase.length - 1 ? 0.8 : 0.05, dev: drift })));
+  const drifting = findNotes(sing(parts).frames);
+  for (const n of drifting.notes) {
+    assert.ok(Math.abs(n.tune - drifting.tuning) <= 0.5 + 1e-9);
+    assert.equal(n.p, Math.round(n.m - n.tune));
+  }
 });
 
 // ---------- findKey ----------
@@ -559,15 +650,106 @@ function played(rhythm, bpm, { start = 0.73, loose = 0.03, seed = 2 } = {}) {
 
 const RHYTHM = [[0, 1, 60], [1, 1, 62], [2, 0.5, 64], [2.5, 0.5, 65], [3, 1, 67], [5, 2, 67], [7, 0.5, 65], [7.5, 1.5, 64], [10, 2, 60]];
 
+// Beats relative to the first note's, so a tune may start anywhere in its bar.
+const fromFirst = (q) => q.notes.map((n) => ({ beat: n.beat - q.notes[0].beat, beats: n.beats, p: n.p }));
+
 test('quantize: recovers a rhythm at each tempo, with rests', () => {
   for (const bpm of Object.values(TEMPOS)) {
-    const q = quantize(played(RHYTHM, bpm), { bpm });
+    const q = quantize(played(RHYTHM, bpm), { bpm, beatsPerBar: 4 });
     assert.equal(q.bpm, bpm);
     assert.equal(q.beatsPerBar, 4);
-    assert.deepEqual(q.notes, RHYTHM.map(([beat, beats, p]) => ({ beat, beats, p })));
-    // offset is the time of beat 0
-    assert.ok(Math.abs(q.offset - 0.73) < 0.05);
+    assert.deepEqual(fromFirst(q), RHYTHM.map(([beat, beats, p]) => ({ beat, beats, p })));
+    // offset is the time of beat 0, so the first note sits where it was sung
+    assert.ok(Math.abs(q.offset + (q.notes[0].beat * 60) / q.bpm - 0.73) < 0.05);
   }
+});
+
+test('quantize: the beat comes from the singing, whatever tempo is picked', () => {
+  // Sung at 108 bpm: every pick gives the same grid, at the sung tempo.
+  const notes = played(RHYTHM, 108);
+  for (const bpm of Object.values(TEMPOS)) {
+    const q = quantize(notes, { bpm, beatsPerBar: 4 });
+    assert.ok(Math.abs(q.bpm - 108) < 2, `bpm ${q.bpm}`);
+    assert.deepEqual(fromFirst(q), RHYTHM.map(([beat, beats, p]) => ({ beat, beats, p })));
+  }
+});
+
+test('quantize: every note is kept, the last one too', () => {
+  // A phrase in quick eighths: picking a slow tempo once squeezed notes out.
+  const mel = parseMelody('C4/0.5 C4/0.5 G4/0.5 G4/0.5 A4/0.5 A4/0.5 G4 F4/0.5 F4/0.5 E4/0.5 E4/0.5 D4/0.5 D4/0.5 C4');
+  for (const sung of [120, 108]) {
+    const spb = 60 / sung;
+    const found = findNotes(sing(mel.notes.map((n) => ({ p: n.m, d: n.beats * spb - 0.05, gap: 0.05 }))).frames).notes;
+    assert.equal(found.length, mel.notes.length);
+    for (const bpm of Object.values(TEMPOS)) {
+      const q = quantize(found, { bpm });
+      assert.deepEqual(q.notes.map((n) => n.p), mel.notes.map((n) => n.m), `sung ${sung}, picked ${bpm}`);
+    }
+  }
+  // Two notes found in one eighth both stay, in order, an eighth apart.
+  const q = quantize([{ t0: 1, t1: 1.4, p: 60 }, { t0: 1.5, t1: 1.55, p: 62 }, { t0: 1.56, t1: 1.9, p: 64 }, { t0: 2, t1: 2.4, p: 65 }], { bpm: 120 });
+  assert.deepEqual(q.notes.map((n) => n.p), [60, 62, 64, 65]);
+});
+
+test('quantize: a singer who speeds up and slows down keeps the beat', () => {
+  // Ode to Joy sung freely: the tempo drifts by a tenth up and down and slows at the end.
+  const ode = parseMelody(`E4 E4 F4 G4 | G4 F4 E4 D4 | C4 C4 D4 E4 | E4/1.5 D4/0.5 D4/2 |
+                          E4 E4 F4 G4 | G4 F4 E4 D4 | C4 C4 D4 E4 | D4/1.5 C4/0.5 C4/2`);
+  const speed = (beat) => 0.5 * (1 + 0.1 * Math.sin(beat / 5) + (beat > 26 ? 0.03 * (beat - 26) : 0));
+  let t = 0.6;
+  let beat = 0;
+  const notes = ode.notes.map((n) => {
+    while (beat < n.beat) {
+      t += speed(beat) * 0.25;
+      beat += 0.25;
+    }
+    let len = 0;
+    for (let b = n.beat; b < n.beat + n.beats; b += 0.25) len += speed(b) * 0.25;
+    return { t0: t, t1: t + len - 0.06, p: n.m, conf: 0.9 };
+  });
+  const q = quantize(notes, { bpm: TEMPOS.slow });
+  assert.equal(q.beatsPerBar, 4);
+  assert.deepEqual(q.notes.map((n) => n.beat), ode.notes.map((n) => n.beat));
+});
+
+test('quantize: bars of three, and tunes that start with a pickup', () => {
+  // Notes (MIDI/beats) written from their place in the bar, sung at 100 bpm from t = 1.
+  const at = (src, bpb, pickup) => {
+    const start = pickup ? bpb - pickup : 0;
+    let beat = start;
+    const out = [];
+    for (const tok of src.trim().split(/\s+/)) {
+      if (tok === '|') continue;
+      const [p, d] = tok.split('/');
+      const beats = d ? Number(d) : 1;
+      out.push({ beat, beats, n: { t0: 1 + (beat - start) * 0.6, t1: 1 + (beat + beats - start) * 0.6 - 0.06, p: Number(p), conf: 0.9 } });
+      beat += beats;
+    }
+    return out;
+  };
+  // A waltz: long notes on the first beat of each bar of three.
+  const waltz = at('60/2 64 | 67/2 64 | 65/2 62 | 59/2 62 | 60/2 64 | 67/2 72 | 71/2 67 | 72/3', 3, 0);
+  let q = quantize(waltz.map((x) => x.n), { bpm: 100 });
+  assert.equal(q.beatsPerBar, 3);
+  assert.deepEqual(q.notes.map((n) => n.beat), waltz.map((x) => x.beat));
+  // In 4/4 with a one-beat pickup, as "Amazing Grace" or "When the Saints" start.
+  const pickup = at('55 | 60/2 64 60 | 62/2 64 62 | 60/2 57 55 | 55/3 55 | 60/2 64 60 | 62/2 64 62 | 67/4', 4, 1);
+  q = quantize(pickup.map((x) => x.n), { bpm: 100, beatsPerBar: 4 });
+  assert.deepEqual(q.notes.map((n) => n.beat), pickup.map((x) => x.beat));
+  assert.equal(q.notes[0].beat, 3);
+  // The time of beat 0 is a bar before the first downbeat, before the first note.
+  assert.ok(Math.abs(q.offset - (1 - 3 * 0.6)) < 0.03, `offset ${q.offset}`);
+  // Most tunes start on the downbeat, and stay there.
+  q = quantize(played(RHYTHM.slice(0, 5).concat([[4, 4, 60]]), 96), { bpm: 96 });
+  assert.equal(q.notes[0].beat, 0);
+  assert.equal(q.beatsPerBar, 4);
+});
+
+test('quantize: a last note held just past a bar line ends on it', () => {
+  // The final C held an eighth too long, into a bar of its own.
+  const q = quantize(played([[0, 1, 64], [1, 1, 62], [2, 1, 60], [3, 1, 62], [4, 1, 64], [5, 1, 62], [6, 2.5, 60]], 96, { loose: 0 }), { bpm: 96, beatsPerBar: 4 });
+  const last = q.notes[q.notes.length - 1];
+  assert.equal(last.beat + last.beats, 8);
 });
 
 test('quantize: never overlaps, never zero length, keeps order', () => {
@@ -588,7 +770,7 @@ test('quantize: never overlaps, never zero length, keeps order', () => {
     assert.equal(n.beat * 2, Math.round(n.beat * 2));
     end = n.beat + n.beats;
   }
-  assert.deepEqual(quantize([], { bpm: 96 }), { bpm: 96, beatsPerBar: 4, offset: 0, notes: [] });
+  assert.deepEqual(quantize([], { bpm: 96 }), { bpm: 96, beatsPerBar: 4, meterSure: false, offset: 0, notes: [] });
 });
 
 test('quantize: notes sung short of their slot keep their length, and rests stay', () => {
@@ -604,7 +786,7 @@ test('quantize: notes sung short of their slot keep their length, and rests stay
   assert.ok(q.notes[2].beats >= 1.5 && q.notes[2].beat + q.notes[2].beats < 5);
 });
 
-test('quantize: the first note is always on beat 0', () => {
+test('quantize: the first note is in the first bar, and nothing breaks on odd input', () => {
   const rnd = random(7);
   for (let k = 0; k < 200; k++) {
     let t = 0.3 + rnd();
@@ -615,11 +797,20 @@ test('quantize: the first note is always on beat 0', () => {
       t += d + rnd() * 0.2;
     }
     const q = quantize(notes, { bpm: [72, 96, 120][k % 3] });
-    assert.equal(q.notes[0].beat, 0);
-    assert.ok(q.notes.every((n) => n.beat >= 0 && n.beats > 0));
-    // offset is still the time of beat 0, near the first note's start
-    assert.ok(Math.abs(q.offset - notes[0].t0) <= 30 / q.bpm);
+    assert.ok(q.notes[0].beat >= 0 && q.notes[0].beat < q.beatsPerBar);
+    assert.ok(q.notes.length === notes.length && q.notes.every((n) => n.beat >= 0 && n.beats > 0));
+    // offset is still the time of beat 0, a bar or less before the first note
+    const first = q.offset + (q.notes[0].beat * 60) / q.bpm;
+    assert.ok(Math.abs(first - notes[0].t0) <= 30 / q.bpm + 1e-6, `first note at ${first}, sung at ${notes[0].t0}`);
   }
+  const notes = played(RHYTHM, 96);
+  for (const bpm of [-96, 0, NaN, Infinity, 1e6, 1e-3, '96']) {
+    const q = quantize(notes, { bpm });
+    assert.equal(q.notes.length, notes.length, `bpm ${bpm}`);
+    assert.ok(q.bpm > 0 && Number.isFinite(q.bpm) && Number.isFinite(q.offset));
+  }
+  for (const beatsPerBar of [0, -1, 2.5, 'x']) assert.ok([3, 4].includes(quantize(notes, { beatsPerBar }).beatsPerBar));
+  assert.deepEqual(quantize([{ t0: 0, t1: NaN, p: 60 }, { t0: 1, t1: 2, p: 62 }]).notes.map((n) => n.p), [62]);
 });
 
 test('quantize: a dotted rhythm becomes two eighths rather than a squash', () => {
@@ -689,10 +880,46 @@ test('harmonize: minor keys use i iv V VI', () => {
 
 test('harmonize: empty, rests and a missing key', () => {
   assert.deepEqual(harmonize({ bpm: 96, beatsPerBar: 4, notes: [] }, C_MAJOR), []);
+  // Too short to know its key: bare fifths, home at both ends, and the step home from re
+  // gets the fifth chord under it.
   const ch = harmonize(qOf('G4/2 r/6 | E4 D4 C4/2'));
-  assert.equal(ch.length, 3);
+  assert.deepEqual(ch.map((c) => c.numeral), ['I', 'I', 'V', 'I']);
+  assert.ok(ch.every((c) => c.quality === '5'));
+  assert.deepEqual(ch.map((c) => [c.beat, c.beats]), [[0, 4], [4, 4], [8, 2], [10, 2]]);
+});
+
+test('harmonize: a minor tune that sings the flat seventh gets VII and v', () => {
+  // Drunken Sailor, in D minor: the second line sits on C major, with C natural, never C#.
+  const sailor = qOf(`A4 A4/.5 A4/.5 A4 A4/.5 A4/.5 | A4 D4 F4 A4 | G4 G4/.5 G4/.5 G4 G4/.5 G4/.5 | G4 C4 E4 G4 |
+                      A4 A4/.5 A4/.5 A4 A4/.5 A4/.5 | A4 B4 C5 D5 | C5 A4 G4 E4 | D4/2 D4/2`);
+  const D_MINOR = { tonic: 2, mode: 'minor', confidence: 1, enough: true };
+  const ch = harmonize(sailor, D_MINOR);
+  const bar = (b) => ch.filter((c) => c.bar === b).map((c) => c.numeral).join(' ');
+  assert.equal(bar(0), 'i');
+  assert.equal(bar(2), 'VII');
+  assert.equal(bar(3), 'VII');
+  assert.equal(ch[ch.length - 1].numeral, 'i');
+  assert.ok(ch.every((c) => c.numeral !== 'V'), 'no major V under a C natural');
+  // A harmonic-minor line (with G#) keeps i iv V VI.
+  const harm = harmonize(qOf('A3 C4 E4 A4 | G#4/2 A4 E4 | F4 E4 D4 C4 | B3 G#3 A3/2'), { tonic: 9, mode: 'minor', enough: true });
+  assert.ok(harm.every((c) => ['i', 'iv', 'V', 'VI'].includes(c.numeral)));
+});
+
+test('harmonize: a pickup has no chord, and the bars start at the downbeat', () => {
+  // "Amazing Grace" in C, 3/4: the first note is a pickup on beat 3.
+  const grace = qOf('r/2 G3 | C4/2 E4/.5 C4/.5 | E4/2 D4 | C4/2 A3 | G3/2 G3 | C4/2 E4/.5 C4/.5 | E4/2 D4 | G4/3', 3);
+  const ch = harmonize(grace, C_MAJOR);
+  assert.equal(ch[0].bar, 1);
+  assert.equal(ch[0].beat, 3);
   assert.equal(ch[0].numeral, 'I');
-  assert.equal(ch[2].numeral, 'I');
+  assert.deepEqual(ch.filter((c) => c.bar === 3).map((c) => c.numeral), ['IV']);
+});
+
+test('harmonize: a tonic given as a MIDI note, below zero or between semitones', () => {
+  const q = qOf('C4 E4 G4 E4 | F4 A4 C5 A4 | G4 B4 D5 B4 | C5/4');
+  const want = harmonize(q, C_MAJOR).map((c) => c.root);
+  for (const tonic of [60, -12, 0.2, 12]) assert.deepEqual(harmonize(q, { tonic, mode: 'major', enough: true }).map((c) => c.root), want);
+  for (const c of harmonize(q, { tonic: -1, mode: 'major', enough: true })) assert.ok(Number.isInteger(c.root) && c.root >= 0 && c.root < 12);
 });
 
 // ---------- arrange ----------
@@ -713,8 +940,13 @@ test('arrange: pop has drums, gentle has none, both follow the tune', () => {
       assert.ok(e.t >= t, 'sorted by time');
       t = e.t;
       assert.ok(e.d > 0 && e.vel > 0 && e.vel <= 1);
-      if (e.kind === 'chord') assert.ok(e.ms.length === 3 && e.ms.every((m) => m >= 55 && m <= 72), `chord ${e.ms}`);
+      if (e.kind === 'chord') assert.ok(e.ms.length === 3 && e.ms.every((m) => m >= 48 && m <= 79), `chord ${e.ms}`);
       if (e.kind === 'bass') assert.ok(e.m >= 40 && e.m < 52);
+      // The chords stay under the tune: their top note no higher than the tune's lowest.
+      if (e.kind === 'chord') {
+        const under = mel.filter((m) => m.t < e.t + e.d - 1e-9 && m.t + m.d > e.t + 1e-9);
+        if (under.length) assert.ok(Math.max(...e.ms) <= Math.min(...under.map((m) => m.m)), `chord ${e.ms} under ${under.map((m) => m.m)}`);
+      }
       assert.ok(e.t + e.d <= song.duration + 1e-9);
     }
     assert.ok(song.duration >= 16 * spb);
@@ -741,6 +973,75 @@ test('arrange: chord notes are the chord, and a count-in comes first', () => {
   // Without chords, arrange picks them itself.
   assert.ok(arrange(q, null, key).events.some((e) => e.kind === 'chord'));
   assert.deepEqual(arrange({ bpm: 96, beatsPerBar: 4, notes: [] }, [], key).events, []);
+});
+
+test('arrange: a low voice is played an octave up, on top of the band', () => {
+  // A man's Ode to Joy, around G2 to D3.
+  const q = qOf('B2 B2 C3 D3 | D3 C3 B2 A2 | G2 G2 A2 B2 | A2/1.5 G2/0.5 G2/2');
+  const key = { tonic: 7, mode: 'major', confidence: 1, enough: true };
+  const song = arrange(q, harmonize(q, key), key, { style: 'pop' });
+  const mel = song.events.filter((e) => e.kind === 'melody');
+  assert.deepEqual(mel.map((e) => e.m), q.notes.map((n) => n.p + 24));
+  for (const e of song.events) {
+    if (e.kind === 'chord') {
+      const under = mel.filter((m) => m.t < e.t + e.d - 1e-9 && m.t + m.d > e.t + 1e-9);
+      if (under.length) assert.ok(Math.max(...e.ms) <= Math.min(...under.map((m) => m.m)));
+    }
+    if (e.kind === 'bass') assert.ok(e.m <= Math.min(...mel.map((m) => m.m)) - 12);
+  }
+  // A child's tune stays where it was sung.
+  const high = qOf('E5 D5 C5 D5 | E5 E5 E5/2');
+  assert.deepEqual(arrange(high, null, C_MAJOR).events.filter((e) => e.kind === 'melody').map((e) => e.m), high.notes.map((n) => n.p));
+});
+
+test('arrange: in pop, a held note is not buried under chords on every beat', () => {
+  const q = qOf('C4 E4 G4/2 | A4/4 | G4 E4 D4/2 | C4/4');
+  const song = arrange(q, harmonize(q, C_MAJOR), C_MAJOR, { style: 'pop' });
+  const spb = 60 / q.bpm;
+  const chordAt = (beat) => song.events.filter((e) => e.kind === 'chord' && Math.abs(e.t - beat * spb) < 1e-9);
+  // Under the whole-note A (bar 2) the chord comes on beats 1 and 3 only, the second softly.
+  assert.equal(chordAt(4).length, 1);
+  assert.equal(chordAt(5).length, 0);
+  assert.ok(chordAt(6)[0].vel < chordAt(4)[0].vel);
+  assert.equal(chordAt(7).length, 0);
+  // Quick notes still get a chord on every beat.
+  assert.equal(chordAt(1).length, 1);
+});
+
+test('arrange: a pickup comes in alone, and the count-in leads to it', () => {
+  // 3/4 with a one-beat pickup on beat 3.
+  const q = qOf('r/2 G3 | C4/2 E4/.5 C4/.5 | E4/2 D4 | C4/3', 3);
+  const ch = harmonize(q, C_MAJOR);
+  const spb = 60 / q.bpm;
+  const song = arrange(q, ch, C_MAJOR, { style: 'pop' });
+  // No silent beats before the first note, nothing but the tune until the downbeat.
+  assert.equal(song.events[0].kind, 'melody');
+  assert.equal(song.events[0].t, 0);
+  assert.ok(song.events.filter((e) => e.t < spb - 1e-9).every((e) => e.kind === 'melody'));
+  assert.ok(song.events.some((e) => e.kind === 'kick' && Math.abs(e.t - spb) < 1e-9));
+  // Counted in: "1 2 3 1 2" and the tune comes in on 3.
+  const counted = arrange(q, ch, C_MAJOR, { style: 'pop', countIn: true });
+  const clicks = counted.events.filter((e) => e.kind === 'click');
+  assert.deepEqual(clicks.map((e) => e.accent), [true, false, false, true, false]);
+  assert.equal(counted.events.find((e) => e.kind === 'melody').t, 5 * spb);
+});
+
+test('arrange: plays at the speed asked for, gently when the key is in doubt', () => {
+  const q = qOf('C4 E4 G4 E4 | F4 A4 C5 A4 | G4 B4 D5 B4 | C5/4');
+  const ch = harmonize(q, C_MAJOR);
+  const slow = arrange(q, ch, C_MAJOR, { bpm: TEMPOS.slow });
+  assert.equal(slow.bpm, TEMPOS.slow);
+  assert.equal(slow.events.filter((e) => e.kind === 'melody')[1].t, 60 / TEMPOS.slow);
+  assert.equal(arrange(q, ch, C_MAJOR).bpm, q.bpm);
+  const drums = (song) => song.events.some((e) => e.kind === 'kick');
+  assert.equal(drums(arrange(q, ch, C_MAJOR)), true);
+  const unsure = { ...C_MAJOR, enough: false };
+  assert.equal(drums(arrange(q, harmonize(q, unsure), unsure)), false);
+  // Asked for the band, it plays the band.
+  assert.equal(drums(arrange(q, harmonize(q, unsure), unsure, { style: 'pop' })), true);
+  // A chord that can't be voiced is left out rather than sent as nothing.
+  const odd = arrange(q, [{ bar: 0, beat: 0, beats: 4, root: 2.5, quality: 'x', numeral: '?' }], C_MAJOR);
+  assert.ok(odd.events.every((e) => e.kind !== 'chord' || (Array.isArray(e.ms) && e.ms.length)));
 });
 
 // ---------- describe ----------

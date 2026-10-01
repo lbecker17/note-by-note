@@ -317,7 +317,7 @@ export class AudioEngine {
     else if (ev.kind === 'click') this.click(at, ev.accent);
     else if (ev.kind === 'melody') this.piano(ev.m, at, ev.d, 0.13 * levelOf(ev, 0.9));
     else if (ev.kind === 'bass') this.piano(ev.m, at, ev.d, 0.11 * levelOf(ev, 0.7));
-    else if (ev.kind === 'chord') for (const m of ev.ms) this.piano(m, at, ev.d, 0.045 * levelOf(ev, 0.5));
+    else if (ev.kind === 'chord') for (const m of Array.isArray(ev.ms) ? ev.ms : []) this.piano(m, at, ev.d, 0.045 * levelOf(ev, 0.5));
     else if (ev.kind === 'kick') this.kick(at, levelOf(ev, 0.8));
     else if (ev.kind === 'snare') this.snare(at, levelOf(ev, 0.6));
     else if (ev.kind === 'hat') this.hat(at, levelOf(ev, 0.35));
