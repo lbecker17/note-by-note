@@ -3,6 +3,9 @@
 // Melody: "C4/1" = pitch/beats, "|" bar line, "//" phrase break.
 // Lyrics: one token per note. "~" holds the previous syllable over another note,
 // "-" joins the next syllable, "=" joins with a visible hyphen.
+// Family songs imported from files (js/import.js) use the same format and live only on
+// the phone. They may have chords: null (no piano chords, unless a harmonizer is set
+// with setHarmonizer) and lyrics: null (sung on "la").
 
 import { parseMelody, parseLyrics, parseChords, chordTones, parsePitch, fitShift } from './music.js';
 import { Builder } from './lessons.js';
@@ -145,14 +148,28 @@ export const SONGS = [
 
 // Parse once and cache.
 const cache = new Map();
+
+// For songs with chords: null. fn(mel, song) returns a chords string or parsed chords
+// ([{ root, quality, beat, beats }]); without one those songs play no piano chords.
+let harmonizer = null;
+export function setHarmonizer(fn) {
+  harmonizer = fn;
+  cache.clear();
+}
+
 export function songData(song) {
   if (cache.has(song.id)) return cache.get(song.id);
   const mel = parseMelody(song.melody);
-  const lyr = parseLyrics(song.lyrics);
+  const lyr = song.lyrics ? parseLyrics(song.lyrics) : mel.notes.map(() => 'la');
   if (lyr.length !== mel.notes.length) {
     console.warn(`${song.id}: ${mel.notes.length} notes but ${lyr.length} lyric tokens`);
   }
-  const chords = parseChords(song.chords);
+  let chords = [];
+  if (song.chords) chords = parseChords(song.chords);
+  else if (harmonizer) {
+    const h = harmonizer(mel, song);
+    chords = typeof h === 'string' ? parseChords(h) : Array.isArray(h) ? h : [];
+  }
   let lo = Infinity, hi = -Infinity;
   for (const n of mel.notes) {
     lo = Math.min(lo, n.m);
