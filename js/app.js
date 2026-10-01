@@ -160,6 +160,7 @@ function openSheet(html, actions = {}, opts = {}) {
     el.scrollTop = y;
     sheet.actions = actions;
     sheet.onClose = opts.onClose;
+    sheet.stuck();
     return sheet.el;
   }
   closeSheet(true);
@@ -171,13 +172,89 @@ function openSheet(html, actions = {}, opts = {}) {
     bd.addEventListener('click', (e) => {
       if (e.target === bd) closeSheet();
     });
-  sheet = { el: bd, actions, onClose: opts.onClose, key: opts.key };
+  const sc = bd.querySelector('.sheet');
+  if (opts.dismissable !== false) swipeToClose(bd, sc);
+  sheet = { el: bd, actions, onClose: opts.onClose, key: opts.key, stuck: watchStuck(sc) };
   // Focus starts at the top, on the heading (or the sheet itself when it has none), so a screen
   // reader begins with the title and the content, not a button at the bottom.
-  const top = bd.querySelector('.sheet h2') || bd.querySelector('.sheet');
+  const top = bd.querySelector('.sheet h2') || sc;
   top.setAttribute('tabindex', '-1');
   top.focus({ preventScroll: true });
   return bd;
+}
+
+// A tall sheet's main buttons (.sheet-actions) stick to its bottom edge (CSS position: sticky).
+// While they're stuck, with the sheet scrolling under them, they get .stuck so CSS can put paper
+// behind them. Returns the check, to run again after the sheet's content changes.
+function watchStuck(sc) {
+  const update = () => {
+    const bar = sc.querySelector('.sheet-actions');
+    if (!bar) return;
+    const lift = parseFloat(getComputedStyle(bar).bottom) || 0; // 10 px plus the home indicator
+    bar.classList.toggle('stuck', bar.getBoundingClientRect().bottom + lift >= sc.getBoundingClientRect().bottom - 1);
+  };
+  sc.addEventListener('scroll', update, { passive: true });
+  update();
+  requestAnimationFrame(update); // again once labels have been fitted
+  return update;
+}
+window.addEventListener('resize', () => sheet && sheet.stuck());
+
+// Swipe a sheet down by its top (the handle and the title) to close it, as the handle suggests.
+// Only a downward drag that starts there while the sheet is scrolled to the top, so scrolling inside
+// a tall sheet still works, and a tap is still a tap. With reduced motion it closes without sliding.
+const SWIPE_ZONE = 64; // px from the sheet's top edge
+const SWIPE_CLOSE = 72; // px of drag that closes it (a quick flick does too)
+function swipeToClose(bd, sc) {
+  const wrap = bd.querySelector('.sheet-wrap');
+  let drag = null; // { x, y, t, dy, on }
+  const slide = (y) => (wrap.style.transform = y ? `translateY(${y})` : '');
+  sc.addEventListener(
+    'touchstart',
+    (e) => {
+      const p = e.touches[0];
+      const inZone = p.clientY - sc.getBoundingClientRect().top <= SWIPE_ZONE;
+      drag = e.touches.length === 1 && sc.scrollTop <= 0 && inZone ? { x: p.clientX, y: p.clientY, t: e.timeStamp, dy: 0, on: false } : null;
+    },
+    { passive: true }
+  );
+  sc.addEventListener(
+    'touchmove',
+    (e) => {
+      if (!drag) return;
+      const p = e.touches[0];
+      const dx = Math.abs(p.clientX - drag.x);
+      const dy = p.clientY - drag.y;
+      if (!drag.on) {
+        if (dx < 6 && Math.abs(dy) < 6) return; // still a tap
+        if (dy <= dx || !e.cancelable) return (drag = null); // up or sideways: a scroll, not a swipe
+        drag.on = true;
+        wrap.classList.remove('settle');
+      }
+      e.preventDefault();
+      drag.dy = Math.max(0, dy);
+      slide(`${drag.dy}px`);
+    },
+    { passive: false }
+  );
+  const end = (e) => {
+    const d = drag;
+    drag = null;
+    if (!d || !d.on) return;
+    const flick = d.dy > 24 && d.dy / Math.max(1, e.timeStamp - d.t) > 0.5;
+    if (e.type === 'touchend' && (d.dy >= SWIPE_CLOSE || flick)) {
+      if (reducedMotion()) return closeSheet();
+      wrap.classList.add('leave');
+      bd.classList.add('leaving');
+      slide('100%');
+      setTimeout(() => sheet && sheet.el === bd && closeSheet(), 200);
+    } else {
+      if (!reducedMotion()) wrap.classList.add('settle');
+      slide(0);
+    }
+  };
+  sc.addEventListener('touchend', end);
+  sc.addEventListener('touchcancel', end);
 }
 
 function closeSheet(silent = false) {
@@ -371,14 +448,18 @@ function settingsSheet(gate = null) {
     });
 }
 
-// Keeps a button's label to `lines` lines: if its <span> wraps onto more, it gets the short
-// label instead. Returns true when it did.
-function fitLabel(btn, short, lines = 1) {
-  const span = btn && btn.querySelector('span');
-  if (!span) return false;
+// How many lines the text in el wraps onto (el holds text only).
+function lineCount(el) {
   const text = document.createRange();
-  text.selectNodeContents(span);
-  if (text.getClientRects().length <= lines) return false;
+  text.selectNodeContents(el);
+  return text.getClientRects().length;
+}
+
+// Keeps a button's label to one line: if its <span> wraps, it gets the short label instead.
+// Returns true when it did.
+function fitLabel(btn, short) {
+  const span = btn && btn.querySelector('span');
+  if (!span || lineCount(span) <= 1) return false;
   span.textContent = short;
   return true;
 }
@@ -783,7 +864,7 @@ function heroHTML() {
     <p class="sub">${warmLength()}.<br>Today: <b>${esc(WARMUP.controlTitle())}</b></p>
     ${stepsHTML(trail, false)}
     <button class="btn ${noRange ? 'secondary' : 'primary'} big wide" data-act="open" data-kind="warmup" data-id="warmup">${ICON.play}Start warm-up</button>
-    <button class="safe-line" data-act="care" aria-label="Sing easy and comfy. Stop if anything hurts. Look after your voice">${ICON.heart}<span>Sing easy and comfy. Stop if anything hurts.</span></button>
+    <button class="safe-line" data-act="care" aria-label="Sing easy and comfy. Stop if anything hurts. Look after your voice"><span>${ICON.heart}Sing easy and comfy. Stop if anything hurts.</span></button>
   </section>`;
 }
 
@@ -932,7 +1013,7 @@ function songsHTML() {
         <div><h2>${ICON.lock}Warm up first</h2></div>
         ${hum('sing')}
         <p>Singers warm up before songs, like stretching before sport.</p>
-        <button class="btn primary big" data-act="open" data-kind="warmup" data-id="warmup">${ICON.play}Warm up · about ${WARMUP.minutes} min</button>
+        <button class="btn primary big" data-act="open" data-kind="warmup" data-id="warmup">${ICON.play}Warm up · about&nbsp;${WARMUP.minutes}&nbsp;min</button>
         <button class="care" data-act="care" data-v="rest">Throat sore today? Rest your voice</button>
       </section>`
     : '';
@@ -1689,9 +1770,15 @@ function playerCtrl({ kind, id }) {
         before: celebrate && !settled ? confetti(BURST, [75, 128], width) : '',
       }
     );
-    // A long title ("Next: Twinkle, Twinkle, Little Star") becomes "Next song" rather than three lines.
+    // "Next: Minor mood" on one line if it fits. If not, a small "Next" goes above the title, so the
+    // title isn't split after "Next: Minor". A title that still needs two lines ("Twinkle, Twinkle,
+    // Little Star") becomes "Next song".
     const nextBtn = nx && bd.querySelector('[data-act="next"]');
-    if (nextBtn && fitLabel(nextBtn, `Next ${nx.kind}`, 2)) nextBtn.setAttribute('aria-label', `Next ${nx.kind}: ${nx.title}`);
+    if (nextBtn && lineCount(nextBtn.querySelector('span')) > 1) {
+      nextBtn.setAttribute('aria-label', `Next ${nx.kind}: ${nx.title}`);
+      nextBtn.innerHTML = `<span class="two-line"><small>Next</small><span>${esc(nx.title)}</span></span>`;
+      if (lineCount(nextBtn.querySelector('.two-line > span')) > 1) nextBtn.innerHTML = `<span>Next ${nx.kind}</span>`;
+    }
     requestAnimationFrame(() => drawOverview(bd.querySelector('.replay'), results));
   }
 
@@ -2069,7 +2156,7 @@ function rangeCtrl() {
         <div class="adj"><span>Highest</span><button class="step" data-act="adj" data-k="high" data-d="-1" aria-label="Highest note down">−</button><button class="note-btn" data-act="hear" data-m="${r.high}" aria-label="Hear ${letterName(r.high)}">${letterName(r.high)}</button><button class="step" data-act="adj" data-k="high" data-d="1" aria-label="Highest note up">+</button></div>
       </div>
       <p class="muted small">Tap a note to hear it. Pick notes that feel easy, not your very highest.</p>
-      <button class="btn primary big wide" data-act="r-save">Save my range</button>
+      <div class="sheet-actions one"><button class="btn primary big wide" data-act="r-save">Save my range</button></div>
       <button class="btn text wide" data-act="r-again">Test again</button>`;
     const opts = { label: 'Your range', dismissable: false, cls: 'range-result', key: 'range-result' };
     const acts = {

@@ -184,6 +184,7 @@ export class Lane {
     const t0 = now - (this.playX - this.gutter) / this.pps - 0.2;
     const t1 = now + (W - this.playX) / this.pps + 0.2;
     const barH = Math.max(8, Math.min(rh * 0.76, 28));
+    const labels = []; // drawn after your line, so it never runs through them
     for (const ev of M.events || []) {
       if (ev.t + ev.d < t0 || ev.t > t1) continue;
       const key = M.free ? null : keyOf(ev, M);
@@ -232,20 +233,13 @@ export class Lane {
       // Label on the bar: the syllable for songs, the note name for exercises.
       const text = ev.text != null ? (ev.melisma ? '' : ev.text) : this.noteLabel(ev.m, key);
       if (text && barH >= 13 && x1 - x0 >= 18) {
-        let ink = ev.role === 'listen' ? C['lane-label'] : C.fg;
+        const listen = ev.role === 'listen';
+        let lit = false;
         if (ev.hits && ev.hits.length) {
           const la = ev.t + 6 / this.pps, lb = ev.t + 22 / this.pps;
-          if (ev.hits.some((h) => h.k === 1 && h.a <= lb && h.b >= la)) ink = C['on-' + fam];
+          lit = ev.hits.some((h) => h.k === 1 && h.a <= lb && h.b >= la);
         }
-        g.save();
-        g.beginPath();
-        g.rect(x0 + 5, top, x1 - x0 - 8, barH);
-        g.clip();
-        g.fillStyle = ink;
-        g.font = `800 ${Math.round(Math.min(13, barH * 0.56))}px ${font}`;
-        g.textAlign = 'left';
-        g.fillText(text, x0 + 7, yy + 0.5);
-        g.restore();
+        labels.push({ text, x0, x1, top, yy, listen, lit, fam });
       }
     }
 
@@ -283,6 +277,39 @@ export class Lane {
       g.stroke();
     }
 
+    // Bar labels, over your line. Each has a halo in the colour behind it, so the line can't run
+    // through a note name. While a bar is under the "now" line, its label waits just right of the
+    // dot rather than sitting under it; near the bar's end it goes back to the bar's start, or
+    // hides if that would still be under the dot.
+    const zoneL = this.playX - 14, zoneR = this.playX + 14;
+    const size = Math.round(Math.min(13, barH * 0.56));
+    g.font = `800 ${size}px ${font}`;
+    g.textAlign = 'left';
+    g.lineJoin = 'round';
+    g.lineWidth = 4;
+    for (const lb of labels) {
+      const tw = g.measureText(lb.text).width;
+      let lx = lb.x0 + 7;
+      let lit = lb.lit;
+      if (lb.x0 <= zoneR && lb.x1 >= zoneL) {
+        if (zoneR + tw <= lb.x1 - 3) {
+          lx = Math.max(lx, zoneR);
+          lit = false; // right of the line hasn't been sung yet
+        } else if (lx + tw > zoneL) continue;
+      }
+      const ink = lb.listen ? C['lane-label'] : lit ? C['on-' + lb.fam] : C.fg;
+      const halo = lb.listen ? C['lane-bg'] : lit ? C[lb.fam] : C['bar-idle'];
+      g.save();
+      g.beginPath();
+      g.rect(lb.x0 + 5, lb.top + 1.5, lb.x1 - lb.x0 - 8, barH - 3); // inside the current bar's outline
+      g.clip();
+      g.strokeStyle = halo;
+      g.strokeText(lb.text, lx, lb.yy + 0.5);
+      g.fillStyle = ink;
+      g.fillText(lb.text, lx, lb.yy + 0.5);
+      g.restore();
+    }
+
     if (live && live.m != null && !live.hide) {
       const dm = live.dm != null ? live.dm : live.m;
       const px = this.playX, py = this.y(clampM(dm));
@@ -304,10 +331,18 @@ export class Lane {
       g.lineWidth = 2.5;
       g.stroke();
       // The right note in another octave counts. The dot sits on the bar; a small note says why.
-      g.fillStyle = C.muted;
-      g.font = `700 12px ${font}`;
-      g.textAlign = 'left';
-      if (live.octave) g.fillText(live.octave < 0 ? 'same note, lower' : 'same note, higher', px + 13, py < 26 ? py + 16 : py - 14);
+      // It sits clear of the bar's own label, with a halo so bars behind it don't muddle it.
+      if (live.octave) {
+        const say = live.octave < 0 ? 'same note, lower' : 'same note, higher';
+        const sy = py < 30 ? py + 20 : py - 18;
+        g.font = `700 12px ${font}`;
+        g.textAlign = 'left';
+        g.lineWidth = 4;
+        g.strokeStyle = C['lane-bg'];
+        g.strokeText(say, px + 13, sy);
+        g.fillStyle = C.muted;
+        g.fillText(say, px + 13, sy);
+      }
       if (dm > vhi || dm < vlo) {
         const up = dm > vhi;
         g.fillStyle = C.fg;

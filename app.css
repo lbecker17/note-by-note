@@ -28,7 +28,10 @@
   --done-fg-2: #3F5A35;
   --done-line: #C3DBB0;
   --good-fill: #4E8F55;
+  --on-good-fill: #FFFFFF; /* ticks on --good-fill: 3.90:1 */
   --switch-knob: #FFFFFF;
+  /* Empty tracks, future-day rings and the off switch: 3:1 or more on bg and surface (WCAG 1.4.11) */
+  --track: #9F846C;
   --tab-bg: rgba(255, 250, 242, 0.92);
   --tab-active: #A9482B;
   --tab-inactive: #76604E;
@@ -139,7 +142,9 @@
     --done-fg-2: #BFD9B6;
     --done-line: #3A5240;
     --good-fill: #6FB774;
+    --on-good-fill: #24170F; /* white was 2.41:1; cocoa is 7.22:1 */
     --switch-knob: #2A2019;
+    --track: #8A7360;
     --tab-bg: rgba(42, 32, 25, 0.92);
     --tab-active: #F6B57E;
     --tab-inactive: #BBA28B;
@@ -201,7 +206,7 @@
 
 /* Note by Note: "warm paper" components (final spec §6).
    app.css = tokens.css, then this file. Class names that app.js already uses are kept;
-   new ones are marked NEW. Nothing here hard-codes a colour except #fff on --good-fill ticks. */
+   new ones are marked NEW. Nothing here hard-codes a colour except the white knob on an off switch. */
 
 /* ---------- Fonts (self-hosted, latin subset) ---------- */
 @font-face {
@@ -341,17 +346,20 @@ body[data-screen="player"] .tabbar { display: none; }
 .step.today i { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
 .safe-line { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 12px; font: 700 14px/1.3 var(--font-body); color: var(--hero-fg-2); text-align: center; } /* NEW (graft) */
 .safe-line svg { width: 16px; height: 16px; color: var(--accent); flex: none; }
-/* The safety line opens "Look after your voice" */
+/* The safety line opens "Look after your voice". The heart sits in the text, so when the line
+   wraps (320 px) it stays beside the first word instead of drifting to the edge. */
 button.safe-line { width: 100%; min-height: 44px; margin: 4px 0 -8px; padding: 0; border: 0; background: none; }
-button.safe-line span { text-decoration: underline; text-decoration-color: var(--hero-line); text-underline-offset: 3px; }
+button.safe-line span { text-wrap: balance; text-decoration: underline; text-decoration-color: var(--hero-line); text-underline-offset: 3px; }
+button.safe-line svg { display: inline-block; vertical-align: -3px; margin-right: 6px; }
 .hero.done { background: var(--done-bg); }
 .hero.done .chip { color: var(--good); box-shadow: inset 0 0 0 1px var(--done-line); }
 .hero.done .sub { color: var(--done-fg-2); max-width: 54%; }
 .hero.done .staff { color: var(--done-line); }
 .hero.done .steps::before { border-top-color: var(--done-line); border-top-style: solid; }
 .hero.done .step { color: var(--done-fg-2); }
-.hero.done .step i { background: var(--good-fill); color: #fff; box-shadow: none; }
+.hero.done .step i { background: var(--good-fill); color: var(--on-good-fill); box-shadow: none; }
 .hero-actions { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+.hero-actions .btn { white-space: nowrap; }
 .hero.done .btn.again { background: transparent; color: var(--done-fg-2); box-shadow: inset 0 0 0 1.5px var(--done-line); }
 
 /* Rubber stamp: verdicts and "Done today" NEW */
@@ -362,7 +370,8 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
   transform: rotate(-8deg); mix-blend-mode: multiply; opacity: 0.92;
 }
 @media (prefers-color-scheme: dark) { .stamp { mix-blend-mode: normal; } }
-.hero.done .stamp { position: absolute; right: 16px; top: 121px; color: var(--good); font-size: 13px; padding: 5px 9px 4px; }
+/* Small text, so full strength: 4.76:1 on --done-bg, where 0.92 opacity gave 4.11 */
+.hero.done .stamp { position: absolute; right: 16px; top: 121px; color: var(--good); font-size: 13px; padding: 5px 9px 4px; opacity: 1; }
 
 /* First run: no range yet NEW */
 .voice-start h2 { font: 600 28px/1.1 var(--font-display); letter-spacing: -0.01em; }
@@ -379,7 +388,7 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .week-head p b { font: 600 20px/1 var(--font-display); color: var(--fg); }
 .days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
 .day { display: flex; flex-direction: column; align-items: center; gap: 5px; font: 800 12px/1 var(--font-body); color: var(--muted); }
-.day i { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; border: 2px dashed var(--line-strong); color: #fff; }
+.day i { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; border: 2px dashed var(--track); color: var(--on-good-fill); }
 .day i svg { width: 18px; height: 18px; }
 .day.past i { border: 0; background: var(--surface-2); } /* a day not sung: quiet, never red */
 .day.done i { background: var(--good-fill); border: 0; }
@@ -483,6 +492,13 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .lock-banner h2 svg { width: 22px; height: 22px; color: var(--accent); flex: none; }
 .lock-banner p { color: var(--hero-fg-2); font-size: 15px; font-weight: 600; }
 .lock-banner .btn { grid-column: 1 / -1; margin-top: 8px; }
+/* Too narrow for the title beside Hum (320 px): the title takes the whole first row and Hum
+   moves down beside the sentence, so "Warm up first" stays on one line. */
+@media (max-width: 360px) {
+  .lock-banner > div:first-child { grid-column: 1 / -1; }
+  .lock-banner .hum { grid-row: 2 / 3; width: 88px; height: 88px; margin: -6px -6px 0 0; }
+  .lock-banner .btn { padding: 0 12px; }
+}
 .lock-banner .care {
   grid-column: 1 / -1; display: flex; justify-content: center; align-items: center; min-height: 44px; margin: 2px 0 -8px; border: 0; background: none;
   font: 700 14px/1.2 var(--font-body); color: var(--hero-fg-2); text-decoration: underline; text-decoration-color: var(--hero-line); text-underline-offset: 3px;
@@ -511,14 +527,21 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
   position: fixed; inset: 0; display: flex; flex-direction: column; max-width: 720px; margin: 0 auto;
   background-color: var(--bg); background-image: var(--paper-grain);
   padding: var(--safe-top) env(safe-area-inset-right) var(--safe-bottom) env(safe-area-inset-left);
+  overflow-y: auto; overscroll-behavior: contain;
 }
+/* Only the lane gives up height. Everything else keeps its size, so a long cue can never spill over
+   the header (and its Close button) or under the lane. If the lane is already at its smallest
+   (Safari's toolbars on an iPhone SE), the player scrolls instead of overlapping. */
+.player > * { flex-shrink: 0; }
+.player > .lane-wrap { flex-shrink: 1; }
 .p-head { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 8px; padding: 8px 14px 0; }
 .p-title { text-align: center; min-width: 0; }
 .p-title h2 { font: 800 17px/1.25 var(--font-body); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .p-title p { font-size: 14px; color: var(--muted); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 1.4em; }
 .p-progress { display: grid; grid-template-columns: repeat(var(--n, 6), 1fr); gap: 5px; padding: 12px 22px 0; } /* NEW */
-.p-progress i { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; position: relative; }
-.p-progress i.done { background: var(--good-fill); }
+/* Steps still to come are empty tracks with a 3:1 outline; done steps fill green. */
+.p-progress i { height: 6px; border-radius: 3px; background: transparent; box-shadow: inset 0 0 0 1.5px var(--track); overflow: hidden; position: relative; }
+.p-progress i.done { background: var(--good-fill); box-shadow: none; }
 .p-progress i.now::after { content: ""; position: absolute; inset: 0; width: var(--p, 0%); background: var(--accent); border-radius: 3px; }
 .cue {
   display: flex; align-items: center; justify-content: center; gap: 10px; text-align: center;
@@ -535,10 +558,15 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .lane-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .countin { position: absolute; inset: 0; display: grid; place-items: center; font: 600 96px/1 var(--font-display); color: var(--fg); pointer-events: none; text-shadow: 0 0 24px var(--lane-bg); }
 .between {
-  position: absolute; inset: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; text-align: center;
-  background: color-mix(in srgb, var(--lane-bg) 92%, transparent); border-radius: 16px; padding: 16px;
+  position: absolute; inset: 12px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 8px; text-align: center;
+  background: color-mix(in srgb, var(--lane-bg) 92%, transparent); border-radius: 16px; padding: 16px; overflow-y: auto;
 }
-.between .bico { width: 56px; height: 56px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; box-shadow: inset 0 0 0 2px var(--hero-line); }
+/* Like the move cards: if the card is taller than the lane, it scrolls rather than squashing its
+   picture (auto margins keep it centred when it fits). */
+.between > * { flex: none; }
+.between > :first-child { margin-top: auto; }
+.between > :last-child { margin-bottom: auto; }
+.between .bico { width: 56px; height: 56px; aspect-ratio: 1; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; box-shadow: inset 0 0 0 2px var(--hero-line); }
 .between .bico svg { width: 30px; height: 30px; }
 .between h3 { font: 600 26px/1.15 var(--font-display); letter-spacing: -0.01em; }
 .between p { color: var(--fg-2); max-width: 32ch; font-size: 15px; }
@@ -567,10 +595,9 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .hold { position: absolute; left: 52px; right: 14px; bottom: 12px; height: 8px; border-radius: 4px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--line); overflow: hidden; }
 .hold i { display: block; height: 100%; width: 0; background: var(--good-fill); border-radius: 4px; transition: width 0.1s linear; }
 .range-screen[data-state="ready"] .hold { visibility: hidden; }
-/* Short screens (iPhone SE): the lane gives up height so the cue never overlaps the header. */
+/* Short screens (iPhone SE): the lane gives up height first. */
 @media (max-height: 700px) {
-  .range-screen .cue { flex-shrink: 0; }
-  .range-screen .lane-wrap { min-height: 120px; }
+  .lane-wrap { min-height: 120px; }
 }
 /* Song lyrics */
 .lyrics { text-align: center; font-size: 20px; font-weight: 700; line-height: 1.35; padding: 12px 20px 0; min-height: calc(2 * 1.35em + 12px); color: var(--muted); text-wrap: balance; }
@@ -594,11 +621,12 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .seg button { border: 0; background: transparent; border-radius: 10px; min-height: 44px; font: 800 15px/1.1 var(--font-body); color: var(--fg-2); }
 .seg button.on { background: var(--seg-on); color: var(--fg); box-shadow: 0 1px 3px rgba(58, 39, 27, 0.16); }
 .player:not([data-state="ready"]):not([data-state="done"]) .seg.mode { opacity: 0.45; pointer-events: none; }
-.switch { flex: none; width: 52px; height: 32px; border: 0; border-radius: 16px; background: var(--line-strong); position: relative; transition: background-color 0.15s ease; }
+.switch { flex: none; width: 52px; height: 32px; padding: 0; border: 0; border-radius: 16px; background: var(--track); position: relative; transition: background-color 0.15s ease; }
 .switch i { position: absolute; top: 3px; left: 3px; width: 26px; height: 26px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: transform 0.15s ease; }
 .switch.on { background: var(--good-fill); }
 .switch.on i { transform: translateX(20px); background: var(--switch-knob); }
-/* A 44 px tap target around the 52 × 32 track: a clear border that the track's colour doesn't paint. */
+/* A 44 px tap target around the 52 × 32 track: a clear border that the track's colour doesn't paint.
+   No padding (a button has some by default), so the knob travels the whole track. */
 .switch { box-sizing: content-box; border: 6px solid transparent; background-clip: padding-box; border-radius: 22px; margin: -6px; }
 
 /* ---------- Sheets ---------- */
@@ -607,10 +635,17 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .sheet {
   position: relative; width: 100%; max-width: 560px; max-height: 92vh; max-height: 92dvh; overflow-y: auto; overscroll-behavior: contain;
   background-color: var(--surface); background-image: var(--paper-grain);
-  border-radius: 28px 28px 0 0; padding: 12px max(20px, env(safe-area-inset-right)) calc(16px + var(--safe-bottom)) max(20px, env(safe-area-inset-left));
+  border-radius: 28px 28px 0 0; padding: 12px max(20px, env(safe-area-inset-right)) 0 max(20px, env(safe-area-inset-left));
   display: flex; flex-direction: column; gap: 14px; animation: rise 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
   box-shadow: 0 -10px 30px -20px rgba(58, 39, 27, 0.5);
 }
+/* The space under the last item (16 px with the gap, plus the home indicator). A spacer rather than
+   bottom padding, so every browser measures the sticky buttons below from the same edge. */
+.sheet::after { content: ""; flex: none; height: calc(2px + var(--safe-bottom)); }
+/* Swipe to close: springing back, or sliding away */
+.sheet-wrap.settle { transition: transform 0.2s ease-out; }
+.sheet-wrap.leave { transition: transform 0.2s ease-in; }
+.sheet-backdrop.leaving { opacity: 0; transition: opacity 0.2s ease-in; }
 .grabber { width: 40px; height: 5px; border-radius: 3px; background: var(--line-strong); margin: 0 auto 2px; flex: none; }
 .sheet h2 { font: 600 28px/1.1 var(--font-display); letter-spacing: -0.01em; }
 .sheet p { color: var(--fg-2); }
@@ -627,8 +662,9 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .field b { font-weight: 800; }
 .field p { font-size: 14px; color: var(--muted); margin-top: 2px; }
 .group-h { font: 600 20px/1.2 var(--font-display); margin-top: 10px; } /* NEW: "For grown-ups" */
-.gate { display: grid; grid-template-columns: 1fr 96px auto; gap: 8px; align-items: center; } /* NEW: the sum check */
-.gate label { font-weight: 800; }
+/* NEW: the sum check. The question gets its own row, the answer box and button share the next. */
+.gate { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.gate label { grid-column: 1 / -1; font-weight: 800; }
 .gate input {
   width: 100%; height: 48px; border-radius: 12px; border: 1.5px solid var(--line-strong); background: var(--surface-2); color: var(--fg);
   font: 800 20px/1 var(--font-body); text-align: center;
@@ -663,6 +699,20 @@ button.safe-line span { text-decoration: underline; text-decoration-color: var(-
 .sheet .tip { color: var(--fg); font-size: 16px; }
 .sheet-actions { display: grid; grid-template-columns: 1fr 1.5fr; gap: 10px; }
 .sheet-actions .btn { padding: 0 12px; }
+.sheet-actions.one { grid-template-columns: 1fr; } /* "Save my range" */
+/* On a short screen the main buttons (Try again, Next, Save my range) stay in view: they stick to
+   the bottom of the sheet, above the home indicator, until it's scrolled down to them. While
+   they're stuck (app.js adds .stuck), paper fades in behind them so text scrolling underneath
+   can't show through. */
+.sheet-actions { position: sticky; bottom: calc(10px + var(--safe-bottom)); z-index: 1; }
+.sheet-actions::before {
+  content: ""; position: absolute; z-index: -1; left: -20px; right: -20px; top: -22px; bottom: calc(-24px - var(--safe-bottom));
+  background: linear-gradient(to bottom, transparent, var(--surface) 20px); pointer-events: none; opacity: 0; transition: opacity 0.15s ease;
+}
+.sheet-actions.stuck::before { opacity: 1; }
+/* "Next: Minor mood" too long for one line: "Next" goes small above the title. */
+.btn .two-line { display: flex; flex-direction: column; align-items: center; line-height: 1.1; }
+.btn .two-line small { font: 700 13px/1.2 var(--font-body); }
 .sheet-links { display: flex; flex-direction: column; align-items: center; margin-top: -6px; }
 /* For grown-ups: "Copy results for Claude", small and quiet at the very bottom */
 .grown-ups { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; column-gap: 2px; padding-top: 6px; border-top: 1px dashed var(--line-strong); font: 700 13px/1.2 var(--font-body); color: var(--muted); }
@@ -759,6 +809,9 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
   .hero { padding: 16px 14px; }
   .hero h2 { font-size: 27px; }
   .hero .hum { width: 100px; height: 100px; }
+  /* The chip ("Warm up to unlock songs") reaches Hum here, so Hum drops below it, marks and all. */
+  .hero:not(.done) .hum { top: 34px; }
+  .hero-actions .btn.big { padding: 0 12px; gap: 6px; }
   .step i { width: 34px; height: 34px; }
   .step i svg { width: 21px; height: 21px; }
   .steps::before { top: 17px; }
@@ -784,4 +837,10 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
   .move p { font-size: 15px; }
   .move-ring, .move-ring svg { width: 52px; height: 52px; }
   .move-ring b { font-size: 20px; }
+  .between { gap: 4px; padding: 10px 14px; }
+  .between .bico { width: 44px; height: 44px; }
+  .between .bico svg { width: 24px; height: 24px; }
+  .between h3 { font-size: 22px; }
+  .between p { font-size: 14px; line-height: 1.35; }
+  .between .between-count { font-size: 36px; margin: 0; }
 }
