@@ -23,18 +23,24 @@ const NOTE_OPTS = {
 };
 const MAX_SEG = 1.2; // seconds; longer steady stretches are cut and joined again afterwards
 const MAX_STALL = 0.4; // seconds with no frames at all that still count as one stretch of singing
+const MIN_STALL = 0.08; // seconds with no frames that are more than a few dropped refreshes
+const HOLE_CONSONANT = 0.03; // half a typical consonant before a note, in seconds
 const LEVEL_DIP = 0.35; // a level this far under the singing either side is a break between notes
+const SCOOP_LONG = 0.3; // seconds: a slide shorter than this that lands on a note is a scoop into it
+const SLIDE_MAX = 1.5; // semitones between two pieces that may still be one note on a slide
+const SPOKEN = 0.35; // seconds: a take with no note this long, many of them sliding, is speech
 const LONELY = 0.3; // seconds of silence either side that leave a sound on its own
 const BLIP_SMEAR = 0.02; // seconds a lone short sound looks longer than it was
 
 // frames: [{ t, m, rms? }] in time order, m a MIDI float or null.
 // Returns { notes: [{ t0, t1, m, p, conf }], sungSeconds, glideShare, tuning }.
-// m is the measured centre of each note. p is the note it was aiming for: the whole take
-// is first moved by `tuning` (semitones, the duration-weighted circular mean of how far
-// every note sat from the nearest semitone), so a child who sings everything a little
-// sharp still gets the notes they meant. A note that then sits well between two semitones
-// goes to the one the tune uses (see aimedNotes), so p is within a semitone of m but is not
-// always Math.round(m - tuning).
+// m is the measured centre of each note. p is the note it was aiming for: the take is first
+// moved by the singer's own tuning (see tuneNotes), so a child who sings everything a little
+// sharp still gets the notes they meant. `tuning` (semitones) is that correction at the start
+// of the take; it follows the singer from phrase to phrase, and when it has wandered more than
+// half a semitone p follows the new key, as a listener would. A note that sits well between
+// two semitones goes to the one the tune uses (see aimedNotes), so p is within a semitone of
+// m but is not always Math.round(m - tuning).
 export function findNotes(frames, opts = {}) {
   const o = { ...NOTE_OPTS, ...opts };
   if (!Array.isArray(frames) || !frames.length) return { notes: [], sungSeconds: 0, glideShare: 0, tuning: 0 };
@@ -61,14 +67,11 @@ export function findNotes(frames, opts = {}) {
     found = found.concat(res.notes);
   }
 
-  // Global tuning: where the notes sit between semitones, averaged round the circle.
-  const { mu, R } = circularMean(found.map((n) => n.m), found.map(tuneWeight));
-  // When the notes scatter all round the circle there is no tuning to speak of. A loose
-  // singer still has one, though: with 20 notes scattered by 0.3 semitones (R about 0.2),
-  // the mean is good to about a seventh of a semitone, far better than assuming A440. Two
-  // or three notes that disagree say nothing, so a short take needs them to agree.
-  const tuning = R > (found.length >= 6 ? 0.05 : 0.25) ? mu : 0;
-  const aimed = aimedNotes(found, tuning, R);
+  // Talking, not singing: a run of syllables, none held as long as a sung note usually is at
+  // least once in a tune, and many sliding through their pitch. That is speech, not a tune.
+  if (found.length >= 6 && found.every((n) => n.t1 - n.t0 < SPOKEN) && found.filter((n) => n.slides).length >= 0.25 * found.length) found = [];
+
+  const { aimed, miss, tuning } = tuneNotes(found);
 
   const notes = [];
   for (let i = 0; i < found.length; i++) {
@@ -80,16 +83,17 @@ export function findNotes(frames, opts = {}) {
       const wa = prev.t1 - prev.t0;
       const wb = n.t1 - n.t0;
       prev.m = (prev.m * wa + n.m * wb) / (wa + wb);
+      prev.miss = (prev.miss * wa + miss[i] * wb) / (wa + wb);
       prev.conf = Math.max(prev.conf, n.conf);
       prev.t1 = n.t1;
       continue;
     }
-    notes.push({ t0: n.t0, t1: n.t1, m: n.m, p, conf: n.conf });
+    notes.push({ t0: n.t0, t1: n.t1, m: n.m, p, conf: n.conf, miss: miss[i] });
   }
   for (const n of notes) {
-    // A note far from any semitone (after tuning) is a less certain guess.
-    const off = Math.abs(n.m - tuning - n.p);
-    n.conf = round(n.conf * (1 - 0.6 * off), 2);
+    // A note far from the semitone it was taken for (after tuning) is a less certain guess.
+    n.conf = round(n.conf * (1 - 0.6 * Math.min(1, n.miss)), 2);
+    delete n.miss;
     n.m = round(n.m, 3);
     n.t0 = round(n.t0, 4);
     n.t1 = round(n.t1, 4);
@@ -107,6 +111,134 @@ function tuneWeight(n) {
   return Math.min(n.t1 - n.t0, 2);
 }
 
+// ---------- Tuning ----------
+
+const STEP = 0.05; // resolution of the tuning search, in semitones
+const PHRASE_GAP = 0.5; // seconds of silence after which a singer may come back in a new tuning
+const DRIFT = 0.15; // typical move in tuning from one phrase to the next (semitones, sd)
+const LEAN = 0.6; // largest move between two phrases worth considering
+const NOTE_SD = 0.3; // first guess at how far a note lands from the semitone meant
+
+// The singer's tuning, phrase by phrase, and the note each piece was aiming for.
+// A tuning is how far the singer sits from A440 equal temperament (semitones), and the right
+// one is the one that puts the notes in a key: so every tuning is scored against every major
+// scale (a minor key shares its relative major's notes), each note counting as whichever
+// nearby semitone fits better, a scale note being far likelier than any other. This beats
+// averaging how far each note sits from its nearest semitone (a circular mean): that only
+// works when the notes land within a quarter of a semitone or so, and children's often don't.
+// Singers drift, so after a breath (a silence of PHRASE_GAP or more) the tuning may move, by
+// about DRIFT per phrase, best path through the take found by dynamic programming. The take
+// starts within half a semitone of A440 by definition (that picks which notes are which);
+// when it later wanders past half a semitone, p moves with it, into the key the singer is
+// now in. Returns, per piece, the note p, how far it sat from that note after tuning (miss),
+// and the tuning at the start of the take.
+function tuneNotes(found) {
+  const N = found.length;
+  const w = found.map(tuneWeight);
+  if (N < 3) {
+    // Too few notes to know a key: just the notes' own agreement (two that disagree say nothing).
+    const { mu, R } = circularMean(found.map((n) => n.m), w);
+    const tuning = R > 0.25 ? mu : 0;
+    const aimed = found.map((n) => Math.round(n.m - tuning));
+    return { aimed, miss: found.map((n, i) => Math.abs(n.m - tuning - aimed[i])), tuning };
+  }
+  // Phrases: a new one after a long enough silence.
+  const phrase = new Int32Array(N);
+  for (let i = 1; i < N; i++) phrase[i] = phrase[i - 1] + (found[i].t0 - found[i - 1].t1 >= PHRASE_GAP ? 1 : 0);
+  let fit = fitTuning(found, w, phrase, NOTE_SD);
+  // Then once more with this singer's own spread of notes around the semitones.
+  fit = fitTuning(found, w, phrase, spreadOf(found, w, fit.off));
+  const { off } = fit;
+  const y = found.map((n, i) => ({ m: n.m - off[i], t0: n.t0, t1: n.t1 }));
+  const q = aimedNotes(y, spreadOf(found, w, off));
+  const aimed = found.map((n, i) => {
+    // In the key the singer has drifted to, and never more than a semitone from what was sung.
+    const p = q[i] + Math.round(off[i] - off[0]);
+    return Math.min(Math.floor(n.m + 1), Math.max(Math.ceil(n.m - 1), p));
+  });
+  return { aimed, miss: y.map((v, i) => Math.abs(v.m - q[i])), tuning: off[0] };
+}
+
+// How far notes sit from their nearest semitone after tuning, as the width (sd) of a bell
+// curve wrapped round the semitone with the same spread: about 0.2 for a steady adult.
+function spreadOf(found, w, off) {
+  const { R } = circularMean(found.map((n, i) => n.m - off[i]), w);
+  return Math.min(0.45, Math.max(0.15, Math.sqrt(-Math.log(Math.max(1e-6, R)) / (2 * Math.PI * Math.PI))));
+}
+
+// Best tuning per phrase (see tuneNotes) for notes spread by `sig` around what they meant.
+// Returns the tuning of each note (its phrase's).
+function fitTuning(found, w, phrase, sig) {
+  const N = found.length;
+  const K = phrase[N - 1] + 1;
+  // How likely a note at x is, as a function of x on a 0.01-semitone grid round the octave,
+  // for the scale with tonic 0: near a scale note (0.9 shared out among the seven) or near
+  // one of the other five (0.1 between them). Other scales are the same curve moved round.
+  const RES = 100;
+  const like = new Float64Array(12 * RES);
+  for (let k = 0; k < like.length; k++) {
+    const x = k / RES;
+    let s = 0;
+    for (let q = Math.floor(x) - 1; q <= Math.floor(x) + 2; q++) {
+      const prior = MAJOR.includes(pc(q)) ? 0.9 / 7 : 0.1 / 5;
+      s += prior * Math.exp(-((x - q) ** 2) / (2 * sig * sig));
+    }
+    like[k] = Math.log(s);
+  }
+  // A scale's tonic plus the tuning is all that matters to the fit, so the search runs over
+  // that sum, u, round the octave in STEPs: each phrase's fit at every u, then the best path
+  // through the phrases, where u moves only as the tuning does (the tonic stays put).
+  const U = Math.round(12 / STEP);
+  const per = Math.round(STEP * RES);
+  const at = new Float64Array(K * U);
+  const L = like.length;
+  for (let i = 0; i < N; i++) {
+    const row = phrase[i] * U;
+    let k = ((Math.round(found[i].m * RES) % L) + L) % L;
+    for (let u = 0; u < U; u++) {
+      at[row + u] += w[i] * like[k];
+      k -= per;
+      if (k < 0) k += L;
+    }
+  }
+  const reach = Math.round(LEAN / STEP);
+  const cost = new Float64Array(reach + 1).map((_, d) => (d * STEP) ** 2 / (2 * DRIFT * DRIFT));
+  let F = at.slice(0, U);
+  const back = [];
+  for (let k = 1; k < K; k++) {
+    const G = new Float64Array(U);
+    const moves = new Int8Array(U);
+    for (let u = 0; u < U; u++) {
+      let best = -Infinity;
+      let arg = 0;
+      for (let d = -reach; d <= reach; d++) {
+        const from = u - d;
+        const v = F[from < 0 ? from + U : from >= U ? from - U : from] - cost[d < 0 ? -d : d];
+        if (v > best) {
+          best = v;
+          arg = d;
+        }
+      }
+      G[u] = best + at[k * U + u];
+      moves[u] = arg;
+    }
+    back.push(moves);
+    F = G;
+  }
+  let u = 0;
+  for (let v = 1; v < U; v++) if (F[v] > F[u]) u = v;
+  // Walk back to the first phrase, adding up how far the tuning moved on the way.
+  const moved = new Float64Array(K);
+  for (let k = K - 1; k > 0; k--) {
+    const d = back[k - 1][u];
+    moved[k - 1] = moved[k] - d * STEP;
+    u = (u - d + U) % U;
+  }
+  // The first phrase's u is its tonic plus a tuning within half a semitone of A440.
+  const start = u * STEP - Math.round(u * STEP);
+  return { off: Array.from(phrase, (k) => start + moved[k] - moved[0]) };
+}
+
 // Where values sit between semitones, averaged round the circle: mu in (-0.5, 0.5] and how
 // tightly they gather there, R in 0..1 (1 when every value is the same distance off).
 function circularMean(xs, ws) {
@@ -122,27 +254,25 @@ function circularMean(xs, ws) {
   return wsum > 0 ? { mu: Math.atan2(s, c) / (2 * Math.PI), R: Math.hypot(c, s) / wsum } : { mu: 0, R: 0 };
 }
 
-// The note each piece was aiming for. Rounding after the tuning shift is right for a steady
-// singer, but children (and tired adults) land a third or more of a semitone off quite
-// often, and then plain rounding picks a note the tune never uses. So each note weighs how
-// close it is to each semitone (a bell curve as wide as this singer's own scatter round the
-// tuning) against how much the take uses that pitch class: its own sung pitch classes, plus
-// the scale its pitches fit. An accurate singer's chromatic note stays put (it is close to
-// its semitone); a wobbly note between two semitones goes to the one in the tune.
-// p never moves more than a semitone from the measured centre.
+// The note each piece was aiming for, from pitches already moved by the singer's tuning
+// (found[i].m). Rounding is right for a steady singer, but children (and tired adults) land
+// a third or more of a semitone off quite often, and then plain rounding picks a note the
+// tune never uses. So each note weighs how close it is to each semitone (a bell curve `sig`
+// wide, this singer's own scatter) against how much the take uses that pitch class: its own
+// sung pitch classes, plus the scale its pitches fit. An accurate singer's chromatic note
+// stays put (it is close to its semitone); a wobbly note between two semitones goes to the
+// one in the tune. The answer is never more than a semitone from the pitch.
 const MAJOR = [0, 2, 4, 5, 7, 9, 11];
 const SCALE_CLOSE = 1; // scales whose fit is within this (log-likelihood, seconds) of the best still count
-function aimedNotes(found, tuning, R) {
-  const p = found.map((n) => Math.round(n.m - tuning));
-  if (found.length < 3) return p;
-  // A wrapped bell curve with this R has this width: about 0.2 semitones for a steady adult.
-  const sig = Math.min(0.45, Math.max(0.15, Math.sqrt(-Math.log(Math.max(1e-6, R)) / (2 * Math.PI * Math.PI))));
+const TAIL = 0.6; // width (sd, semitones) of the occasional note that lands well off: anywhere within a semitone or so
+function aimedNotes(found, sig) {
+  const p = found.map((n) => Math.round(n.m));
   const near = (x, q) => Math.exp(-((x - q) ** 2) / (2 * sig * sig));
   // How much each pitch class is sung, sharing a note between its two nearest semitones by
   // how close it is to each. Each note is judged on the others' votes, never its own.
   const used = new Array(12).fill(0);
   const own = found.map((n) => {
-    const x = n.m - tuning;
+    const x = n.m;
     const f = Math.floor(x);
     const a = near(x, f);
     const b = near(x, f + 1);
@@ -163,7 +293,7 @@ function aimedNotes(found, tuning, R) {
     const inKey = (q) => (MAJOR.includes(pc(q - tonic)) ? 0.9 / 7 : 0.1 / 5);
     found.forEach((n, i) => {
       const o = own[i];
-      const x = n.m - tuning;
+      const x = n.m;
       fit[tonic] += o.w * Math.log(near(x, o.f) * inKey(o.f) + near(x, o.f + 1) * inKey(o.f + 1) + 1e-12);
     });
   }
@@ -172,10 +302,24 @@ function aimedNotes(found, tuning, R) {
   for (let tonic = 0; tonic < 12; tonic++) if (fit[tonic] >= top - SCALE_CLOSE) likely.push(tonic);
   const inScale = new Array(12).fill(0);
   for (const tonic of likely) for (const step of MAJOR) inScale[pc(tonic + step)] += 1 / likely.length;
+  // How far notes land from what they meant: mostly a bell curve as wide as this singer's
+  // scatter, but now and then a note lands much further off (a scoop that lingers, a slide, a
+  // tired note), more often for some singers than others. How often is the share of the
+  // take's other notes that sit more than 0.3 from any semitone: an exact singer's odd note
+  // out is a chromatic note they meant; a loose singer's is as likely a miss.
+  let far = 0;
+  let all = 0;
+  const wide = found.map((n) => Math.abs(n.m - Math.round(n.m)) > 0.3);
   found.forEach((n, i) => {
-    const x = n.m - tuning;
+    all += own[i].w;
+    if (wide[i]) far += own[i].w;
+  });
+  const miss = (d, eps) => Math.log((1 - eps) * Math.exp(-(d * d) / (2 * sig * sig)) / sig + eps * Math.exp(-(d * d) / (2 * TAIL * TAIL)) / TAIL);
+  found.forEach((n, i) => {
+    const x = n.m;
     const o = own[i];
     const rest = Math.max(1e-9, total - o.w);
+    const eps = Math.min(0.4, Math.max(0.01, (far - (wide[i] ? o.w : 0)) / Math.max(1e-9, all - o.w)));
     const prior = (q) => {
       const c = pc(q);
       const mine = c === pc(o.f) ? o.a : c === pc(o.f + 1) ? o.b : 0;
@@ -184,7 +328,7 @@ function aimedNotes(found, tuning, R) {
     let best = p[i];
     let bestS = -Infinity;
     for (let q = Math.ceil(n.m - 1); q <= Math.floor(n.m + 1); q++) {
-      const s = -((x - q) ** 2) / (2 * sig * sig) + Math.log(prior(q));
+      const s = miss(x - q, eps) + Math.log(prior(q));
       if (s > bestS) {
         bestS = s;
         best = q;
@@ -514,12 +658,13 @@ function segStats(run, a, b) {
     if (x[i] < lo) lo = x[i];
   }
   const mu = sx / sw;
+  const tc = st / sw;
   const den = sw * stt - st * st;
   const beta = den > 1e-12 ? (sw * stx - st * sx) / den : 0;
   const t1 = t[b - 1] + w[b - 1];
   const dur = t1 - t0;
   const rise = beta * dur;
-  return { a, b, t0, t1, dur, mu, lo, beta, rise, sloped: Math.abs(rise) >= 0.6 && Math.abs(beta) >= 1.5, glide: false };
+  return { a, b, t0, t1, dur, mu, tc, lo, beta, rise, sloped: Math.abs(rise) >= 0.6 && Math.abs(beta) >= 1.5, glide: false };
 }
 
 // Consecutive pieces of one glide: same direction, about the same speed, and each starts
@@ -638,25 +783,74 @@ function runNotes(run, segs, o) {
   }
 
   // 3. Split repeated notes at clear dips, then measure each note.
-  const notes = [];
+  const parts = [];
   for (const it of items) {
     if (it.glide) continue;
-    for (const nt of it.notes) {
-      for (const part of splitDips(run, nt, o, core)) {
-        const n = measure(run, part, core);
-        // A lone sound in silence shows up longer than it was: the detector's window catches it
-        // a little before it starts and holds on after it stops. A blip (a cough, a knock, an
-        // "uh") is a lone sound; a short note in a tune has neighbours.
-        const alone = run.lonely && part.a === 0 && part.b === run.x.length;
-        if (!n || n.t1 - n.t0 < o.minNote + (alone ? BLIP_SMEAR : 0)) continue;
-        // A note heard first just after the browser stalled began somewhere in the stall: its
-        // middle is the best guess (unless the start has been trimmed away since).
-        if (part.a === 0 && run.lead > 0 && run.t[0] === run.first) n.t0 -= run.lead;
-        notes.push(n);
-      }
+    for (const nt of it.notes) parts.push(...splitDips(run, nt, o, core));
+  }
+  // Two neighbours may yet turn out to be the same note (a child's repeated note often lands
+  // a little higher or lower the second time). A dip in level where they meet says the note
+  // was sung again, so they must not be joined back into one.
+  for (let i = 1; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part.split && parts[i - 1].b === part.a) part.split = levelBreak(run, parts[i - 1].a, part.a, part.b);
+  }
+  const notes = [];
+  for (const part of parts) {
+    const n = measure(run, part, core);
+    // A lone sound in silence shows up longer than it was: the detector's window catches it
+    // a little before it starts and holds on after it stops. A blip (a cough, a knock, an
+    // "uh") is a lone sound; a short note in a tune has neighbours.
+    const alone = run.lonely && part.a === 0 && part.b === run.x.length;
+    if (!n || n.t1 - n.t0 < o.minNote + (alone ? BLIP_SMEAR : 0)) continue;
+    // A note heard first just after the browser stalled began somewhere in the stall: its
+    // middle is the best guess (unless the start has been trimmed away since).
+    if (part.a === 0 && run.lead > 0 && run.t[0] === run.first) n.t0 -= run.lead;
+    else if (part.a > 0 && changedInHole(run, part.a)) {
+      // The same inside a run, when the tune moved on to a new note during the stall: a
+      // little after the middle, as a new note usually follows a short consonant.
+      const prev = notes[notes.length - 1];
+      n.t0 = Math.max(Math.min(n.t0, (run.t[part.a - 1] + run.t[part.a]) / 2 + HOLE_CONSONANT), prev ? prev.t1 : -Infinity);
     }
+    // A sung note holds its pitch (give or take a scoop or vibrato); a spoken syllable slides
+    // steadily through it, start to end.
+    n.slides = slides(run, part.a, part.b);
+    notes.push(n);
   }
   return { notes, glide };
+}
+
+// Whether a note starting at frame k > 0 began in a hole just before it: a stretch with no
+// frames at all, not even unvoiced ones, so nobody heard what happened there. Not when the
+// first frame after the hole is still at the old note's pitch (the change came after), or
+// when the sound there is still swelling up (under half the level it reaches within 80 ms:
+// the note had only just begun).
+function changedInHole(run, k) {
+  const { t, x, r, g } = run;
+  if (!(g[k] === Infinity && t[k] - t[k - 1] > MIN_STALL)) return false;
+  let top = 0;
+  for (let j = k + 1; j < t.length && t[j] - t[k] <= 0.08; j++) top = Math.max(top, r[j]);
+  if (r[k] >= 0 && r[k] < 0.5 * top) return false;
+  // The new note's level: its frames over the next 0.1 s.
+  const ahead = [];
+  for (let j = k; j < t.length && t[j] - t[k] <= 0.1; j++) ahead.push(x[j]);
+  return Math.abs(x[k] - quantile(ahead, 0.5)) < Math.abs(x[k] - x[k - 1]);
+}
+
+// Whether frames [a, b) slide steadily through half a semitone or more: a straight line
+// through them explains most of how they move (vibrato and a scoop into a held pitch don't).
+function slides(run, a, b) {
+  const { t, x, w } = run;
+  const st = segStats(run, a, b);
+  if (!(Math.abs(st.rise) >= 0.5)) return false;
+  let total = 0;
+  let left = 0;
+  for (let i = a; i < b; i++) {
+    const line = st.mu + st.beta * (t[i] - t[a] - st.tc);
+    total += w[i] * (x[i] - st.mu) ** 2;
+    left += w[i] * (x[i] - line) ** 2;
+  }
+  return left <= 0.3 * total;
 }
 
 // How far from its centre a note's own frames stray: a little for a steady voice, more with vibrato.
@@ -722,6 +916,18 @@ function islandNotes(run, list, o, core) {
     if (!n || !c.core || c.dur >= 0.15 || n.dur < c.dur || Math.abs(c.mu - n.mu) < o.mergeTol || Math.abs(c.mu - n.mu) > 3) continue;
     if (c.sloped || spread(c, 0) >= 0.6 || (c.dur < 0.12 && n.mu - c.mu <= 2.5)) c.core = false;
   }
+  // A longer slide (up to SCOOP_LONG) that heads straight for the next steady note and lands
+  // on it is a slow scoop into that note; one that sets off from the note before and leaves
+  // it is a fall at its end.
+  for (let i = 0; i < cores.length; i++) {
+    const c = cores[i];
+    if (!c.core || !c.sloped || c.dur >= SCOOP_LONG) continue;
+    const lands = (n, end) => n && n.dur >= c.dur && Math.abs(c.mu - n.mu) >= o.mergeTol && Math.abs(c.mu - n.mu) <= 3 && Math.abs(end - n.mu) <= 0.35;
+    const n = cores[i + 1];
+    const p = cores[i - 1];
+    if (lands(n, c.mu + c.rise / 2) && Math.sign(c.rise) === Math.sign(n.mu - c.mu)) c.core = false;
+    else if (lands(p, c.mu - c.rise / 2) && Math.sign(c.rise) === Math.sign(c.mu - p.mu)) c.core = false;
+  }
 
   if (!list.some((s) => s.core)) {
     // Nothing steady: a short plain note (staccato) is still a note, anything else is a wobble.
@@ -745,7 +951,9 @@ function islandNotes(run, list, o, core) {
     for (let k = s.a; k < s.b; k++) core[k] = 1;
     const g = groups[groups.length - 1];
     const dip = prev && dipBetween(run, list, prev, s);
-    if (g && !dip && Math.abs(s.mu - prev.mu) < o.mergeTol && Math.abs(s.mu - g.mu) < 1) {
+    const near = g && Math.abs(s.mu - prev.mu) < o.mergeTol && Math.abs(s.mu - g.mu) < 1;
+    const slide = g && !near && Math.abs(s.mu - prev.mu) < SLIDE_MAX && sliding(run, g.first.a, prev.b, s.a, s.b) && !levelBreak(run, g.first.a, (prev.b + s.a) >> 1, s.b);
+    if (g && !dip && (near || slide)) {
       g.last = s;
       g.w += s.dur;
       g.mu += ((s.mu - g.mu) * s.dur) / g.w;
@@ -777,6 +985,71 @@ function islandNotes(run, list, o, core) {
     notes[i].a = k;
   }
   return { notes, junk: 0 };
+}
+
+// One note sung on a slide (talk-singing, or a long note that sags or creeps up), rather than
+// a step from one note to the next: a straight line through frames [a, b) fits them at least
+// as well as two steady levels do, the first ending somewhere in [m0, m1].
+function sliding(run, a, m0, m1, b) {
+  const { t, x, w } = run;
+  let sw = 0;
+  let st = 0;
+  let sx = 0;
+  let stt = 0;
+  let stx = 0;
+  let sxx = 0;
+  for (let i = a; i < b; i++) {
+    const u = t[i] - t[a];
+    sw += w[i];
+    st += w[i] * u;
+    sx += w[i] * x[i];
+    stt += w[i] * u * u;
+    stx += w[i] * u * x[i];
+    sxx += w[i] * x[i] * x[i];
+  }
+  const vt = stt - (st * st) / sw;
+  const cov = stx - (st * sx) / sw;
+  const line = sxx - (sx * sx) / sw - (vt > 1e-12 ? (cov * cov) / vt : 0);
+  // Two levels, split at the best point: running sums from the left.
+  let lw = 0;
+  let lx = 0;
+  let lxx = 0;
+  let two = Infinity;
+  for (let i = a; i < m1; i++) {
+    lw += w[i];
+    lx += w[i] * x[i];
+    lxx += w[i] * x[i] * x[i];
+    if (i + 1 < m0) continue;
+    const rw = sw - lw;
+    const rx = sx - lx;
+    two = Math.min(two, lxx - (lx * lx) / lw + (sxx - lxx) - (rx * rx) / rw);
+  }
+  return line <= two;
+}
+
+// A clear drop in level within 60 ms of frame k, where the notes [lo, k) and [k, hi) meet:
+// under half the loudest singing on both sides of it (within a quarter of a second, and
+// within the two notes). Within one held note the level hardly ever falls that far; a
+// consonant or a fresh start does. The fade at the end of a note doesn't count: the level
+// has to come back up in the second note. Needs rms.
+function levelBreak(run, lo, k, hi) {
+  const { t, r, g } = run;
+  let j0 = -1;
+  let low = Infinity;
+  for (let j = lo; j < hi; j++) {
+    if (!(r[j] >= 0)) return false;
+    const v = Math.min(r[j], g[j]);
+    if (Math.abs(t[j] - t[k]) <= 0.06 && v < low) {
+      low = v;
+      j0 = j;
+    }
+  }
+  if (j0 < 0) return false;
+  let L = 0;
+  let R = 0;
+  for (let j = j0 - 1; j >= lo && t[j0] - t[j] <= 0.26; j--) L = Math.max(L, r[j]);
+  for (let j = j0 + 1; j < hi && t[j] - t[j0] <= 0.26; j++) R = Math.max(R, r[j]);
+  return low < 0.5 * Math.min(L, R);
 }
 
 // Where one note hands over to the next. The line is first smoothed over up to a fifth of a

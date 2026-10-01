@@ -16,7 +16,8 @@ function random(seed) {
 }
 
 // parts: { p, d, gap?, vib?: [semitones, Hz], scoop?: [semitones below, seconds],
-//          dev?: semitones off, oct?: [from, length] seconds an octave up, rmsDip?: [at, length],
+//          dev?: semitones off, slide?: semitones the note sags through (talk-singing),
+//          oct?: [from, length] seconds an octave up, rmsDip?: [at, length],
 //          lost?: [at, length] seconds the detector loses the pitch while the voice carries on,
 //          echo?: seconds the detector still names the pitch after the note, at a whisper }
 //        { rest: seconds } | { glide: [from, to], d } | { siren: [low, high], d }
@@ -49,6 +50,7 @@ function sing(parts, { rate = 120, jitter = 0.04, seed = 1, sharp = 0, lead = 0.
           let m = n.p + (n.dev || 0);
           if (n.vib) m += n.vib[0] * Math.sin(2 * Math.PI * n.vib[1] * u + phase);
           if (n.scoop && u < n.scoop[1]) m -= n.scoop[0] * (1 - u / n.scoop[1]);
+          if (n.slide) m += n.slide * (0.5 - u / n.d);
           if (n.oct && u >= n.oct[0] && u < n.oct[0] + n.oct[1]) m += 12;
           return m;
         },
@@ -342,6 +344,101 @@ test('findNotes: a wobbly note between two semitones goes to the one the tune us
   const chrom = [64, 65, 67, 64, 63, 64, 62, 60, 64, 65, 67, 72, 67, 64, 62, 60];
   const exact = findNotes(sing(chrom.map((p, i) => ({ p, d: 0.4, dev: i === 4 ? 0.3 : 0 }))).frames);
   assert.deepEqual(ps(exact), chrom);
+});
+
+test('findNotes: a loose child is read in the key the notes fit', () => {
+  // Sung about a third of a semitone sharp, each note scattered by about a third more, so
+  // many notes sit nearer the semitone above. Averaging how far notes sit from their nearest
+  // semitone can't tell which way such a singer leans; the key the notes make together can.
+  const tune = [67, 64, 64, 65, 62, 62, 60, 62, 64, 65, 67, 67, 67, 67, 64, 64, 65, 62, 62, 60, 64, 67, 67, 60];
+  let right = 0;
+  for (let seed = 1; seed <= 10; seed++) {
+    const rnd = random(seed);
+    const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+    const parts = tune.map((p) => ({ p, d: 0.35, gap: 0.1, dev: Math.max(-0.45, Math.min(0.45, 0.3 * gauss())) }));
+    const res = findNotes(sing(parts, { sharp: 0.35, seed }).frames);
+    assert.equal(res.notes.length, tune.length);
+    assert.ok(res.notes.every((n) => Math.abs(n.p - n.m) <= 1));
+    // So far off, the whole take might fairly be heard a semitone up: the tune is what counts.
+    right += Math.max(...[-1, 0, 1].map((k) => ps(res).filter((p, i) => p + k === tune[i]).length));
+  }
+  assert.ok(right >= 0.97 * 10 * tune.length, `${right} of ${10 * tune.length}`);
+});
+
+test('findNotes: a singer who drifts between phrases is followed, phrase by phrase', () => {
+  // Four phrases, each after a breath, each sung a little higher than the last. Every phrase
+  // is read in the tuning it was sung in; once the singer has drifted more than half a
+  // semitone from where they began, the notes follow them into the new key.
+  const phrase = [60, 62, 64, 65, 67, 65, 64, 62, 60];
+  const parts = [];
+  [0, 0.3, 0.6, 0.9].forEach((drift, k) => {
+    phrase.forEach((p, i) => parts.push({ p, d: 0.3, gap: i === phrase.length - 1 ? 0.8 : 0.05, dev: drift }));
+  });
+  const res = findNotes(sing(parts).frames);
+  const want = [0, 0, 1, 1].flatMap((shift) => phrase.map((p) => p + shift));
+  assert.deepEqual(ps(res), want);
+  assert.ok(Math.abs(res.tuning) < 0.15, `starts in tune: ${res.tuning}`);
+  // Without breaths there is nowhere for the tuning to move: one tuning for the whole take.
+  const joined = findNotes(sing(phrase.concat(phrase).map((p, i) => ({ p, d: 0.3, gap: 0.05, dev: i < 9 ? 0 : 0.3 }))).frames);
+  assert.deepEqual(ps(joined), phrase.concat(phrase));
+});
+
+test('findNotes: a note sung on a slide is one note', () => {
+  // Talk-singing: the voice sags through two semitones over a long note, with no steady
+  // part, between two steady notes. It is still one note, its pitch the middle.
+  const { frames, truth } = sing([{ p: 60, d: 0.5, gap: 0.08 }, { p: 64, d: 1.5, slide: 2, gap: 0.08 }, { p: 67, d: 0.5 }]);
+  const res = findNotes(frames);
+  matches(res, truth, 0.05);
+  assert.ok(Math.abs(res.notes[1].m - 64) < 0.25, `centre ${res.notes[1].m}`);
+  // A real step to the next note is not a slide.
+  const step = sing([{ p: 64, d: 0.6 }, { p: 65, d: 0.6 }, { p: 64, d: 0.6 }]);
+  matches(findNotes(step.frames), step.truth, 0.05);
+});
+
+test('findNotes: a slow scoop that lands on a note is part of it', () => {
+  // A child's scoop up a whole semitone that takes a quarter of a second to arrive.
+  const { frames, truth } = sing([{ p: 60, d: 0.5, gap: 0.15 }, { p: 64, d: 0.7, scoop: [1, 0.25], gap: 0.15 }, { p: 62, d: 0.5 }]);
+  matches(findNotes(frames), truth, 0.03);
+});
+
+test('findNotes: a repeated note sung again a little off is still two notes', () => {
+  // The second A comes back higher than the first, enough that the two look like different
+  // levels; both are A, and the dip in level between them says the note was sung again.
+  const tune = [{ p: 64, d: 0.4 }, { p: 66, d: 0.4 }, { p: 68, d: 0.4 }, { p: 69, d: 0.45, dev: -0.3 }, { p: 69, d: 0.45, dev: 0.3, rmsDip: [0, 0.05] }, { p: 68, d: 0.4 }, { p: 66, d: 0.4 }, { p: 64, d: 0.6 }];
+  const { frames } = sing(tune, { rms: true });
+  assert.deepEqual(ps(findNotes(frames)), tune.map((n) => n.p));
+});
+
+test('findNotes: a note change hidden in a stall starts in the stall', () => {
+  // Legato, so nothing marks the change but the pitch, and the browser missed the moment.
+  const parts = [{ p: 62, d: 0.6 }, { p: 65, d: 0.6 }];
+  const onset = 0.3 + 0.6;
+  const res = findNotes(sing(parts, { stalls: [[onset - 0.15, onset + 0.15]] }).frames);
+  assert.deepEqual(ps(res), [62, 65]);
+  assert.ok(Math.abs(res.notes[1].t0 - onset) < 0.06, `starts at ${res.notes[1].t0}, sung at ${onset}`);
+  // But a note that is only just swelling up after the stall began right there.
+  const late = sing([{ p: 62, d: 0.6, gap: 0.25 }, { p: 65, d: 0.6 }], { rms: true, stalls: [[0.75, 1.15]] });
+  for (const f of late.frames) if (f.m != null && f.t >= 1.15 && f.t < 1.19) f.rms = 0.01;
+  assert.ok(findNotes(late.frames).notes[1].t0 > 1.1);
+});
+
+test('findNotes: talking is not a tune', () => {
+  // Syllables of speech between consonants: short, each sliding through its own pitch, and
+  // nothing ever held.
+  const rnd = random(8);
+  const parts = [];
+  for (let k = 0; k < 14; k++) {
+    const start = 57 + 5 * rnd();
+    const slide = (rnd() < 0.5 ? -1 : 1) * (0.7 + rnd());
+    parts.push({ glide: [start, start + slide], d: 0.12 + 0.1 * rnd() });
+    parts.push({ rest: k % 5 === 4 ? 0.4 : 0.07 + 0.05 * rnd() }); // consonants, and a breath
+  }
+  const res = findNotes(sing(parts).frames);
+  assert.equal(res.notes.length, 0);
+  assert.ok(res.sungSeconds > 1);
+  // The same quick rhythm sung on steady notes is a tune.
+  const sung = sing([60, 62, 64, 62, 60, 64, 65, 67].map((p) => ({ p, d: 0.18, gap: 0.06 })));
+  assert.deepEqual(ps(findNotes(sung.frames)), sung.truth.map((n) => n.p));
 });
 
 test('findNotes: uneven frame times and noisy pitch', () => {
