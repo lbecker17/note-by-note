@@ -19,15 +19,20 @@ const NOTE_OPTS = {
   mergeTol: 0.5, // neighbouring pieces closer than half a semitone are one note
   glideMin: 2, // a slide has to cover two semitones to be a glide rather than a wobble
   scoopMax: 0.35, // a shorter slide into or out of a note is part of that note
+  fade: 0.2, // at the ends of a voiced stretch, frames under this share of its level are an echo
 };
 const MAX_SEG = 1.2; // seconds; longer steady stretches are cut and joined again afterwards
+const MAX_STALL = 0.4; // seconds with no frames at all that still count as one stretch of singing
+const LEVEL_DIP = 0.35; // a level this far under the singing either side is a break between notes
 
 // frames: [{ t, m, rms? }] in time order, m a MIDI float or null.
 // Returns { notes: [{ t0, t1, m, p, conf }], sungSeconds, glideShare, tuning }.
 // m is the measured centre of each note. p is the note it was aiming for: the whole take
 // is first moved by `tuning` (semitones, the duration-weighted circular mean of how far
 // every note sat from the nearest semitone), so a child who sings everything a little
-// sharp still gets the notes they meant.
+// sharp still gets the notes they meant. A note that then sits well between two semitones
+// goes to the one the tune uses (see aimedNotes), so p is within a semitone of m but is not
+// always Math.round(m - tuning).
 export function findNotes(frames, opts = {}) {
   const o = { ...NOTE_OPTS, ...opts };
   if (!Array.isArray(frames) || !frames.length) return { notes: [], sungSeconds: 0, glideShare: 0, tuning: 0 };
@@ -36,6 +41,7 @@ export function findNotes(frames, opts = {}) {
   let glide = 0;
   let found = [];
   for (const run of runs) {
+    trimFade(run, dt, o.fade);
     if (run.jumpy) clean(run, dt);
     if (!run.x.length) continue;
     const segs = segmentRun(run, o.penalty, dt);
@@ -45,22 +51,18 @@ export function findNotes(frames, opts = {}) {
   }
 
   // Global tuning: where the notes sit between semitones, averaged round the circle.
-  let c = 0;
-  let s = 0;
-  let wsum = 0;
-  for (const n of found) {
-    const w = Math.min(n.t1 - n.t0, 2);
-    const a = 2 * Math.PI * (n.m - Math.round(n.m));
-    c += w * Math.cos(a);
-    s += w * Math.sin(a);
-    wsum += w;
-  }
-  // When the notes scatter all round the circle there is no tuning to speak of.
-  const tuning = wsum > 0 && Math.hypot(c, s) / wsum > 0.25 ? Math.atan2(s, c) / (2 * Math.PI) : 0;
+  const { mu, R } = circularMean(found.map((n) => n.m), found.map(tuneWeight));
+  // When the notes scatter all round the circle there is no tuning to speak of. A loose
+  // singer still has one, though: with 20 notes scattered by 0.3 semitones (R about 0.2),
+  // the mean is good to about a seventh of a semitone, far better than assuming A440. Two
+  // or three notes that disagree say nothing, so a short take needs them to agree.
+  const tuning = R > (found.length >= 6 ? 0.05 : 0.25) ? mu : 0;
+  const aimed = aimedNotes(found, tuning, R);
 
   const notes = [];
-  for (const n of found) {
-    const p = Math.round(n.m - tuning);
+  for (let i = 0; i < found.length; i++) {
+    const n = found[i];
+    const p = aimed[i];
     const prev = notes[notes.length - 1];
     // Two touching pieces that land on the same note are one note, unless a dip split them.
     if (prev && prev.p === p && !n.split && n.t0 - prev.t1 < 1e-6) {
@@ -89,6 +91,88 @@ export function findNotes(frames, opts = {}) {
   };
 }
 
+// Long notes say more about the tuning than short ones, up to a point.
+function tuneWeight(n) {
+  return Math.min(n.t1 - n.t0, 2);
+}
+
+// Where values sit between semitones, averaged round the circle: mu in (-0.5, 0.5] and how
+// tightly they gather there, R in 0..1 (1 when every value is the same distance off).
+function circularMean(xs, ws) {
+  let c = 0;
+  let s = 0;
+  let wsum = 0;
+  for (let i = 0; i < xs.length; i++) {
+    const a = 2 * Math.PI * (xs[i] - Math.round(xs[i]));
+    c += ws[i] * Math.cos(a);
+    s += ws[i] * Math.sin(a);
+    wsum += ws[i];
+  }
+  return wsum > 0 ? { mu: Math.atan2(s, c) / (2 * Math.PI), R: Math.hypot(c, s) / wsum } : { mu: 0, R: 0 };
+}
+
+// The note each piece was aiming for. Rounding after the tuning shift is right for a steady
+// singer, but children (and tired adults) land a third or more of a semitone off quite
+// often, and then plain rounding picks a note the tune never uses. So each note weighs how
+// close it is to each semitone (a bell curve as wide as this singer's own scatter round the
+// tuning) against how much the take uses that pitch class: its own sung pitch classes, plus
+// the scale of the key they suggest. An accurate singer's chromatic note stays put (it is
+// close to its semitone); a wobbly note between two semitones goes to the one in the tune.
+// p never moves more than a semitone from the measured centre.
+const SCALES = { major: [0, 2, 4, 5, 7, 9, 11], minor: [0, 2, 3, 5, 7, 8, 10] };
+const KEY_CLOSE = 0.1; // keys scoring within this of the best are all still in the running
+function aimedNotes(found, tuning, R) {
+  const p = found.map((n) => Math.round(n.m - tuning));
+  if (found.length < 3) return p;
+  // A wrapped bell curve with this R has this width: about 0.2 semitones for a steady adult.
+  const sig = Math.min(0.45, Math.max(0.15, Math.sqrt(-Math.log(Math.max(1e-6, R)) / (2 * Math.PI * Math.PI))));
+  const near = (x, q) => Math.exp(-((x - q) ** 2) / (2 * sig * sig));
+  // How much each pitch class is sung, sharing a note between its two nearest semitones by
+  // how close it is to each. Each note is judged on the others' votes, never its own.
+  const used = new Array(12).fill(0);
+  const own = found.map((n) => {
+    const x = n.m - tuning;
+    const f = Math.floor(x);
+    const a = near(x, f);
+    const b = near(x, f + 1);
+    const w = tuneWeight(n);
+    used[pc(f)] += (w * a) / (a + b);
+    used[pc(f + 1)] += (w * b) / (a + b);
+    return { f, a: (w * a) / (a + b), b: (w * b) / (a + b), w };
+  });
+  const total = used.reduce((s, u) => s + u, 0);
+  for (let pass = 0; pass < 2; pass++) {
+    // The scale counts only as far as the likely keys agree on it: when major and minor (or
+    // a key and its neighbour) are close, the notes they disagree about are left to the
+    // singing itself, or a guessed key would pull its own third into line and prove itself.
+    const { keys } = rankKeys(found.map((n, i) => ({ t0: n.t0, t1: n.t1, p: p[i], conf: n.conf })));
+    const likely = keys.filter((k) => k.score >= keys[0].score - KEY_CLOSE);
+    const inScale = new Array(12).fill(0);
+    for (const k of likely) for (const step of SCALES[k.mode]) inScale[pc(k.tonic + step)] += 1 / likely.length;
+    found.forEach((n, i) => {
+      const x = n.m - tuning;
+      const o = own[i];
+      const rest = Math.max(1e-9, total - o.w);
+      const prior = (q) => {
+        const c = pc(q);
+        const mine = c === pc(o.f) ? o.a : c === pc(o.f + 1) ? o.b : 0;
+        return Math.max(0, used[c] - mine) / rest + (2 / 7) * inScale[c] + 0.02;
+      };
+      let best = p[i];
+      let bestS = -Infinity;
+      for (let q = Math.ceil(n.m - 1); q <= Math.floor(n.m + 1); q++) {
+        const s = -((x - q) ** 2) / (2 * sig * sig) + Math.log(prior(q));
+        if (s > bestS) {
+          bestS = s;
+          best = q;
+        }
+      }
+      p[i] = best;
+    });
+  }
+  return p;
+}
+
 // Rounded for tidy output (and never -0, which strict comparisons treat as different).
 function round(v, places) {
   const k = 10 ** places;
@@ -110,6 +194,10 @@ function framePeriod(frames) {
 }
 
 // Stretches of voiced frames. Short dropouts are bridged; a longer silence starts a new run.
+// Free sing pushes a frame on every screen refresh, null when nothing is sung, so silence
+// shows up as null frames. A stretch with no frames at all is the browser missing refreshes
+// (a dropped frame, or a stall of a few hundred ms): nobody heard anything, so it is not
+// evidence of a break and the line is bridged across it, up to MAX_STALL.
 // Everything per frame is worked out in this one pass, into shared arrays that each run
 // views a slice of, which keeps a long take quick: the time each frame stands for (w; a
 // bridged hole doesn't count as singing), running sums for smoothing (PW, PX), and whether
@@ -119,6 +207,7 @@ function voicedRuns(frames, gap, dt) {
   const T = new Float64Array(N);
   const X = new Float64Array(N);
   const R = new Float64Array(N);
+  const G = new Float64Array(N);
   const Wt = new Float64Array(N);
   const PW = new Float64Array(N + 1);
   const PX = new Float64Array(N + 1);
@@ -138,20 +227,29 @@ function voicedRuns(frames, gap, dt) {
     if (n > start) {
       weight(dt);
       const v = (A, extra = 0) => A.subarray(start, n + extra);
-      runs.push({ t: v(T), x: v(X), r: v(R), w: v(Wt), PW: v(PW, 1), PX: v(PX, 1), jumpy });
+      runs.push({ t: v(T), x: v(X), r: v(R), g: v(G), w: v(Wt), PW: v(PW, 1), PX: v(PX, 1), jumpy });
     }
     start = n;
     jumpy = false;
   };
+  let lost = 0; // time since the last voiced frame that no frame covered
+  let hushLo = Infinity; // quietest and loudest unvoiced frame since then (NaN without rms)
+  let hushHi = -Infinity;
   for (let i = 0; i < N; i++) {
     const f = frames[i];
     if (!f || !(f.t > last)) continue; // broken or out-of-order frame
+    if (last > -Infinity) lost += Math.max(0, f.t - last - 1.5 * dt);
     last = f.t;
     const m = f.m;
-    if (typeof m !== 'number' || !(m > 12 && m < 120)) continue;
+    if (typeof m !== 'number' || !(m > 12 && m < 120)) {
+      const r = typeof f.rms === 'number' && f.rms >= 0 ? f.rms : NaN;
+      hushLo = Math.min(hushLo, r);
+      hushHi = Math.max(hushHi, r);
+      continue;
+    }
     if (n > start) {
       const d = f.t - T[n - 1];
-      if (d > gap) close();
+      if (d > MAX_STALL || (d - lost > gap && !lostVoice(frames, i, R, X, T, start, n, d, hushLo, hushHi))) close();
       else {
         weight(Math.min(d, 2 * dt));
         if (Math.abs(m - X[n - 1]) >= 4.5) jumpy = true;
@@ -160,10 +258,72 @@ function voicedRuns(frames, gap, dt) {
     T[n] = f.t;
     X[n] = m;
     R[n] = typeof f.rms === 'number' && f.rms >= 0 ? f.rms : NaN;
+    // The quietest unvoiced frame bridged just before this one: often the bottom of a
+    // consonant between two sung notes, which the voiced frames on either side don't show.
+    G[n] = n > start ? hushLo : Infinity;
     n++;
+    lost = 0;
+    hushLo = Infinity;
+    hushHi = -Infinity;
   }
   close();
   return { runs, sung };
+}
+
+// A short unvoiced patch where the sound carried on at the singer's own level, with the same
+// note either side: a breathy or rough moment the pitch detector lost, not a break between
+// notes. A real break (a consonant, a breath, a stop) drops well below the sung level, under
+// half of it; a hiss louder than the voice is a consonant or breath too. Needs rms; without
+// it, a gap is a gap.
+// frames[i] is the first voiced frame after the patch; the run so far is T/X/R[start, n).
+function lostVoice(frames, i, R, X, T, start, n, d, lo, hi) {
+  if (!(d <= 0.25) || !(lo >= 0) || !(hi >= 0)) return false;
+  const before = [];
+  const pb = [];
+  for (let k = n - 1; k >= start && T[n - 1] - T[k] <= 0.12; k--) {
+    before.push(R[k]);
+    pb.push(X[k]);
+  }
+  const after = [];
+  const pa = [];
+  for (let k = i; k < frames.length && frames[k] && frames[k].t - frames[i].t <= 0.12; k++) {
+    const g = frames[k];
+    if (typeof g.m !== 'number' || !(g.m > 12 && g.m < 120)) continue;
+    after.push(typeof g.rms === 'number' && g.rms >= 0 ? g.rms : NaN);
+    pa.push(g.m);
+  }
+  if (before.length < 3 || after.length < 3 || before.some(isNaN) || after.some(isNaN)) return false;
+  const level = Math.min(quantile(before, 0.5), quantile(after, 0.5));
+  return lo >= 0.55 * level && hi <= 1.5 * level && Math.abs(quantile(pa, 0.5) - quantile(pb, 0.5)) < 1;
+}
+
+// The detector keeps naming a pitch for a moment after a sound stops, while its window still
+// holds the end of it (or the room is still ringing), and the level then falls to a small
+// fraction of the singing. Those frames are an echo, not the voice: without them a short blip
+// shows its true length (and is dropped as one), and a note ends where the singing did.
+function trimFade(run, dt, fade) {
+  const { r } = run;
+  const n = r.length;
+  if (n < 3) return;
+  let top = 0;
+  for (let k = 0; k < n; k++) {
+    if (!(r[k] >= 0)) return; // no level to go on: keep everything
+    top = Math.max(top, r[k]);
+  }
+  // Ends already above the floor even of the loudest frame: nothing to trim (the usual case).
+  if (r[0] >= fade * top && r[n - 1] >= fade * top) return;
+  const floor = fade * quantile(Float64Array.from(r).sort(), 0.9, true);
+  let a = 0;
+  let b = n;
+  while (a < b && r[a] < floor) a++;
+  while (b > a && r[b - 1] < floor) b--;
+  if (a === 0 && b === n) return;
+  run.t = run.t.slice(a, b);
+  run.x = run.x.slice(a, b);
+  run.r = run.r.slice(a, b);
+  run.g = run.g.slice(a, b);
+  run.g[0] = Infinity;
+  weigh(run, dt);
 }
 
 // The same per-frame weights and running sums for a run whose frames have changed.
@@ -206,6 +366,7 @@ function clean(run, dt) {
     run.t = Float64Array.from(keep, (i) => t[i]);
     run.x = Float64Array.from(keep, (i) => x[i]);
     run.r = Float64Array.from(keep, (i) => r[i]);
+    run.g = Float64Array.from(keep, (i) => run.g[i]);
   }
   if (moved || keep.length < x.length) weigh(run, dt);
 }
@@ -641,7 +802,7 @@ function dipBetween(run, list, l, r) {
 // Split a note where the pitch (or, when we have it, the level) dips clearly and comes
 // back to the same note: that is two repeated notes sung without a break.
 function splitDips(run, nt, o, core) {
-  const dip = findDip(run, nt.a, nt.b, o);
+  const dip = findDip(run, nt.a, nt.b, o) || levelDip(run, nt.a, nt.b);
   if (!dip) return [nt];
   // Frames in the dip don't count towards either note's pitch.
   for (let j = dip.i; j <= dip.j; j++) core[j] = 0;
@@ -704,6 +865,56 @@ function findDip(run, a, b, o) {
   return best;
 }
 
+// A sharp dip in level between two stretches of singing: a consonant ("la la", "da da") or a
+// note sung again. It falls below LEVEL_DIP of the loudest singing within a fifth of a second
+// on both sides, which the level inside a held note almost never does (vibrato and breathy
+// patches stay above half). This works on short notes, which findDip can't judge: it needs a
+// quarter of a second either side to know the pitch level. Needs rms; NaN or missing levels
+// mean no dip. Returns where the new note starts (k) and the dip's frames (i..j).
+function levelDip(run, a, b) {
+  const { t, r, g } = run;
+  const edge = 0.06;
+  if (b - a < 6 || t[b - 1] - t[a] < 2 * edge) return null;
+  let top = 0;
+  for (let k = a; k < b; k++) {
+    if (!(r[k] >= 0)) return null;
+    top = Math.max(top, r[k]);
+  }
+  let best = null;
+  for (let k = a + 1; k < b - 1; k++) {
+    if (t[k] - t[a] < edge || t[b - 1] - t[k] < edge) continue;
+    const v = Math.min(r[k], g[k]);
+    if (!(v < LEVEL_DIP * top)) continue; // not even under the loudest frame: no dip here
+    let L = 0;
+    let R = 0;
+    let nl = 0;
+    let nr = 0;
+    let lowest = true;
+    for (let j = k - 1; j >= a && t[k] - t[j] <= 0.2; j--) {
+      L = Math.max(L, r[j]);
+      nl++;
+      if (t[k] - t[j] <= 0.025 && Math.min(r[j], g[j]) < v) lowest = false;
+    }
+    for (let j = k + 1; j < b && t[j] - t[k] <= 0.2; j++) {
+      R = Math.max(R, r[j]);
+      nr++;
+      if (t[j] - t[k] <= 0.025 && Math.min(r[j], g[j]) <= v) lowest = false;
+    }
+    if (!lowest || nl < 3 || nr < 3) continue;
+    const ratio = v / Math.min(L, R);
+    if (ratio < LEVEL_DIP && (!best || ratio < best.ratio)) best = { k, ratio, R };
+  }
+  if (!best) return null;
+  // The new note starts once the level is back up, or right at the dip when its bottom was
+  // in the unvoiced frames just before.
+  const i = best.k;
+  let k = i;
+  if (!(g[i] < r[i])) {
+    while (k + 1 < b && t[k + 1] - t[i] <= 0.06 && r[k] < 0.5 * best.R) k++;
+  }
+  return { k, i, j: Math.max(i, k - 1), depth: 1 - best.ratio };
+}
+
 // The stretch around frame k where v stays under `limit`, if it is more than one frame
 // (one frame is a glitch) and no longer than a quarter of a second.
 function below(run, v, a, b, k, limit) {
@@ -738,6 +949,17 @@ function centre(s, swing) {
   const mix = Math.min(1, Math.max(0, (swing - 0.15) / 0.15));
   const med = quantile(s, 0.5, true);
   return med + mix * ((quantile(s, 0.05, true) + quantile(s, 0.95, true)) / 2 - med);
+}
+
+// Mean of the half of the sorted values that lies in the narrowest span.
+function shorth(s) {
+  const n = s.length;
+  const h = Math.max(1, Math.ceil(n / 2));
+  let best = 0;
+  for (let i = 1; i + h <= n; i++) if (s[i + h - 1] - s[i] < s[best + h - 1] - s[best]) best = i;
+  let sum = 0;
+  for (let i = best; i < best + h; i++) sum += s[i];
+  return sum / h;
 }
 
 function quantile(arr, q, sorted = false) {
@@ -781,18 +1003,21 @@ function measure(run, { a, b, split }, core) {
   // Wider than any vibrato: this was never one note (noise, or a slide that got through).
   if (sd > 1.2) return null;
   const s = vals.sort();
-  const trim = Math.floor(s.length * 0.15);
-  let sum = 0;
-  for (let i = trim; i < s.length - trim; i++) sum += s[i];
-  // A steady note: trimmed mean. With vibrato, the middle of its range is far better: part
-  // of a cycle left over at either end barely moves it (the mean can be off by 13 cents).
-  const trimmed = s.length > 2 * trim ? sum / (s.length - 2 * trim) : mean;
-  const range = (quantile(s, 0.05, true) + quantile(s, 0.95, true)) / 2;
-  const mix = Math.min(1, Math.max(0, (0.71 * (quantile(s, 0.75, true) - quantile(s, 0.25, true)) - 0.15) / 0.15));
-  const m = trimmed + mix * (range - trimmed);
   const t0 = t[a];
   const t1 = t[b - 1] + w[b - 1];
   const dur = t1 - t0;
+  // A steady note: its trimmed mean. On a short note a scoop in or a fall at the end is a big
+  // share of the frames and still pulls a trimmed mean its way, so there it is the mean of the
+  // tightest half, where the voice settled. With vibrato, the middle of its range is far
+  // better: part of a cycle left over at either end barely moves it (the mean can be off by
+  // 13 cents).
+  const trim = Math.floor(s.length * 0.15);
+  let sum = 0;
+  for (let i = trim; i < s.length - trim; i++) sum += s[i];
+  const settled = dur < 0.3 ? shorth(s) : s.length > 2 * trim ? sum / (s.length - 2 * trim) : mean;
+  const range = (quantile(s, 0.05, true) + quantile(s, 0.95, true)) / 2;
+  const mix = Math.min(1, Math.max(0, (0.71 * (quantile(s, 0.75, true) - quantile(s, 0.25, true)) - 0.15) / 0.15));
+  const m = settled + mix * (range - settled);
   // Longer and steadier notes are surer. Vibrato (sd about 0.4) only costs a little.
   const long = Math.min(1, Math.max(0, (dur - 0.05) / 0.25));
   const steady = Math.min(1, Math.max(0, 1.25 - sd));
@@ -853,6 +1078,21 @@ function corr(h, prof, tonic) {
 // them a short major tune is often read as its relative minor (same notes, other home).
 // Returns the best guess even when it isn't sure; `enough` says whether to tell anyone.
 export function findKey(notes) {
+  const { keys, clear } = rankKeys(notes);
+  if (!keys.length) return { tonic: 0, mode: 'major', confidence: 0, enough: false };
+  const best = keys[0];
+  const margin = best.score - keys[1].score;
+  const clamp = (v) => Math.min(1, Math.max(0, v));
+  // The nudge for ending on the home note is 0.2, so a key has to win by more than most of
+  // that nudge before we say it out loud.
+  const confidence = clamp(Math.min(1, clear / 10) * (0.4 * clamp((best.r - 0.3) / 0.5) + 0.6 * clamp(margin / 0.3)));
+  const enough = clear >= 8 && margin >= 0.15 && best.r >= 0.5;
+  return { tonic: best.tonic, mode: best.mode, confidence: round(confidence, 2), enough };
+}
+
+// All 24 keys, best first, with their profile fit r and score (fit plus the nudges), and
+// how many clear notes there were to go on.
+function rankKeys(notes) {
   const h = new Array(12).fill(0);
   const list = [];
   for (const n of notes || []) {
@@ -864,7 +1104,7 @@ export function findKey(notes) {
     // Cap very long notes so one held note doesn't decide the key on its own.
     h[pc(p)] += Math.min(d, 2) * (0.5 + 0.5 * conf);
   }
-  if (!list.length) return { tonic: 0, mode: 'major', confidence: 0, enough: false };
+  if (!list.length) return { keys: [], clear: 0 };
   const clear = list.filter((n) => n.conf >= 0.45);
   const ends = clear.length ? clear : list;
   const first = pc(ends[0].p);
@@ -886,14 +1126,7 @@ export function findKey(notes) {
   }
   // Ties (rare) go to major, then the lower tonic, so the answer never depends on sort order.
   keys.sort((a, b) => b.score - a.score || (a.mode === b.mode ? 0 : a.mode === 'major' ? -1 : 1) || a.tonic - b.tonic);
-  const best = keys[0];
-  const margin = best.score - keys[1].score;
-  const clamp = (v) => Math.min(1, Math.max(0, v));
-  // The nudge for ending on the home note is 0.2, so a key has to win by more than most of
-  // that nudge before we say it out loud.
-  const confidence = clamp(Math.min(1, clear.length / 10) * (0.4 * clamp((best.r - 0.3) / 0.5) + 0.6 * clamp(margin / 0.3)));
-  const enough = clear.length >= 8 && margin >= 0.15 && best.r >= 0.5;
-  return { tonic: best.tonic, mode: best.mode, confidence: round(confidence, 2), enough };
+  return { keys, clear: clear.length };
 }
 
 // ---------- Rhythm ----------
@@ -930,8 +1163,9 @@ export function quantize(notes, { bpm = TEMPOS.medium, beatsPerBar = 4 } = {}) {
       phase = ph;
     }
   }
-  const offset = phase + g * Math.round((list[0].t0 - phase) / g);
+  let offset = phase + g * Math.round((list[0].t0 - phase) / g);
 
+  // Starts first.
   const out = [];
   let lastStart = -Infinity;
   list.forEach((n, i) => {
@@ -945,18 +1179,34 @@ export function quantize(notes, { bpm = TEMPOS.medium, beatsPerBar = 4 } = {}) {
       s = lastStart + 1;
       if (s - exact > 1) return; // a burst of quick notes: this one gives way to the one before
     }
-    let e = Math.round((n.t1 - offset) / g);
-    if (e <= s) e = s + 1;
-    const prev = out[out.length - 1];
-    if (prev && prev.e > s) prev.e = s;
-    out.push({ s, e, p: noteP(n) });
+    out.push({ s, n });
     lastStart = s;
+  });
+  // That can pull the first note back an eighth; beat 0 is always the first note.
+  const first = out[0].s;
+  offset += first * g;
+  for (const o of out) o.s -= first;
+
+  // Then lengths. Singers leave a little air before the next note (a consonant, a breath
+  // between words), and the note still lasts until the next one starts. Only a silence of
+  // more than about half an eighth that is also more than a quarter of the note's own slot
+  // is a rest (or staccato), and then the note keeps the length it was sung.
+  out.forEach((o, i) => {
+    const next = out[i + 1];
+    const { n } = o;
+    let e = Math.round((n.t1 - offset) / g);
+    if (next) {
+      const gap = next.n.t0 - n.t1;
+      if (gap < 0.6 * g || gap < 0.25 * (next.n.t0 - n.t0)) e = next.s;
+      e = Math.min(e, next.s);
+    }
+    o.e = Math.max(e, o.s + 1);
   });
   return {
     bpm,
     beatsPerBar,
     offset: round(offset, 4),
-    notes: out.map((n) => ({ beat: n.s / 2 + 0, beats: (n.e - n.s) / 2, p: n.p })),
+    notes: out.map((o) => ({ beat: o.s / 2 + 0, beats: (o.e - o.s) / 2, p: noteP(o.n) })),
   };
 }
 

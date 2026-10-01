@@ -16,9 +16,12 @@ function random(seed) {
 }
 
 // parts: { p, d, gap?, vib?: [semitones, Hz], scoop?: [semitones below, seconds],
-//          dev?: semitones off, oct?: [from, length] seconds an octave up, rmsDip?: [at, length] }
+//          dev?: semitones off, oct?: [from, length] seconds an octave up, rmsDip?: [at, length],
+//          lost?: [at, length] seconds the detector loses the pitch while the voice carries on,
+//          echo?: seconds the detector still names the pitch after the note, at a whisper }
 //        { rest: seconds } | { glide: [from, to], d } | { siren: [low, high], d }
-function sing(parts, { rate = 120, jitter = 0.04, seed = 1, sharp = 0, lead = 0.3, tail = 0.3, rms = false, wobble = 0 } = {}) {
+// stalls: [[from, to]] stretches with no frames at all, as when the browser misses refreshes.
+function sing(parts, { rate = 120, jitter = 0.04, seed = 1, sharp = 0, lead = 0.3, tail = 0.3, rms = false, wobble = 0, stalls = [] } = {}) {
   const rnd = random(seed);
   const pieces = [];
   const truth = [];
@@ -63,14 +66,20 @@ function sing(parts, { rate = 120, jitter = 0.04, seed = 1, sharp = 0, lead = 0.
     while (k < pieces.length && pieces[k].t1 <= time) k++;
     const pc = pieces[k];
     const on = pc && time >= pc.t0;
-    const m = on ? pc.f(time - pc.t0) + sharp + (rnd() - 0.5) * 2 * jitter : null;
-    const f = { t: time, m };
-    if (rms) {
-      let level = on ? 0.05 : 0.001;
-      const dip = on && pc.n && pc.n.rmsDip;
-      if (dip && time - pc.t0 >= dip[0] && time - pc.t0 < dip[0] + dip[1]) level = 0.008;
-      f.rms = level;
+    let m = on ? pc.f(time - pc.t0) + sharp + (rnd() - 0.5) * 2 * jitter : null;
+    let level = on ? 0.05 : 0.001;
+    const lost = on && pc.n && pc.n.lost;
+    if (lost && time - pc.t0 >= lost[0] && time - pc.t0 < lost[0] + lost[1]) m = null;
+    const dip = on && pc.n && pc.n.rmsDip;
+    if (dip && time - pc.t0 >= dip[0] && time - pc.t0 < dip[0] + dip[1]) level = 0.008;
+    const before = k > 0 ? pieces[k - 1] : null;
+    if (!on && before && before.n && before.n.echo && time < before.t1 + before.n.echo) {
+      m = before.n.p + sharp;
+      level = 0.003;
     }
+    if (stalls.some(([a, b]) => time >= a && time < b)) continue;
+    const f = { t: time, m };
+    if (rms) f.rms = level;
     frames.push(f);
   }
   return { frames, truth };
@@ -199,6 +208,45 @@ test('findNotes: a dip in level alone splits repeated notes when rms is there', 
   assert.deepEqual(ps(findNotes(frames.map(({ t, m }) => ({ t, m })))), [62]);
 });
 
+test('findNotes: short repeated notes split at a dip in level, as in "la la la"', () => {
+  // Quick notes joined by a voiced consonant: the pitch never breaks, only the level dips.
+  const tune = [67, 67, 67, 64, 64, 64, 60];
+  const { frames, truth } = sing(tune.map((p) => ({ p, d: 0.16, rmsDip: [0.12, 0.04] })), { rms: true });
+  matches(findNotes(frames), truth, 0.04);
+  // A held note's level never falls that far, so it stays one note.
+  assert.deepEqual(ps(findNotes(sing([{ p: 64, d: 2, vib: [0.5, 5.5] }], { rms: true }).frames)), [64]);
+});
+
+test('findNotes: missed screen refreshes are not breaks between notes', () => {
+  // No frames at all for a fifth of a second (a stall) and for 70 ms (dropped frames): nobody
+  // heard anything, so the notes carry on.
+  const { frames, truth } = sing([{ p: 62, d: 1.5 }, { p: 64, d: 1 }], { rate: 60, stalls: [[0.9, 1.1], [2.2, 2.27]] });
+  matches(findNotes(frames), truth, 0.03);
+  // A heard silence of the same length is a break.
+  assert.deepEqual(ps(findNotes(sing([{ p: 62, d: 0.7, gap: 0.2 }, { p: 62, d: 0.7 }], { rate: 60 }).frames)), [62, 62]);
+  // So is a stall of more than 0.4 s: the note may well have been sung again in it.
+  assert.deepEqual(ps(findNotes(sing([{ p: 62, d: 2 }], { stalls: [[1, 1.5]] }).frames)), [62, 62]);
+});
+
+test('findNotes: a moment the detector loses while the voice carries on stays one note', () => {
+  // 120 ms with no pitch but the level of the singing: a breathy patch, not a break.
+  const { frames } = sing([{ p: 60, d: 1.2, lost: [0.5, 0.12] }], { rms: true });
+  assert.deepEqual(ps(findNotes(frames)), [60]);
+  // Without the level there is no telling, and a gap that long is a break.
+  assert.deepEqual(ps(findNotes(frames.map(({ t, m }) => ({ t, m })))), [60, 60]);
+  // When the level falls away too, it is a break between two notes.
+  assert.deepEqual(ps(findNotes(sing([{ p: 60, d: 0.55, gap: 0.12 }, { p: 60, d: 0.55 }], { rms: true }).frames)), [60, 60]);
+});
+
+test('findNotes: the detector\'s echo after a sound is not singing', () => {
+  // A 50 ms blip that the detector holds on to for 100 ms more, at a whisper, is still a blip;
+  // and a note ends where the singing stops, not where its echo does.
+  const { frames, truth } = sing([{ p: 60, d: 0.4, gap: 0.3 }, { p: 67, d: 0.05, echo: 0.1, gap: 0.3 }, { p: 62, d: 0.4, echo: 0.15 }], { rms: true });
+  const res = findNotes(frames);
+  assert.deepEqual(ps(res), [60, 62]);
+  assert.ok(Math.abs(res.notes[1].t1 - truth[2].t1) < 0.03, `ends at ${res.notes[1].t1}`);
+});
+
 test('findNotes: short octave jumps are folded back', () => {
   const { frames, truth } = sing(SCALE.map((p, i) => ({ p, d: 0.4, oct: i % 2 ? [0.15, 0.01] : [0.2, 0.07] })));
   const res = findNotes(frames);
@@ -233,6 +281,40 @@ test('findNotes: a sharp singer gets the notes they meant, and drift is tolerate
   // Each note a little off in its own way still reads as the tune.
   const loose = sing(SCALE.map((p, i) => ({ p, d: 0.4, dev: [0.2, -0.25, 0.1, -0.15, 0.25, 0, -0.2, 0.15][i] })));
   assert.deepEqual(ps(findNotes(loose.frames)), SCALE);
+});
+
+test('findNotes: a loose singer still has a tuning, two notes that disagree have none', () => {
+  // A singer 0.4 sharp overall, each note scattered by about 0.3: the scatter round the circle
+  // is wide, but there are enough notes to find the middle of it.
+  const rnd = random(11);
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+  const tune = [60, 62, 64, 65, 67, 65, 64, 62, 60, 64, 67, 72, 67, 64, 62, 60, 62, 64, 62, 60, 67, 65, 64, 60];
+  const parts = tune.map((p) => ({ p, d: 0.4, dev: 0.3 * gauss() }));
+  const res = findNotes(sing(parts, { sharp: 0.4 }).frames);
+  assert.ok(Math.abs(res.tuning - 0.4) < 0.15, `tuning ${res.tuning}`);
+  const right = ps(res).filter((p, i) => p === tune[i]).length;
+  assert.ok(res.notes.length === tune.length && right >= 21, `${right} of ${tune.length}`);
+  // Two notes half a semitone apart in their offsets say nothing about tuning.
+  const two = findNotes(sing([{ p: 72, d: 0.6, dev: -0.48, gap: 0.2 }, { p: 70, d: 0.6, dev: 0.04 }]).frames);
+  assert.equal(two.tuning, 0);
+  assert.deepEqual(ps(two), [72, 70]);
+});
+
+test('findNotes: a wobbly note between two semitones goes to the one the tune uses', () => {
+  // C major sung loosely (each note off by about a quarter of a semitone); one D lands 0.6
+  // sharp, nearer E flat, which the tune never uses.
+  const rnd = random(3);
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+  const tune = [60, 62, 64, 65, 67, 65, 64, 62, 60, 64, 67, 72, 67, 64, 62, 60];
+  const devs = tune.map((p, i) => (i === 7 ? 0.6 : Math.max(-0.4, Math.min(0.4, 0.25 * gauss()))));
+  const loose = findNotes(sing(tune.map((p, i) => ({ p, d: 0.4, gap: 0.08, dev: devs[i] }))).frames);
+  assert.ok(Math.round(loose.notes[7].m - loose.tuning) === 63, 'plain rounding would say E flat');
+  assert.deepEqual(ps(loose), tune);
+  assert.ok(loose.notes.every((n) => Math.abs(n.p - n.m) <= 1));
+  // An accurate singer's chromatic note is close to its own semitone, so it stays put.
+  const chrom = [64, 65, 67, 64, 63, 64, 62, 60, 64, 65, 67, 72, 67, 64, 62, 60];
+  const exact = findNotes(sing(chrom.map((p, i) => ({ p, d: 0.4, dev: i === 4 ? 0.3 : 0 }))).frames);
+  assert.deepEqual(ps(exact), chrom);
 });
 
 test('findNotes: uneven frame times and noisy pitch', () => {
@@ -377,6 +459,37 @@ test('quantize: never overlaps, never zero length, keeps order', () => {
     end = n.beat + n.beats;
   }
   assert.deepEqual(quantize([], { bpm: 96 }), { bpm: 96, beatsPerBar: 4, offset: 0, notes: [] });
+});
+
+test('quantize: notes sung short of their slot keep their length, and rests stay', () => {
+  // Every note sung for 80% of its slot (a consonant or a breath before the next one).
+  const bpm = 96;
+  const spb = 60 / bpm;
+  const rhythm = [[0, 1, 60], [1, 1, 62], [2, 2, 64], [5, 1, 65], [6, 1, 67], [7, 1, 65]];
+  const notes = rhythm.map(([beat, beats, p]) => ({ t0: 0.5 + beat * spb, t1: 0.5 + (beat + 0.8 * beats) * spb, m: p, p, conf: 0.9 }));
+  const q = quantize(notes, { bpm });
+  assert.deepEqual(q.notes.map((n) => n.beat), [0, 1, 2, 5, 6, 7]);
+  assert.deepEqual(q.notes.map((n) => n.beats).filter((b, i) => i !== 2 && i !== 5), [1, 1, 1, 1]);
+  // Before the rest the note is as long as it was sung, and the rest is still there.
+  assert.ok(q.notes[2].beats >= 1.5 && q.notes[2].beat + q.notes[2].beats < 5);
+});
+
+test('quantize: the first note is always on beat 0', () => {
+  const rnd = random(7);
+  for (let k = 0; k < 200; k++) {
+    let t = 0.3 + rnd();
+    const notes = [];
+    for (let i = 0; i < 6; i++) {
+      const d = 0.1 + rnd() * 0.5;
+      notes.push({ t0: t, t1: t + d, p: 60 + i, conf: rnd() });
+      t += d + rnd() * 0.2;
+    }
+    const q = quantize(notes, { bpm: [72, 96, 120][k % 3] });
+    assert.equal(q.notes[0].beat, 0);
+    assert.ok(q.notes.every((n) => n.beat >= 0 && n.beats > 0));
+    // offset is still the time of beat 0, near the first note's start
+    assert.ok(Math.abs(q.offset - notes[0].t0) <= 30 / q.bpm);
+  }
 });
 
 test('quantize: a dotted rhythm becomes two eighths rather than a squash', () => {
