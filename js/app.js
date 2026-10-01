@@ -3,7 +3,7 @@ import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './les
 import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer } from './songs.js';
 import { Lane, drawOverview, drawSong } from './lane.js';
 import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, fitShift } from './music.js';
-import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, offWords } from './score.js';
+import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, speakerBleed, offWords } from './score.js';
 import { store, today, week, warmedToday, songPassToday } from './store.js';
 import { findNotes, findKey, quantize, harmonize, arrange, describe, TEMPOS } from './tune.js';
 import { writeFamilySongFile, familySongFileName, validateSong, isFamilySongId, SONG_LIMITS } from './nbn.js';
@@ -29,6 +29,7 @@ const VERSION = '1.1';
 // The app talks in one voice, as “I”: “I couldn’t hear you”, “I set How strict to Relaxed”.
 const NOT_HEARD = 'I couldn’t hear you';
 const NOT_FOLLOWED = 'I couldn’t hear the tune';
+const SPEAKER = 'Was that the speaker?';
 const TABS = ['today', 'lessons', 'songs'];
 // The grown-ups' corner of the results and warm-up sheets: small and quiet, below everything a
 // child needs.
@@ -355,7 +356,7 @@ function settingsSheet(gate = null) {
   const html = `
     <h2>Settings</h2>
     <div class="field">
-      <div><b>Headphones</b><p>On: you also hear the guide note while you sing, except in the warm-up, where you always listen first, then sing. Wired headphones work best. Bluetooth drops to call quality while the mic is on.</p></div>
+      <div><b>Headphones</b><p>Only switch this on when you’re wearing headphones. Then you hear the tune while you sing. With it off, you hear each part (or its first note) before you sing, so the mic only hears you. Wired headphones work best: Bluetooth drops to call quality while the mic is on.</p></div>
       <button class="switch ${s.headphones ? 'on' : ''}" role="switch" aria-checked="${s.headphones}" aria-label="Headphones" data-act="set" data-k="headphones" data-v="${!s.headphones}"><i></i></button>
     </div>
     <div class="field col"><b>Note names</b>${seg('names', [['letters', 'C D E'], ['solfa', 'Do Re Mi']])}</div>
@@ -1306,6 +1307,8 @@ function playerCtrl({ kind, id }) {
   // The warm-up is always hear-then-sing, whatever the headphones setting: nothing plays while
   // the child sings, so sound from the phone's speaker can't count as their voice and open songs.
   const guideWhileSinging = () => kind !== 'warmup' && S().headphones;
+  // Whether this run played anything meant for headphones only, for the speaker check in finish().
+  let hpPlayed = false;
   // The song a locked tap asked for, offered on the warm-up's done sheet.
   const forSong = kind === 'warmup' ? pendingSong : null;
   if (kind === 'warmup') pendingSong = null;
@@ -1587,6 +1590,7 @@ function playerCtrl({ kind, id }) {
     tol = tolerance();
     kept = null;
     results = [];
+    hpPlayed = false;
     stepIdx = 0;
     clearHits();
     startStep();
@@ -1627,6 +1631,9 @@ function playerCtrl({ kind, id }) {
     while (ai < A.length && A[ai].t < t + 0.7) {
       const a = A[ai++];
       if (a.hp && !guideWhileSinging()) continue;
+      // Backing for the speaker (songs without headphones) gives way to the guide and full chords.
+      if (a.nohp && guideWhileSinging()) continue;
+      if (a.hp) hpPlayed = true;
       let at = T0 + a.t;
       if (a.kind === 'click') {
         if (at < now - 0.03) continue;
@@ -1788,6 +1795,13 @@ function playerCtrl({ kind, id }) {
     if (plan.id === 'warmup') return finishWarmup(sum);
     // A run the mic barely heard still shows its result, but doesn't count as practice.
     const heard = wasHeard(sum);
+    // Headphones on but not worn: the mic heard the guide from the speaker. Not counted either.
+    if (heard && hpPlayed && speakerBleed(results).bleed) {
+      setBtn(el.start, 'again');
+      setCue(SPEAKER, '');
+      setProgress(seg.n, 1, true);
+      return bleedSheet();
+    }
     const prev = store.data.progress[plan.id];
     const prevBest = prev ? prev.best : null; // read before this run is recorded
     if (heard) store.record(plan.id, sum.score);
@@ -1795,6 +1809,33 @@ function playerCtrl({ kind, id }) {
     setCue(heard ? verdict(sum.score) : NOT_HEARD, '');
     setProgress(seg.n, 1, true);
     resultsSheet(sum, heard, prevBest);
+  }
+
+  // The run sat exactly on the notes, like the guide tone: no score, nothing saved.
+  function bleedSheet() {
+    openSheet(
+      `<p class="eyebrow">${esc(plan.title)}</p>
+       ${hum('sing')}
+       <h2>${SPEAKER}</h2>
+       <p>I think I heard the tune from the speaker, not you. Are your headphones in? If not, turn Headphones off in Settings.</p>
+       <p class="muted">This one won’t count toward your practice days or best score.</p>
+       <div class="sheet-actions">
+         <button class="btn secondary" data-act="again">Try again</button>
+         <button class="btn primary" data-act="settings">Open Settings</button>
+       </div>`,
+      {
+        again: () => {
+          closeSheet(true);
+          stop();
+        },
+        settings: () => {
+          closeSheet(true);
+          stop();
+          settingsSheet();
+        },
+      },
+      { cls: 'speaker', label: 'Was that the speaker?', onClose: () => stop() }
+    );
   }
 
   // settled: re-shown after the care sheet, so no confetti or stamp animation the second time.
@@ -2070,7 +2111,7 @@ function playerCtrl({ kind, id }) {
         btn.classList.toggle('on', on);
         btn.setAttribute('aria-pressed', String(on));
         if (plan.song && state === 'ready') rebuild();
-        if (state === 'ready') setCue(on ? 'Headphones on: you’ll hear the guide while you sing.' : 'Headphones off: you’ll hear each part first, then sing.', '');
+        if (state === 'ready') setCue(on ? 'Headphones on: wear them, and you’ll hear the tune while you sing.' : 'Headphones off: you’ll hear each part first, then sing.', '');
       },
       mode: (btn) => {
         if (state !== 'ready') return;
@@ -2140,6 +2181,15 @@ function playerCtrl({ kind, id }) {
       const keep = plan.id === 'warmup' && results.length ? { results: results.slice(), at } : null;
       if (keep) stop('Paused while you were away. Tap Carry on to keep going.', keep);
       else stop('Stopped while you were away. Tap Start to go again.');
+    },
+    // After Settings closes: the Headphones switch may have changed.
+    refresh() {
+      const on = !!S().headphones;
+      const btn = root.querySelector('[data-act="hp"]');
+      if (!btn || btn.classList.contains('on') === on) return;
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-pressed', String(on));
+      if (plan.song && state === 'ready') rebuild();
     },
     probe() {
       const st = step();

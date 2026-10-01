@@ -723,7 +723,7 @@ button.safe-line svg { display: inline-block; vertical-align: -3px; margin-right
 .care-link svg { width: 18px; height: 18px; }
 textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--fg); font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 10px; }
 /* Warm-up sheets NEW */
-.sheet.warm-done, .sheet.warm-miss, .sheet.lock { text-align: center; }
+.sheet.warm-done, .sheet.warm-miss, .sheet.speaker, .sheet.lock { text-align: center; }
 .sheet.warm-done .hum { width: 110px; height: 110px; }
 .sheet.warm-done h2 { font-size: 34px; }
 .unlock-chip { align-self: center; display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: var(--r-pill); background: var(--good-soft); color: var(--good); font: 800 15px/1.2 var(--font-body); }
