@@ -71,6 +71,8 @@ export function parseMelody(src) {
     notes.push({ m: parsePitch(p), beat, beats });
     beat += beats;
   }
+  // A "//" after the last note starts no phrase.
+  if (phraseStarts.length > 1 && phraseStarts[phraseStarts.length - 1] === notes.length) phraseStarts.pop();
   const phrases = phraseStarts.map((s, i) => [s, i + 1 < phraseStarts.length ? phraseStarts[i + 1] : notes.length]);
   return { notes, phrases, totalBeats: beat };
 }
@@ -130,29 +132,4 @@ export function fitShift(range, low, high) {
   const want = (range.low + range.high) / 2;
   const have = (low + high) / 2;
   return Math.round(want - have);
-}
-
-export const VOICE_TYPES = [
-  { name: 'Bass', below: 51 },
-  { name: 'Baritone', below: 55 },
-  { name: 'Tenor', below: 59 },
-  { name: 'Alto', below: 63 },
-  { name: 'Mezzo-soprano', below: 67 },
-  { name: 'Soprano', below: 999 },
-];
-
-export function voiceType(range) {
-  const c = (range.low + range.high) / 2;
-  return VOICE_TYPES.find((v) => c < v.below).name;
-}
-
-export function spanWords(semitones) {
-  if (semitones < 12) {
-    const words = ['one note', 'a half step', 'a step', 'a minor third', 'a third', 'a fourth', 'a tritone', 'a fifth', 'a minor sixth', 'a sixth', 'a minor seventh', 'a seventh'];
-    return words[semitones];
-  }
-  if (semitones === 12) return 'an octave';
-  const extra = semitones - 12;
-  const words = ['', 'an octave and a half step', 'an octave and a step', 'an octave and a minor third', 'an octave and a third', 'an octave and a fourth', 'an octave and a tritone', 'an octave and a fifth', 'an octave and a minor sixth', 'an octave and a sixth', 'an octave and a minor seventh', 'an octave and a seventh', 'two octaves'];
-  return words[extra] || `${(semitones / 12).toFixed(1)} octaves`;
 }

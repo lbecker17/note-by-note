@@ -1,8 +1,8 @@
 // The pitch lane: target notes scroll right to left past a fixed line,
 // and your voice draws a line across them. Notes light up in their colour as you hit them.
 
-import { family, label, pc, MAJOR } from './music.js';
-import { targetAt } from './score.js';
+import { family, label, pc, prefersFlats, MAJOR } from './music.js';
+import { targetAt, keyOf, keyAt } from './score.js';
 
 const MINOR = [0, 2, 3, 5, 7, 8, 10];
 const TOKENS = [
@@ -65,7 +65,8 @@ export class Lane {
     this.c.height = Math.round(this.h * this.dpr);
   }
 
-  // model: { events, tonic, minor, flats, names, free, center, marks }
+  // model: { events, tonic, minor, names, free, center, marks }
+  // Events may carry their own tonic when an exercise changes key part way through.
   setModel(model) {
     this.model = model;
     if (model.free) {
@@ -108,11 +109,12 @@ export class Lane {
   rowH() {
     return (this.h - 24) / (this.view.hi - this.view.lo);
   }
-  noteLabel(m) {
+  noteLabel(m, tonic) {
     const M = this.model;
+    const T = M.free ? null : tonic;
     return label(m, {
-      tonic: M.free ? null : M.tonic,
-      flats: !!M.flats,
+      tonic: T,
+      flats: T != null && prefersFlats(T, !!M.minor),
       names: M.free ? 'letters' : M.names,
       octave: !(M.names === 'solfa' && !M.free),
     });
@@ -131,9 +133,9 @@ export class Lane {
       this.view = { lo: this.center - 7, hi: this.center + 7 };
     }
 
-    // Rows and note names
+    // Rows and note names, in the key of the note at (or coming up to) the line
     const rh = this.rowH();
-    const tonic = M.free ? null : M.tonic;
+    const tonic = M.free ? null : keyAt(M, now);
     const scale = M.minor ? MINOR : MAJOR;
     g.textAlign = 'right';
     g.textBaseline = 'middle';
@@ -151,8 +153,8 @@ export class Lane {
       g.stroke();
       if (inScale && rh >= 8) {
         g.fillStyle = C['lane-label'];
-        g.font = `${strong ? 700 : 600} 11px ${font}`;
-        g.fillText(this.noteLabel(m), this.gutter - 8, yy);
+        g.font = `${strong ? 800 : 700} 12px ${font}`;
+        g.fillText(this.noteLabel(m, tonic), this.gutter - 8, yy);
       }
     }
 
@@ -182,9 +184,11 @@ export class Lane {
     const t0 = now - (this.playX - this.gutter) / this.pps - 0.2;
     const t1 = now + (W - this.playX) / this.pps + 0.2;
     const barH = Math.max(8, Math.min(rh * 0.76, 28));
+    const labels = []; // drawn after your line, so it never runs through them
     for (const ev of M.events || []) {
       if (ev.t + ev.d < t0 || ev.t > t1) continue;
-      const fam = family(ev.m, tonic != null ? tonic : 0);
+      const key = M.free ? null : keyOf(ev, M);
+      const fam = family(ev.m, key != null ? key : 0);
       if (ev.m2 != null) {
         this.drawGlide(ev, now, C[fam], barH);
         continue;
@@ -227,22 +231,15 @@ export class Lane {
         }
       }
       // Label on the bar: the syllable for songs, the note name for exercises.
-      const text = ev.text != null ? (ev.melisma ? '' : ev.text) : this.noteLabel(ev.m);
+      const text = ev.text != null ? (ev.melisma ? '' : ev.text) : this.noteLabel(ev.m, key);
       if (text && barH >= 13 && x1 - x0 >= 18) {
-        let ink = ev.role === 'listen' ? C['lane-label'] : C.fg;
+        const listen = ev.role === 'listen';
+        let lit = false;
         if (ev.hits && ev.hits.length) {
           const la = ev.t + 6 / this.pps, lb = ev.t + 22 / this.pps;
-          if (ev.hits.some((h) => h.k === 1 && h.a <= lb && h.b >= la)) ink = C['on-' + fam];
+          lit = ev.hits.some((h) => h.k === 1 && h.a <= lb && h.b >= la);
         }
-        g.save();
-        g.beginPath();
-        g.rect(x0 + 5, top, x1 - x0 - 8, barH);
-        g.clip();
-        g.fillStyle = ink;
-        g.font = `700 ${Math.round(Math.min(13, barH * 0.56))}px ${font}`;
-        g.textAlign = 'left';
-        g.fillText(text, x0 + 7, yy + 0.5);
-        g.restore();
+        labels.push({ text, x0, x1, top, yy, listen, lit, fam });
       }
     }
 
@@ -280,10 +277,52 @@ export class Lane {
       g.stroke();
     }
 
+    // Bar labels, over your line. Each has a halo in the colour behind it, so the line can't run
+    // through a note name. While a bar is under the "now" line, its label waits just right of the
+    // dot rather than sitting under it; near the bar's end it goes back to the bar's start, or
+    // hides if that would still be under the dot.
+    const zoneL = this.playX - 14, zoneR = this.playX + 14;
+    const size = Math.round(Math.min(13, barH * 0.56));
+    g.font = `800 ${size}px ${font}`;
+    g.textAlign = 'left';
+    g.lineJoin = 'round';
+    g.lineWidth = 4;
+    for (const lb of labels) {
+      const tw = g.measureText(lb.text).width;
+      let lx = lb.x0 + 7;
+      let lit = lb.lit;
+      if (lb.x0 <= zoneR && lb.x1 >= zoneL) {
+        if (zoneR + tw <= lb.x1 - 3) {
+          lx = Math.max(lx, zoneR);
+          lit = false; // right of the line hasn't been sung yet
+        } else if (lx + tw > zoneL) continue;
+      }
+      const ink = lb.listen ? C['lane-label'] : lit ? C['on-' + lb.fam] : C.fg;
+      const halo = lb.listen ? C['lane-bg'] : lit ? C[lb.fam] : C['bar-idle'];
+      g.save();
+      g.beginPath();
+      g.rect(lb.x0 + 5, lb.top + 1.5, lb.x1 - lb.x0 - 8, barH - 3); // inside the current bar's outline
+      g.clip();
+      g.strokeStyle = halo;
+      g.strokeText(lb.text, lx, lb.yy + 0.5);
+      g.fillStyle = ink;
+      g.fillText(lb.text, lx, lb.yy + 0.5);
+      g.restore();
+    }
+
     if (live && live.m != null && !live.hide) {
       const dm = live.dm != null ? live.dm : live.m;
       const px = this.playX, py = this.y(clampM(dm));
       const color = live.k === 1 ? C[live.fam] : live.k === 0.5 ? C.near : live.k === 0 ? C.off : C.trace;
+      // A soft halo when you're in tune: a wordless "yes".
+      if (live.k === 1) {
+        g.globalAlpha = 0.25;
+        g.fillStyle = color;
+        g.beginPath();
+        g.arc(px, py, 13, 0, Math.PI * 2);
+        g.fill();
+        g.globalAlpha = 1;
+      }
       g.fillStyle = color;
       g.beginPath();
       g.arc(px, py, 7.5, 0, Math.PI * 2);
@@ -291,10 +330,19 @@ export class Lane {
       g.strokeStyle = C['lane-bg'];
       g.lineWidth = 2.5;
       g.stroke();
-      g.fillStyle = C.muted;
-      g.font = `700 11px ${font}`;
-      g.textAlign = 'left';
-      if (live.octave) g.fillText(live.octave < 0 ? '8vb' : '8va', px + 12, py - 12);
+      // The right note in another octave counts. The dot sits on the bar; a small note says why.
+      // It sits clear of the bar's own label, with a halo so bars behind it don't muddle it.
+      if (live.octave) {
+        const say = live.octave < 0 ? 'same note, lower' : 'same note, higher';
+        const sy = py < 30 ? py + 20 : py - 18;
+        g.font = `700 12px ${font}`;
+        g.textAlign = 'left';
+        g.lineWidth = 4;
+        g.strokeStyle = C['lane-bg'];
+        g.strokeText(say, px + 13, sy);
+        g.fillStyle = C.muted;
+        g.fillText(say, px + 13, sy);
+      }
       if (dm > vhi || dm < vlo) {
         const up = dm > vhi;
         g.fillStyle = C.fg;
@@ -395,7 +443,7 @@ export function drawOverview(canvas, results) {
     }
     for (const ev of st.events) {
       if (ev.role !== 'sing') continue;
-      const fam = family(ev.m, st.tonic);
+      const fam = family(ev.m, keyOf(ev, st));
       if (ev.m2 != null) {
         g.strokeStyle = C['bar-idle'];
         g.lineWidth = bh;
@@ -445,4 +493,143 @@ export function drawOverview(canvas, results) {
     g.globalAlpha = 1;
     off += st.end;
   });
+}
+
+// "See my song": a Free sing take as rounded note blocks on a pitch grid (time across, pitch
+// up), with the take's pitch line faint behind them, so slides show too. With a sure key each
+// block takes its scale-degree colour and the name Settings asks for; otherwise every block is
+// one warm neutral, named by letter. lit is the block playing now (-1 for none). A long take
+// scrolls sideways: each second gets about SONG_PPS pixels. Returns each block's [x0, x1]
+// in CSS pixels, so the page can keep the lit one in view.
+const SONG_PPS = 36;
+const SONG_MAX_W = 6000;
+export function drawSong(canvas, { notes, frames = [], key = null, names = 'letters', lit = -1, width }) {
+  const C = readTokens();
+  const plain = getComputedStyle(document.documentElement).getPropertyValue('--line-strong').trim() || C['bar-ghost'];
+  const font = C['font-body'] || 'system-ui, sans-serif';
+  const voiced = frames.filter((f) => f.m != null);
+  let t0 = Infinity, t1 = -Infinity;
+  for (const n of notes) {
+    t0 = Math.min(t0, n.t0);
+    t1 = Math.max(t1, n.t1);
+  }
+  if (voiced.length) {
+    t0 = Math.min(t0, voiced[0].t);
+    t1 = Math.max(t1, voiced[voiced.length - 1].t);
+  }
+  if (!isFinite(t0)) {
+    t0 = 0;
+    t1 = 1;
+  }
+  t0 = Math.max(0, t0 - 0.25);
+  t1 += 0.25;
+  // Pitch: the notes' span, or the middle of the line when there are no notes (one wild
+  // reading shouldn't squash the picture).
+  let lo = Infinity, hi = -Infinity;
+  for (const n of notes) {
+    lo = Math.min(lo, n.p);
+    hi = Math.max(hi, n.p);
+  }
+  if (!isFinite(lo)) {
+    const ms = voiced.map((f) => f.m).sort((a, b) => a - b);
+    lo = ms.length ? ms[Math.floor(ms.length * 0.05)] : 57;
+    hi = ms.length ? ms[Math.floor(ms.length * 0.95)] : 64;
+  }
+  if (hi - lo < 7) {
+    const pad = (7 - (hi - lo)) / 2;
+    lo -= pad;
+    hi += pad;
+  }
+  lo -= 1;
+  hi += 1;
+
+  const W0 = Math.max(40, width || canvas.parentElement.clientWidth);
+  // Fit the screen when that is nearly roomy enough, rather than scroll for the last few pixels.
+  const W = W0 / (t1 - t0) >= SONG_PPS * 0.75 ? W0 : Math.min(SONG_MAX_W, (t1 - t0) * SONG_PPS);
+  canvas.style.width = `${Math.round(W)}px`;
+  const H = Math.max(60, canvas.getBoundingClientRect().height);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  // Sizing a canvas rebuilds its memory (megabytes for a long take), so only when the size
+  // changes: lighting the next block during playback just draws again.
+  const cw = Math.round(W * dpr);
+  const ch = Math.round(H * dpr);
+  if (canvas.width !== cw) canvas.width = cw;
+  if (canvas.height !== ch) canvas.height = ch;
+  const g = canvas.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  g.fillStyle = C['lane-bg'];
+  g.fillRect(0, 0, W, H);
+  const padX = 8, top = 10, bot = H - 10;
+  const X = (t) => padX + ((t - t0) / (t1 - t0)) * (W - padX * 2);
+  const Y = (m) => bot - ((m - lo) / (hi - lo)) * (bot - top);
+  const rh = (bot - top) / (hi - lo);
+
+  // Rows: the key's scale notes (home a little stronger), or the white keys when the key isn't sure.
+  const sure = !!(key && key.enough);
+  const tonic = sure ? pc(key.tonic) : 0;
+  const scale = sure && key.mode === 'minor' ? MINOR : MAJOR;
+  for (let m = Math.ceil(lo); m <= Math.floor(hi); m++) {
+    const deg = pc(m - tonic);
+    if (!scale.includes(deg)) continue;
+    const strong = sure && deg === 0;
+    const yy = Math.round(Y(m)) + 0.5;
+    g.strokeStyle = strong ? C['lane-row-strong'] : C['lane-row'];
+    g.lineWidth = strong ? 1.5 : 1;
+    g.beginPath();
+    g.moveTo(0, yy);
+    g.lineTo(W, yy);
+    g.stroke();
+  }
+
+  // The pitch line, faint
+  g.strokeStyle = C.trace;
+  g.globalAlpha = 0.3;
+  g.lineWidth = 2;
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+  g.beginPath();
+  let prev = null;
+  for (const f of voiced) {
+    const px = X(f.t), py = Y(Math.max(lo + 0.2, Math.min(hi - 0.2, f.m)));
+    if (prev && f.t - prev.t < 0.1) g.lineTo(px, py);
+    else g.moveTo(px, py);
+    prev = f;
+  }
+  g.stroke();
+  g.globalAlpha = 1;
+
+  // The blocks, each named when its name fits inside it
+  // Taller than a row, so a name fits (neighbours a semitone apart never sound at the same
+  // time), but no taller than the tune's usual note is wide, so short notes stay round.
+  const widths = notes.map((n) => X(n.t1) - X(n.t0) - 2.5).sort((a, b) => a - b);
+  const usual = widths.length ? widths[widths.length >> 1] : Infinity;
+  const bh = Math.max(14, Math.min(28, rh * 1.45, usual + 2));
+  const flats = sure && prefersFlats(tonic, key.mode === 'minor');
+  g.font = `800 12px ${font}`;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  const xs = [];
+  notes.forEach((n, i) => {
+    const x0 = X(n.t0) + 1;
+    const w = Math.max(6, X(n.t1) - 1.5 - x0);
+    const yy = Y(n.p);
+    const fam = sure ? family(n.p, tonic) : null;
+    roundRect(g, x0, yy - bh / 2, w, bh, Math.min(bh / 2, 8));
+    g.fillStyle = fam ? C[fam] : plain;
+    g.fill();
+    if (i === lit) {
+      roundRect(g, x0 - 2.5, yy - bh / 2 - 2.5, w + 5, bh + 5, Math.min(bh / 2 + 2.5, 10));
+      g.strokeStyle = C.fg;
+      g.lineWidth = 2.5;
+      g.stroke();
+    }
+    const text = label(n.p, { tonic: sure ? tonic : null, flats, names: sure ? names : 'letters', octave: false });
+    if (g.measureText(text).width + 6 <= w) {
+      g.fillStyle = fam ? C['on-' + fam] : C.fg;
+      g.fillText(text, x0 + w / 2, yy + 0.5);
+    }
+    xs.push([x0, x0 + w]);
+  });
+  return xs;
 }

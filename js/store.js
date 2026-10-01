@@ -4,9 +4,18 @@ const KEY = 'note-by-note:v1';
 
 const DEFAULTS = () => ({
   range: null,
-  settings: { headphones: false, names: 'letters', strict: 'standard' },
+  rangeAt: null, // 'YYYY-MM-DD' when the range was last saved
+  rangePrev: null, // the range before that, {low, high}
+  rangeFrom: null, // 'test' | 'child' | 'high' | 'low'
+  // warmupLock: songs open only after today's warm-up (the grown-ups' switch in Settings).
+  settings: { headphones: false, names: 'letters', strict: 'standard', warmupLock: true },
   progress: {},
   days: [],
+  warm: null, // { day: 'YYYY-MM-DD', at: ms, heard: 0.86, ctl: 'bounce' }: the last warm-up that counted
+  nudge: {}, // { range: 'YYYY-MM-DD' } when the range re-test nudge was last put off
+  pin: null, // the grown-up PIN as { v, salt, hash } (js/pin.js), never the digits
+  pinLock: null, // wrong PINs: { fails, until, lockouts }, so a reload doesn't end a lockout
+  persistAsked: false, // navigator.storage.persist() asked once, after the first family song
 });
 
 function load() {
@@ -15,7 +24,10 @@ function load() {
     if (!raw) return DEFAULTS();
     const d = JSON.parse(raw);
     const base = DEFAULTS();
-    return { ...base, ...d, settings: { ...base.settings, ...(d.settings || {}) } };
+    const data = { ...base, ...d, settings: { ...base.settings, ...(d.settings || {}) } };
+    // Saves from before rangeAt existed start the re-test clock today, so there's no nag on first launch.
+    if (data.range && !data.rangeAt) data.rangeAt = today();
+    return data;
   } catch (e) {
     return DEFAULTS();
   }
@@ -34,8 +46,21 @@ export const store = {
     this.data.settings[k] = v;
     this.save();
   },
-  setRange(range) {
+  // from: 'test' for the range test, or the preset's key ('child', 'high', 'low').
+  setRange(range, from = 'test') {
+    this.data.rangePrev = this.data.range;
     this.data.range = range;
+    this.data.rangeAt = today();
+    this.data.rangeFrom = from;
+    this.save();
+  },
+  // A warm-up the app heard: it opens songs until local midnight.
+  setWarm(w) {
+    this.data.warm = w;
+    this.save();
+  },
+  putOffNudge(kind) {
+    this.data.nudge = { ...this.data.nudge, [kind]: today() };
     this.save();
   },
   record(id, score) {
@@ -50,10 +75,15 @@ export const store = {
     this.data.days = this.data.days.slice(-120);
     this.save();
   },
+  setPin(pin) {
+    this.data.pin = pin;
+    this.save();
+  },
+  // Clears scores and practice days. Resetting scores shouldn't lock songs again, so today's warm-up
+  // stays, and neither the PIN nor the family songs (which live in IndexedDB) are touched.
   reset() {
-    const range = this.data.range;
-    const settings = this.data.settings;
-    this.data = { ...DEFAULTS(), range, settings };
+    const { range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, pin, pinLock, persistAsked } = this.data;
+    this.data = { ...DEFAULTS(), range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, pin, pinLock, persistAsked };
     this.save();
   },
 };
@@ -65,16 +95,10 @@ export function today(d = new Date()) {
   return `${y}-${m}-${day}`;
 }
 
-export function streak(days) {
-  const set = new Set(days);
-  const d = new Date();
-  if (!set.has(today(d))) d.setDate(d.getDate() - 1);
-  let n = 0;
-  while (set.has(today(d))) {
-    n++;
-    d.setDate(d.getDate() - 1);
-  }
-  return n;
+// True once a warm-up has counted today. It resets at local midnight with no timer:
+// everything that shows or enforces the lock asks again when it renders or opens.
+export function warmedToday() {
+  return !!(store.data.warm && store.data.warm.day === today());
 }
 
 // Monday-first week with practised flags.

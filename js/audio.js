@@ -1,8 +1,10 @@
 // Microphone capture, pitch reading and a small synthesizer for guide notes,
-// piano chords and count-in clicks. Everything is generated in the browser.
+// piano chords, count-in clicks and a little drum kit. Everything is generated in the browser.
 
 import { createDetector, Tracker } from './pitch.js';
 import { midiToHz } from './music.js';
+
+const levelOf = (ev, fallback) => (Number.isFinite(ev.vel) ? ev.vel : fallback);
 
 function periodicWave(ctx, harmonics) {
   const imag = new Float32Array(harmonics);
@@ -239,12 +241,118 @@ export class AudioEngine {
     this.track(o);
   }
 
+  // Short noise, made once and shared by every snare and hi-hat.
+  noise() {
+    if (!this.noiseBuf) {
+      const ctx = this.ctx;
+      const b = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+      const d = b.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      this.noiseBuf = b;
+    }
+    return this.noiseBuf;
+  }
+
+  // Noise through a filter with a fast decay: the body of a snare or a hi-hat.
+  hiss(t, type, hz, level, decay) {
+    const ctx = this.ctx;
+    const bus = this.bus || this.openBus();
+    const n = ctx.createBufferSource();
+    n.buffer = this.noise();
+    const f = ctx.createBiquadFilter();
+    f.type = type;
+    f.frequency.value = hz;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(level, t + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0005, t + decay);
+    n.connect(f).connect(g).connect(bus);
+    // Start somewhere different in the noise each time so repeated hits don't sound pasted.
+    n.start(t, (t * 0.37) % 0.5, decay + 0.02);
+    this.track(n);
+  }
+
+  // A quick falling tone: a kick drum's thump, or the ring under a snare.
+  thump(t, from, to, level, decay) {
+    const ctx = this.ctx;
+    const bus = this.bus || this.openBus();
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(from, t);
+    o.frequency.exponentialRampToValueAtTime(to, t + decay * 0.5);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(level, t + 0.003);
+    g.gain.exponentialRampToValueAtTime(0.0005, t + decay);
+    o.connect(g).connect(bus);
+    o.start(t);
+    o.stop(t + decay + 0.02);
+    this.track(o);
+  }
+
+  // Drums for "play my tune as a song". A phone speaker can't play a kick's real 50 Hz
+  // thump, so its pitch drop starts high enough to hear (a triangle wave adds overtones)
+  // with a little click on top. All three stay well under the melody.
+  kick(t, vel = 0.8) {
+    this.thump(t, 190, 50, 0.32 * vel, 0.25);
+    this.hiss(t, 'bandpass', 2500, 0.03 * vel, 0.012);
+  }
+
+  snare(t, vel = 0.6) {
+    this.hiss(t, 'highpass', 1500, 0.13 * vel, 0.15);
+    this.thump(t, 230, 170, 0.08 * vel, 0.09);
+  }
+
+  hat(t, vel = 0.35) {
+    this.hiss(t, 'highpass', 7000, 0.06 * vel, 0.04);
+  }
+
   // Play one event from a lesson's audio list at an absolute context time.
+  // Song events (tune.js arrange()) carry a vel from 0 to 1; the levels here keep the
+  // tune on top, the chords soft and the drums quiet.
   play(ev, at) {
     if (ev.kind === 'guide') this.guide(ev.m, at, ev.d, ev.level);
     else if (ev.kind === 'glide') this.guide(ev.m, at, ev.d, ev.level, ev.m2);
     else if (ev.kind === 'piano') this.piano(ev.m, at, ev.d, ev.vel);
     else if (ev.kind === 'click') this.click(at, ev.accent);
+    else if (ev.kind === 'melody') this.piano(ev.m, at, ev.d, 0.13 * levelOf(ev, 0.9));
+    else if (ev.kind === 'bass') this.piano(ev.m, at, ev.d, 0.11 * levelOf(ev, 0.7));
+    else if (ev.kind === 'chord') for (const m of Array.isArray(ev.ms) ? ev.ms : []) this.piano(m, at, ev.d, 0.045 * levelOf(ev, 0.5));
+    else if (ev.kind === 'kick') this.kick(at, levelOf(ev, 0.8));
+    else if (ev.kind === 'snare') this.snare(at, levelOf(ev, 0.6));
+    else if (ev.kind === 'hat') this.hat(at, levelOf(ev, 0.35));
+  }
+
+  // Play an arranged song (tune.js arrange()) starting at context time `at`, on a fresh bus
+  // (like a lesson step). Events go to the synth a moment ahead in small batches, so a long
+  // song never builds thousands of nodes at once. Every node is tracked: stop() (or
+  // closeBus()) silences it at once and ends the batches.
+  playSong(song, at = this.ctx.currentTime + 0.1) {
+    const bus = this.openBus();
+    const evs = (song.events || []).slice().sort((a, b) => a.t - b.t);
+    let i = 0;
+    let timer = null;
+    const pump = () => {
+      if (this.bus !== bus) return clearInterval(timer);
+      const now = this.ctx.currentTime;
+      while (i < evs.length && at + evs[i].t < now + 1.5) {
+        const ev = evs[i++];
+        const when = at + ev.t;
+        // Missed while the page was busy: skip it rather than play a pile-up.
+        if (when >= now - 0.02) this.play(ev, Math.max(when, now + 0.005));
+      }
+      if (i >= evs.length) clearInterval(timer);
+    };
+    timer = setInterval(pump, 250);
+    pump();
+    return {
+      at,
+      end: at + (song.duration || 0),
+      stop: () => {
+        if (this.bus === bus) this.closeBus();
+        clearInterval(timer);
+      },
+    };
   }
 
   // A quick note for previews (e.g. hearing the edges of your range).
