@@ -1,11 +1,14 @@
 import { AudioEngine } from './audio.js';
 import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './lessons.js';
-import { SONGS, buildSong, difficulty, songGlyph } from './songs.js';
+import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer } from './songs.js';
 import { Lane, drawOverview, drawSong } from './lane.js';
-import { letterName, label, family, prefersFlats, pc } from './music.js';
+import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, fitShift } from './music.js';
 import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, offWords } from './score.js';
 import { store, today, week, warmedToday } from './store.js';
 import { findNotes, findKey, quantize, harmonize, arrange, describe, TEMPOS } from './tune.js';
+import { writeFamilySongFile, familySongFileName, validateSong, isFamilySongId, SONG_LIMITS } from './nbn.js';
+import { library, askToPersist } from './library.js';
+import { makePin, checkPin, isPinShape, pinSupported } from './pin.js';
 import { ICON, PHASE_ICON, MARK, SQUIGGLE, STAFF, BURST, AROUND, confetti, rating, hum, WARM_STEPS, CONTROL_STEP, MOVE_ART, moveRing } from './art.js';
 
 const audio = new AudioEngine();
@@ -379,6 +382,14 @@ function settingsSheet(gate = null) {
     }
     <p class="lock-note">This is a gentle nudge, not a real lock. I check that someone sang along with the warm-up, but I can’t be certain.</p>
     <div class="field">
+      <div><b>Family songs</b><p>${familyState === 'unavailable' ? 'Can’t be saved in this browser window.' : `${familySongs.length || 'None'} on this phone. Songs you’ve bought, kept private.`}</p></div>
+      ${familyState === 'unavailable' ? '' : '<button class="btn small secondary" data-act="fam-add">Add a song</button>'}
+    </div>
+    <div class="field">
+      <div><b>Grown-up PIN</b><p>${store.data.pin ? 'Set. Needed to add, move or delete family songs, and to turn off the warm-up switch.' : 'Not set yet. I’ll ask for one the first time a grown-up needs it.'}</p></div>
+      <button class="btn small secondary" data-act="pin-change">${store.data.pin ? 'Change PIN' : 'Set PIN'}</button>
+    </div>
+    <div class="field">
       <div><b>Reset progress</b><p>Clears scores and practice days. Keeps the range.</p></div>
       <button class="btn small danger" data-act="reset">Reset</button>
     </div>
@@ -416,10 +427,24 @@ function settingsSheet(gate = null) {
         settingsSheet();
       },
       care: () => careSheet(null, () => settingsSheet()),
-      // On: switching off shows the grown-up check (tapping again cancels it). Off: back on straight away.
+      // On: switching off shows the grown-up check (tapping again cancels it): the PIN once there is
+      // one, otherwise a times-table sum. Off: back on straight away.
       'lock-switch': () => {
         if (!lockEnabled()) store.setSetting('warmupLock', true);
-        else if (!gate) {
+        else if (store.data.pin) {
+          return grownUp({
+            why: 'Enter your PIN to turn off “Warm-up before songs”.',
+            then: () => {
+              store.setSetting('warmupLock', false);
+              settingsSheet();
+              focusIn('[data-act="lock-switch"]');
+            },
+            back: () => {
+              settingsSheet();
+              focusIn('[data-act="lock-switch"]');
+            },
+          });
+        } else if (!gate) {
           settingsSheet(newGate());
           return focusIn('#gate');
         }
@@ -427,6 +452,7 @@ function settingsSheet(gate = null) {
         focusIn('[data-act="lock-switch"]');
       },
       gate: () => checkGate(),
+      'pin-change': () => changePin(),
     },
     { label: 'Settings', key: 'settings', cls: 'settings', onClose: () => current && current.refresh && current.refresh() }
   );
@@ -601,6 +627,7 @@ window.addEventListener('popstate', () => {
 function openItem(kind, id) {
   if (kind === 'free') return show(freeCtrl());
   if (kind === 'lesson' && id === 'range') return show(rangeCtrl());
+  if (kind === 'song' && !findSong(id)) return;
   if (kind === 'song' && !songsUnlocked()) return lockSheet({ kind, id });
   if (!store.data.range) {
     pendingOpen = { kind, id };
@@ -681,6 +708,8 @@ const GLOBAL = {
     closeSheet(true);
     show(rangeCtrl(), !(current && current.name === 'range'));
   },
+  'fam-add': () => familyAdd(),
+  'fam-menu': (el) => familyMenu(el.dataset.id),
   preset: (el) => {
     const relaxed = applyPreset(el.dataset.v);
     closeSheet(true);
@@ -1012,6 +1041,49 @@ function lessonsHTML(unit) {
     </section>`;
 }
 
+// One song in a list. Family songs get a small grown-ups' button beside the row (PIN first).
+function songRowHTML(s, locked, fam = false) {
+  const gl = songGlyph(s);
+  const diff = difficulty(s);
+  const row = `<button class="srow" data-act="open" data-kind="song" data-id="${esc(s.id)}"${locked ? ` aria-label="${esc(s.title)}, ${diff}, locked until you warm up"` : ''}>
+      <span class="gtile">${glyphSVG(gl, gl.songTonicOffset)}</span>
+      <span><span class="ttl">${esc(s.title)}</span><span class="meta"><span class="diff ${diff.toLowerCase()}">${diff}</span></span></span>
+      ${locked ? `<span class="lockpill">${ICON.lock}</span>` : badgeHTML('song:' + s.id)}
+    </button>`;
+  if (!fam) return `<li>${row}</li>`;
+  return `<li class="fam-item">${row}<button class="fam-more" data-act="fam-menu" data-id="${esc(s.id)}" aria-label="Grown-ups: change ${esc(s.title)}">${ICON_MORE}</button></li>`;
+}
+
+const FAMILY_FOOT = 'These songs are private to your family. They stay on this phone and are never shared by the app.';
+
+// Family songs: above the built-in songs once there are some; before that, a small card for
+// grown-ups below them.
+function familyHTML(locked) {
+  if (familyState === 'loading') return '';
+  if (familyState === 'unavailable') {
+    return `<section class="card fam-empty" aria-labelledby="fam-h">
+        <h2 id="fam-h">Family songs</h2>
+        <p>${esc(LIBRARY_OFF)}</p>
+      </section>`;
+  }
+  if (!familySongs.length) {
+    return `<section class="card fam-empty" aria-labelledby="fam-h">
+        <h2 id="fam-h">Family songs</h2>
+        <p>Grown-ups can add a song they’ve bought, like a karaoke file or sheet music. It stays on this phone only.</p>
+        <button class="btn secondary" data-act="fam-add">${ICON_PLUS}Add a song</button>
+      </section>`;
+  }
+  const rows = familySongs.map((r) => songRowHTML(r.song, locked, true)).join('');
+  return `<section class="family" aria-labelledby="fam-h">
+      <div class="section-label"><h2 id="fam-h">Family songs</h2><p class="only-here">${ICON.lock}Only on this phone</p></div>
+      <ol class="song-list${locked ? ' locked' : ''}">${rows}</ol>
+      <div class="fam-foot">
+        <p>${FAMILY_FOOT}</p>
+        <button class="btn small secondary" data-act="fam-add">${ICON_PLUS}Add a song</button>
+      </div>
+    </section>`;
+}
+
 function songsHTML() {
   const locked = !songsUnlocked();
   const banner = locked
@@ -1023,19 +1095,14 @@ function songsHTML() {
         <button class="care" data-act="care" data-v="rest">Throat sore today? Rest your voice</button>
       </section>`
     : '';
-  const rows = SONGS.map((s) => {
-    const gl = songGlyph(s);
-    const diff = difficulty(s);
-    return `<li><button class="srow" data-act="open" data-kind="song" data-id="${s.id}"${locked ? ` aria-label="${esc(s.title)}, ${diff}, locked until you warm up"` : ''}>
-      <span class="gtile">${glyphSVG(gl, gl.songTonicOffset)}</span>
-      <span><span class="ttl">${esc(s.title)}</span><span class="meta"><span class="diff ${diff.toLowerCase()}">${diff}</span></span></span>
-      ${locked ? `<span class="lockpill">${ICON.lock}</span>` : badgeHTML('song:' + s.id)}
-    </button></li>`;
-  }).join('');
+  const rows = SONGS.map((s) => songRowHTML(s, locked)).join('');
+  const hasFamily = familyState === 'ready' && familySongs.length > 0;
   return `<header class="top"><div><h1>Songs</h1><p class="sub">Each one opens in your key.</p></div></header>
     ${banner}
+    ${hasFamily ? familyHTML(locked) : ''}
     <div class="section-label"><h2>All songs</h2><p>${SONGS.length} songs</p></div>
-    <ol class="song-list${locked ? ' locked' : ''}">${rows}</ol>`;
+    <ol class="song-list${locked ? ' locked' : ''}">${rows}</ol>
+    ${hasFamily ? '' : familyHTML(locked)}`;
 }
 
 function tabbarHTML(active) {
@@ -1110,7 +1177,7 @@ function buildPlan(kind, id, mode) {
     return { id: 'warmup', title: WARMUP.title, ctl: controlFor(date), steps: WARMUP.build(range, date) };
   }
   if (kind === 'song') {
-    const song = SONGS.find((s) => s.id === id);
+    const song = findSong(id);
     return { id: 'song:' + id, title: song.title, song, steps: buildSong(song, range, { mode, headphones: S().headphones }) };
   }
   const L = LESSONS[id];
@@ -1124,8 +1191,10 @@ function nextAfter(kind, id) {
     return nx ? { kind: 'lesson', id: nx, title: LESSONS[nx].title } : null;
   }
   if (kind === 'song') {
-    const i = SONGS.findIndex((s) => s.id === id);
-    const nx = SONGS[i + 1];
+    // Built-in songs lead on to the next built-in one, family songs to the next family song.
+    const list = isFamilySongId(id) ? familySongs.map((r) => r.song) : SONGS;
+    const i = list.findIndex((s) => s.id === id);
+    const nx = i >= 0 ? list[i + 1] : null;
     return nx ? { kind: 'song', id: nx.id, title: nx.title } : null;
   }
   return null;
@@ -1838,7 +1907,7 @@ function playerCtrl({ kind, id }) {
   // settled: shown again (after the care sheet or "Later"), so no confetti the second time.
   function warmupSheet(sum, check, settled = false) {
     const lock = lockEnabled();
-    const song = forSong && SONGS.find((x) => x.id === forSong.id);
+    const song = forSong && findSong(forSong.id);
     const acts = {
       again: () => {
         closeSheet(true);
@@ -1932,8 +2001,12 @@ function playerCtrl({ kind, id }) {
 
   async function copyReport(btn, sum) {
     const range = store.data.range;
+    // A family song's words never leave the app; its title is marked as a family song.
+    const fam = !!(plan.song && isFamilySongId(plan.song.id));
+    const how = plan.song ? (mode === 'learn' ? 'line by line' : 'sung through') : '';
     const text = reportText({
-      title: plan.title + (plan.song ? (mode === 'learn' ? ' (line by line)' : ' (sung through)') : ''),
+      title: plan.title + (fam ? ` (family song, ${how})` : how ? ` (${how})` : ''),
+      family: fam,
       sum,
       range,
       rangeFrom: store.data.rangeFrom,
@@ -2073,6 +2146,7 @@ function playerCtrl({ kind, id }) {
 
 function openItemReplace(kind, id) {
   // Swap the current screen without growing the history stack.
+  if (kind === 'song' && !findSong(id)) return;
   if (kind === 'song' && !songsUnlocked()) return lockSheet({ kind, id });
   if (!store.data.range) return openItem(kind, id);
   if (current && current.destroy) current.destroy();
@@ -2819,6 +2893,828 @@ function freeCtrl() {
   };
 }
 
+// ---------- Family songs (private, on this phone only) ----------
+// A grown-up imports a song file they bought (karaoke MIDI or MusicXML, js/import.js) and it is
+// kept in IndexedDB on this phone (js/library.js): only the melody and words, never the file.
+// Adding, moving and deleting need the grown-up PIN (js/pin.js). Moving sends a private .nbn
+// file (js/nbn.js) through the share sheet, then deletes the song here once it has arrived.
+// Every string from a file is escaped before it reaches the page.
+
+const ICON_MORE = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.9" fill="currentColor"/><circle cx="12" cy="12" r="1.9" fill="currentColor"/><circle cx="18" cy="12" r="1.9" fill="currentColor"/></svg>`;
+const ICON_PLUS = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M12 5.5v13M5.5 12h13"/></svg>`;
+const ICON_SEND = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 15V4M7.5 8.5 12 4l4.5 4.5M6 12.5v5a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-5"/></svg>`;
+
+const NOTICE_ADD = 'Only add a song file that you bought or have permission to use. Family songs are saved only on this phone. Note by Note never uploads them, and they are never part of the public app or website.';
+const NOTICE_SEND = 'Only send songs to phones belonging to your own family. Song shops usually allow personal use only, and some don’t allow extra copies. Moving the song (not copying it) is the safest choice. Never post song files online or share them outside your family.';
+const LIBRARY_OFF = 'Family songs can’t be saved in this browser window. Private Browsing turns saving off: open Note by Note from the Home Screen, or in a normal Safari tab.';
+const FILE_MAX = 16 * 1024 * 1024; // bigger than any song file (the importers have their own limits)
+const PIECE_LINES = 16; // a part offered on its own: up to this many lines
+
+let familySongs = []; // library records, oldest first
+let familyState = 'loading'; // 'loading' | 'ready' | 'unavailable'
+let famInput = null; // the hidden file picker
+let pinFails = 0;
+let pinWaitUntil = 0;
+
+const findSong = (id) => SONGS.find((s) => s.id === id) || (familySongs.find((r) => r.id === id) || {}).song || null;
+const findRecord = (id) => familySongs.find((r) => r.id === id) || null;
+
+async function loadFamily() {
+  try {
+    familySongs = await library.list();
+    familyState = 'ready';
+  } catch (e) {
+    familySongs = [];
+    familyState = 'unavailable';
+  }
+  if (current && current.name === 'home' && !sheet && current.refresh) current.refresh();
+}
+
+function refreshHome() {
+  if (current && current.name === 'home' && current.refresh) current.refresh();
+}
+
+// Songs from files often have no chord symbols: the piano then follows tune.js's harmonize(),
+// about one chord a bar. A short first bar (a pickup) is lined up first so the chords fall on
+// the bars the file had.
+function familyChords(mel, song) {
+  if (!isFamilySongId(song.id) || !mel.notes.length) return [];
+  const bpb = Math.max(1, Math.round(song.meter));
+  let pre = 0;
+  let bar = false;
+  for (const tok of song.melody.trim().split(/\s+/)) {
+    if (tok === '|') {
+      bar = true;
+      break;
+    }
+    if (tok === '//') continue;
+    const d = tok.split('/')[1];
+    pre += d ? Number(d) : 1;
+  }
+  const pickup = bar && pre > 0 && pre < bpb - 1e-6 ? bpb - pre : 0;
+  const q = { beatsPerBar: bpb, notes: mel.notes.map((n) => ({ beat: n.beat + pickup, beats: n.beats, p: n.m })) };
+  const out = [];
+  for (const c of harmonize(q)) {
+    const a = Math.max(0, c.beat - pickup);
+    const z = c.beat - pickup + c.beats;
+    if (z <= a) continue;
+    // Bare fifths (key in doubt) play as the major chord: the voicing has no fifths-only shape.
+    out.push({ root: ((c.root % 12) + 12) % 12, quality: c.quality === 'm' ? 'm' : '', beat: a, beats: z - a });
+  }
+  return out;
+}
+setHarmonizer(familyChords);
+
+// The words of some lyric tokens, as a child reads them.
+function wordsOfTokens(tokens) {
+  let s = '';
+  for (const t of tokens) {
+    if (t === '~') continue;
+    if (t.endsWith('=')) s += t.slice(0, -1) + '-';
+    else if (t.endsWith('-')) s += t.slice(0, -1);
+    else s += t + ' ';
+  }
+  return s.replace(/‿/g, ' ').trim();
+}
+
+function firstLines(song, n = 2) {
+  if (!song.lyrics) return [];
+  const mel = parseMelody(song.melody);
+  const toks = parseLyrics(song.lyrics);
+  return mel.phrases.slice(0, n).map(([a, z]) => wordsOfTokens(toks.slice(a, z)));
+}
+
+const shortDate = (iso) => {
+  const t = Date.parse(iso || '');
+  return Number.isFinite(t) ? new Date(t).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+};
+
+// ---- The grown-up PIN ----
+
+// Ask for the grown-up PIN (or set one up the first time), then run then().
+// why: one sentence for the grown-up. back(): where Cancel goes (default: just close).
+function grownUp({ why, then, back = null }) {
+  pinSheet({ mode: store.data.pin ? 'check' : 'new', why, then, back });
+}
+
+function changePin() {
+  const back = () => settingsSheet();
+  const setNew = () => pinSheet({ mode: 'new', then: back, back });
+  if (store.data.pin) grownUp({ why: 'Enter your PIN first.', then: setNew, back });
+  else setNew();
+}
+
+// mode: 'check' | 'new' | 'again' (first: the PIN typed in 'new'). msg: a kind word on a miss.
+function pinSheet(o) {
+  const { mode, why, then, back, first = null, msg = '' } = o;
+  if (!pinSupported()) {
+    openSheet(
+      `<h2>Grown-ups only</h2>
+       <p>This browser window can’t keep a PIN safe. Open Note by Note from the Home Screen, then try again.</p>
+       <button class="btn primary wide" data-act="pin-cancel">OK</button>`,
+      { 'pin-cancel': () => (back ? back() : closeSheet()) },
+      { label: 'Grown-up PIN', key: 'pin', cls: 'pin' }
+    );
+    return;
+  }
+  const waiting = mode === 'check' && Date.now() < pinWaitUntil;
+  const head =
+    mode === 'check'
+      ? `<h2>Grown-ups only</h2><p>${esc(why)}</p>`
+      : mode === 'new'
+        ? `<h2>${store.data.pin ? 'Choose a new PIN' : 'Set a grown-up PIN'}</h2><p>Choose 4 numbers that only grown-ups know. You’ll need them to add, move or delete family songs, and to turn off the warm-up switch.</p>`
+        : `<h2>Type it again</h2><p>The same 4 numbers, so I know they’re right.</p>`;
+  const label = mode === 'check' ? 'PIN' : mode === 'new' ? 'New PIN' : 'New PIN again';
+  const go = mode === 'check' ? 'Continue' : mode === 'new' ? 'Next' : 'Save PIN';
+  const bd = openSheet(
+    `<div class="pin-art" aria-hidden="true">${ICON.lock}</div>
+     ${head}
+     <label class="pin-label" for="pin">${label}</label>
+     <input id="pin" class="pin-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="done"${waiting ? ' disabled' : ''}${msg ? ' aria-describedby="pin-msg"' : ''}>
+     ${msg ? `<p class="err" id="pin-msg" role="alert">${esc(msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="pin-cancel">Cancel</button>
+       <button class="btn primary" data-act="pin-go"${waiting ? ' disabled' : ''}>${go}</button>
+     </div>
+     ${mode === 'check' ? '<button class="quiet-link pin-forgot" data-act="pin-forgot">Forgot PIN?</button>' : ''}`,
+    {
+      'pin-go': () => submit(),
+      'pin-cancel': () => (back ? back() : closeSheet()),
+      'pin-forgot': () => forgotPinSheet(o),
+    },
+    { label: 'Grown-up PIN', key: 'pin', cls: 'pin' }
+  );
+  const input = bd.querySelector('#pin');
+  let busy = false;
+  async function submit() {
+    if (busy || !input || input.disabled) return;
+    const v = input.value.trim();
+    if (!isPinShape(v)) {
+      pinSheet({ ...o, msg: 'A PIN is 4 numbers.' });
+      return focusIn('#pin');
+    }
+    if (mode === 'new') {
+      pinSheet({ ...o, mode: 'again', first: v, msg: '' });
+      return focusIn('#pin');
+    }
+    if (mode === 'again') {
+      if (v !== first) {
+        pinSheet({ ...o, mode: 'new', first: null, msg: 'Those didn’t match. Choose a PIN again.' });
+        return focusIn('#pin');
+      }
+      busy = true;
+      store.setPin(await makePin(v));
+      pinFails = 0;
+      return then();
+    }
+    busy = true;
+    const ok = await checkPin(store.data.pin, v);
+    busy = false;
+    if (!sheet || sheet.key !== 'pin') return; // closed while checking
+    if (ok) {
+      pinFails = 0;
+      return then();
+    }
+    pinFails++;
+    if (pinFails >= 5) {
+      pinFails = 0;
+      pinWaitUntil = Date.now() + 30000;
+      setTimeout(() => {
+        if (sheet && sheet.key === 'pin') pinSheet({ ...o, msg: '' });
+      }, 30000);
+      pinSheet({ ...o, msg: 'Too many tries. Wait 30 seconds, then try again.' });
+      return;
+    }
+    pinSheet({ ...o, msg: 'That’s not the PIN. Try again.' });
+    focusIn('#pin');
+  }
+  if (input) {
+    // Keep it to digits, and go on by itself once there are four.
+    input.addEventListener('input', () => {
+      const d = input.value.replace(/\D/g, '').slice(0, 4);
+      if (d !== input.value) input.value = d;
+      if (d.length === 4) submit();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submit();
+      }
+    });
+    if (!waiting) input.focus({ preventScroll: true });
+  }
+}
+
+function forgotPinSheet(o) {
+  let armed = false;
+  const n = familySongs.length;
+  openSheet(
+    `<h2>Forgot the PIN?</h2>
+     <p>I can reset it, but resetting the PIN also deletes ${n ? `all ${n === 1 ? 'the family song' : `${n} family songs`}` : 'every family song'} on this phone. That way a reset can’t be used to get around the PIN.</p>
+     <p class="muted">To add songs again afterwards, use the files you bought.</p>
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="pin-keep">Go back</button>
+       <button class="btn danger" data-act="pin-reset">Reset PIN</button>
+     </div>`,
+    {
+      'pin-keep': () => pinSheet({ ...o, mode: 'check', msg: '' }),
+      'pin-reset': async (btn) => {
+        if (!armed) {
+          armed = true;
+          btn.textContent = 'Tap to delete songs';
+          return;
+        }
+        btn.disabled = true;
+        try {
+          await library.clear();
+        } catch (e) {
+          /* nothing to delete, or no storage: the PIN still resets */
+        }
+        for (const r of familySongs) delete store.data.progress['song:' + r.id];
+        familySongs = [];
+        store.setPin(null);
+        pinFails = 0;
+        pinWaitUntil = 0;
+        refreshHome();
+        pinSheet({ ...o, mode: 'new', msg: '' });
+      },
+    },
+    { label: 'Forgot PIN', key: 'pin-forgot', cls: 'pin-forgot-sheet' }
+  );
+}
+
+// ---- Adding a song ----
+
+function familyAdd() {
+  if (familyState === 'unavailable') {
+    openSheet(`<h2>Family songs</h2><p>${esc(LIBRARY_OFF)}</p><button class="btn primary wide" data-act="sheet-close">OK</button>`, {}, { label: 'Family songs' });
+    return;
+  }
+  grownUp({ why: 'Enter your PIN to add a song.', then: () => addSheet() });
+}
+
+function addSheet(msg = '') {
+  openSheet(
+    `<p class="eyebrow">Family songs</p>
+     <h2>Add a song from a file</h2>
+     <p class="notice">${NOTICE_ADD}</p>
+     ${msg ? `<p class="err" role="alert">${esc(msg)}</p>` : ''}
+     <button class="btn primary big wide" data-act="fam-pick">${ICON_PLUS}Choose a file</button>
+     <details class="fam-help">
+       <summary>Where to get songs${ICON.chev}</summary>
+       <ol class="fam-steps">
+         <li><b>Buy the song</b> in Safari: at <b>midi.com.au</b> (Hit Trax), one marked “Karaoke Lyrics” with a melody guide. Or on <b>musescore.com</b> with MuseScore PRO, a score that shows the words under the singer’s notes: tap Download, then MusicXML.</li>
+         <li><b>Save it to Files.</b> Tap Download. It goes to Files, in Downloads. If it’s a .zip, tap it once in Files to unzip it.</li>
+         <li><b>Come back here</b>, tap Choose a file and pick it. I’ll show you the song before it’s added.</li>
+       </ol>
+       <p class="muted">From another family phone? Save the .nbn file to Files, then choose it here.</p>
+     </details>
+     <button class="btn text wide" data-act="sheet-close">Cancel</button>`,
+    {
+      'fam-pick': () => pickFile(),
+    },
+    { label: 'Add a song', key: 'fam-add', cls: 'fam' }
+  );
+}
+
+// No accept filter: iOS greys out file types it doesn't know (.kar, .mxl, .nbn) when there is one.
+function pickFile() {
+  if (!famInput) {
+    famInput = document.createElement('input');
+    famInput.type = 'file';
+    famInput.className = 'fam-input';
+    famInput.tabIndex = -1;
+    famInput.setAttribute('aria-hidden', 'true');
+    famInput.addEventListener('change', () => {
+      const f = famInput.files && famInput.files[0];
+      famInput.value = '';
+      if (f) readFamilyFile(f);
+    });
+    document.body.appendChild(famInput);
+  }
+  famInput.value = '';
+  famInput.click();
+}
+
+const isNbnBytes = (b) => {
+  let i = b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf ? 3 : 0;
+  while (i < b.length && i < 64 && (b[i] === 0x20 || b[i] === 0x09 || b[i] === 0x0a || b[i] === 0x0d)) i++;
+  return b[i] === 0x7b;
+};
+
+// A kind message for anything that goes wrong while reading a file. Never a stack trace.
+// (ImportError messages are already kind and are shown as they are, by the caller.)
+function importMessage(e) {
+  if (e && e.code === 'unavailable') return LIBRARY_OFF;
+  return 'I couldn’t read this file. It may be damaged: try downloading it again.';
+}
+
+async function readFamilyFile(file) {
+  openSheet(`<h2>Reading the song…</h2><p class="muted">${esc(cleanName(file.name))}</p>`, {}, { label: 'Reading', key: 'fam-add', cls: 'fam', dismissable: false });
+  try {
+    if (!file.size) throw new Error('empty');
+    if (file.size > FILE_MAX) return addSheet('This file is too big to be a song file.');
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const imp = await import('./import.js');
+    let result;
+    try {
+      result = await imp.importSongFile(bytes, file.name);
+    } catch (e) {
+      return addSheet(e instanceof imp.ImportError ? e.message : importMessage(e));
+    }
+    if (!sheet || sheet.key !== 'fam-add') return; // closed meanwhile
+    previewSheet({ imp, bytes, name: file.name, result, viaNbn: isNbnBytes(bytes) });
+  } catch (e) {
+    addSheet(file.size ? importMessage(e) : 'This file is empty.');
+  }
+}
+
+const cleanName = (s) => String(s || '').replace(/[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, '').slice(0, 120);
+
+// The parts a grown-up can choose from a long song: each section, two sections in a row
+// (often a verse and its chorus) and, when it fits, the whole song.
+function pieceOptions(result) {
+  const { sections, fits, long } = result;
+  const lines = result.stats.lines;
+  if (fits && !long) return [{ from: 0, to: lines - 1, whole: true }];
+  const out = [];
+  if (fits) out.push({ from: 0, to: lines - 1, whole: true });
+  sections.forEach((s, i) => {
+    out.push({ from: s.from, to: s.to, sec: s });
+    const nx = sections[i + 1];
+    if (nx && nx.to - s.from + 1 <= PIECE_LINES) out.push({ from: s.from, to: nx.to, sec: s, end: nx, pair: true });
+  });
+  return out;
+}
+
+function pieceLabel(p) {
+  if (p.whole) return 'The whole song';
+  const a = p.from + 1;
+  const b = p.to + 1;
+  const lines = a === b ? `Line ${a}` : `Lines ${a}–${b}`;
+  const first = p.sec.firstBar;
+  const last = (p.end || p.sec).lastBar;
+  const bars = first && last ? ` (bars ${first}–${last})` : '';
+  return `${lines}${bars}${p.sec.words ? `: “${p.sec.words}”` : ''}`;
+}
+
+// The first verse and chorus when there are sections to pair, or the first part.
+function defaultPiece(opts) {
+  if (opts.length === 1) return 0;
+  const pair = opts.findIndex((p) => p.pair && p.from === 0);
+  if (pair >= 0) return pair;
+  const first = opts.findIndex((p) => !p.whole);
+  return first >= 0 ? first : 0;
+}
+
+let preview = null; // the playing preview: { handle, timer }
+function stopPreview() {
+  if (!preview) return;
+  clearTimeout(preview.timer);
+  try {
+    preview.handle.stop();
+  } catch (e) {
+    /* already stopped */
+  }
+  preview = null;
+}
+
+// The tune on the piano, in the singer's key when there's a range.
+function playTune(song, onEnd) {
+  stopPreview();
+  if (!audio.unlock()) return false;
+  const mel = parseMelody(song.melody);
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const n of mel.notes) {
+    lo = Math.min(lo, n.m);
+    hi = Math.max(hi, n.m);
+  }
+  const range = store.data.range;
+  const shift = range ? fitShift(range, lo, hi) : 0;
+  const spb = 60 / song.bpm;
+  const events = mel.notes.map((n) => ({ t: n.beat * spb, d: n.beats * spb, kind: 'melody', m: n.m + shift, vel: 0.9 }));
+  const duration = mel.totalBeats * spb + 0.6;
+  const handle = audio.playSong({ events, duration });
+  preview = { handle, timer: setTimeout(() => (stopPreview(), onEnd && onEnd()), duration * 1000 + 300) };
+  return true;
+}
+
+// pv: { imp, bytes, name, result, viaNbn, title?, pick?, msg? }
+function previewSheet(pv) {
+  stopPreview();
+  const { result } = pv;
+  if (pv.title == null) pv.title = result.song.title;
+  const opts = pieceOptions(result);
+  if (pv.pick == null || pv.pick >= opts.length) pv.pick = defaultPiece(opts);
+  const opt = opts[pv.pick];
+  let piece;
+  try {
+    piece = opt.whole ? { ...result.song } : pv.imp.sliceSong(result.song, opt.from, opt.to);
+  } catch (e) {
+    piece = { ...result.song };
+  }
+  const { stats } = pv.imp.songSections(piece);
+  const lines = firstLines(piece);
+  const choices = result.choices || [];
+  const chosen = choices.find((c) => c.chosen);
+  const warnings = (result.warnings || []).filter(Boolean);
+  const html = `
+    <p class="eyebrow">New family song</p>
+    <h2>Check the song</h2>
+    <div class="fam-field">
+      <label for="fam-title">Title</label>
+      <input id="fam-title" class="text-input" type="text" maxlength="${SONG_LIMITS.title}" autocomplete="off" value="${esc(pv.title)}">
+      <p class="muted">From the file “${esc(cleanName(pv.name))}”</p>
+    </div>
+    <div class="stats four">
+      <div><b>${stats.notes}</b><span>notes</span></div>
+      <div><b>${stats.lines}</b><span>${stats.lines === 1 ? 'line' : 'lines'}</span></div>
+      <div><b>${clock(stats.seconds)}</b><span>long</span></div>
+      <div><b>${letterName(stats.low)}–${letterName(stats.high)}</b><span>lowest to highest</span></div>
+    </div>
+    <div class="fam-words">
+      <h3>${lines.length ? 'How it starts' : 'No words'}</h3>
+      ${lines.length ? lines.map((l) => `<p>${esc(l)}</p>`).join('') : '<p>This file has no words, so it will be sung on “la”.</p>'}
+    </div>
+    <button class="btn secondary wide" data-act="fam-play" aria-pressed="${!!preview}">${ICON.play}<span>Play the tune</span></button>
+    ${
+      choices.length > 1
+        ? `<div class="fam-field">
+            <label for="fam-melody">Tune from</label>
+            <select id="fam-melody" class="select">${choices.map((c) => `<option value="${esc(c.id)}"${c === chosen ? ' selected' : ''}>${esc(c.label)}${Number.isFinite(c.notes) ? ` · ${c.notes} notes` : ''}</option>`).join('')}</select>
+            <p class="muted">Wrong tune? Pick another part of the file.</p>
+          </div>`
+        : ''
+    }
+    ${
+      opts.length > 1
+        ? `<div class="fam-field">
+            <label for="fam-part">Part to learn</label>
+            <select id="fam-part" class="select">${opts.map((p, i) => `<option value="${i}"${i === pv.pick ? ' selected' : ''}>${esc(pieceLabel(p))}</option>`).join('')}</select>
+            <p class="muted">${result.fits ? 'This is a long song. A verse and chorus is plenty to learn at once.' : 'This song is too long to keep whole. Pick a part, like a verse and chorus.'}</p>
+          </div>`
+        : ''
+    }
+    ${warnings.length ? `<div class="fam-warn"><h3>Good to know</h3><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
+    <p class="notice">${NOTICE_ADD}</p>
+    ${pv.msg ? `<p class="err" role="alert">${esc(pv.msg)}</p>` : ''}
+    <div class="sheet-actions">
+      <button class="btn secondary" data-act="fam-cancel">Cancel</button>
+      <button class="btn primary" data-act="fam-save">Add song</button>
+    </div>`;
+  const setPlayBtn = (btn, on) => {
+    btn.setAttribute('aria-pressed', String(on));
+    btn.innerHTML = on ? `${ICON.stop}<span>Stop</span>` : `${ICON.play}<span>Play the tune</span>`;
+  };
+  const bd = openSheet(
+    html,
+    {
+      'fam-play': (btn) => {
+        if (preview) {
+          stopPreview();
+          return setPlayBtn(btn, false);
+        }
+        if (playTune(piece, () => btn.isConnected && setPlayBtn(btn, false))) setPlayBtn(btn, true);
+      },
+      'fam-cancel': () => {
+        stopPreview();
+        closeSheet();
+      },
+      'fam-save': (btn) => saveFamily(pv, piece, btn),
+    },
+    { label: 'Check the song', key: 'fam-preview', cls: 'fam', onClose: () => stopPreview() }
+  );
+  const t = bd.querySelector('#fam-title');
+  t.addEventListener('input', () => (pv.title = t.value));
+  const mel = bd.querySelector('#fam-melody');
+  if (mel)
+    mel.addEventListener('change', async () => {
+      mel.disabled = true;
+      try {
+        const r = await pv.imp.importSongFile(pv.bytes, pv.name, { melody: mel.value });
+        // Keep a title the grown-up typed; otherwise take the file's.
+        const typed = pv.title !== pv.result.song.title;
+        pv.result = r;
+        if (!typed) pv.title = r.song.title;
+        pv.pick = null;
+        pv.msg = '';
+      } catch (e) {
+        pv.msg = e instanceof pv.imp.ImportError ? e.message : importMessage(e);
+      }
+      previewSheet(pv);
+      focusIn('#fam-melody');
+    });
+  const part = bd.querySelector('#fam-part');
+  if (part)
+    part.addEventListener('change', () => {
+      pv.pick = Number(part.value);
+      pv.msg = '';
+      previewSheet(pv);
+      focusIn('#fam-part');
+    });
+}
+
+async function saveFamily(pv, piece, btn) {
+  stopPreview();
+  const title = String(pv.title || '').trim();
+  if (!title) {
+    pv.msg = 'Give the song a title.';
+    previewSheet(pv);
+    return focusIn('#fam-title');
+  }
+  const v = validateSong({ ...piece, title });
+  if (!v.ok) {
+    pv.msg = /title/i.test(v.error) ? 'That title has characters I can’t use. Try plain letters and numbers.' : v.error;
+    previewSheet(pv);
+    return focusIn('.err');
+  }
+  if (findRecord(v.song.id)) {
+    pv.msg = 'This song is already in Family songs.';
+    previewSheet(pv);
+    return focusIn('.err');
+  }
+  btn.disabled = true;
+  const src = pv.result.source || null;
+  const rec = {
+    id: v.song.id,
+    song: v.song,
+    source: src,
+    via: pv.viaNbn ? 'nbn' : (src && src.kind) || null,
+    addedAt: new Date().toISOString(),
+  };
+  try {
+    const saved = await library.put(rec);
+    familySongs = [...familySongs.filter((r) => r.id !== saved.id), saved];
+  } catch (e) {
+    pv.msg = e && e.message ? e.message : 'I couldn’t save that. Try again.';
+    previewSheet(pv);
+    return focusIn('.err');
+  }
+  // Ask once for storage the browser won't clear when space runs low.
+  if (!store.data.persistAsked) {
+    store.data.persistAsked = true;
+    store.save();
+    askToPersist();
+  }
+  pv.bytes = null; // the bought file is never kept
+  refreshHome();
+  openSheet(
+    `${hum('happy')}
+     <h2>Song added</h2>
+     <p>“${esc(v.song.title)}” is in Family songs now. It opens in each singer’s key, like the other songs.</p>
+     <button class="btn primary big wide" data-act="sheet-close">Done</button>`,
+    {},
+    { label: 'Song added', cls: 'centered' }
+  );
+}
+
+// ---- A family song's menu (grown-ups) ----
+
+function familyMenu(id) {
+  if (!findRecord(id)) return;
+  grownUp({ why: 'Enter your PIN to change this song.', then: () => songMenuSheet(id) });
+}
+
+function songMenuSheet(id) {
+  const rec = findRecord(id);
+  if (!rec) return closeSheet();
+  const from = rec.via === 'nbn' ? 'from another family phone' : rec.source && rec.source.fileName ? `from “${cleanName(rec.source.fileName)}”` : '';
+  const added = shortDate(rec.addedAt);
+  openSheet(
+    `<p class="eyebrow">Family song</p>
+     <h2>${esc(rec.song.title)}</h2>
+     ${added || from ? `<p class="muted">${esc([added && `Added ${added}`, from].filter(Boolean).join(', '))}</p>` : ''}
+     <div class="fam-menu">
+       <button class="field link-row" data-act="fam-rename"><span><b>Rename</b></span>${ICON.chev}</button>
+       <button class="field link-row" data-act="fam-move"><span>${ICON_SEND}<b>Move to another family phone</b></span>${ICON.chev}</button>
+       <button class="field link-row danger" data-act="fam-delete"><span><b>Delete</b></span>${ICON.chev}</button>
+     </div>
+     <button class="btn primary wide" data-act="sheet-close">Done</button>`,
+    {
+      'fam-rename': () => renameSheet(id),
+      'fam-move': () => moveSheet(id),
+      'fam-delete': () => deleteSheet(id),
+    },
+    { label: 'Family song', key: 'fam-menu', cls: 'fam' }
+  );
+}
+
+function renameSheet(id, msg = '') {
+  const rec = findRecord(id);
+  if (!rec) return closeSheet();
+  const bd = openSheet(
+    `<h2>Rename</h2>
+     <div class="fam-field">
+       <label for="fam-name">Title</label>
+       <input id="fam-name" class="text-input" type="text" maxlength="${SONG_LIMITS.title}" autocomplete="off" value="${esc(rec.song.title)}">
+     </div>
+     ${msg ? `<p class="err" role="alert">${esc(msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="fam-back">Cancel</button>
+       <button class="btn primary" data-act="fam-rename-save">Save</button>
+     </div>`,
+    {
+      'fam-back': () => songMenuSheet(id),
+      'fam-rename-save': () => save(),
+    },
+    { label: 'Rename', key: 'fam-rename', cls: 'fam' }
+  );
+  const input = bd.querySelector('#fam-name');
+  input.focus({ preventScroll: true });
+  input.select();
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      save();
+    }
+  });
+  let busy = false;
+  async function save() {
+    if (busy) return;
+    const title = input.value.trim();
+    if (!title) return renameSheet(id, 'Give the song a title.');
+    const v = validateSong({ ...rec.song, title });
+    if (!v.ok) return renameSheet(id, 'That title has characters I can’t use. Try plain letters and numbers.');
+    busy = true;
+    // The id stays, so the song keeps its scores.
+    try {
+      const saved = await library.put({ ...rec, song: { ...v.song, id: rec.id } });
+      familySongs = familySongs.map((r) => (r.id === id ? saved : r));
+    } catch (e) {
+      return renameSheet(id, e && e.message ? e.message : 'I couldn’t save that. Try again.');
+    }
+    refreshHome();
+    songMenuSheet(id);
+  }
+}
+
+function deleteSheet(id) {
+  const rec = findRecord(id);
+  if (!rec) return closeSheet();
+  openSheet(
+    `<h2>Delete this song?</h2>
+     <p>“${esc(rec.song.title)}” and its scores will be gone from this phone. To sing it again, a grown-up adds the song file again.</p>
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="fam-back">Keep it</button>
+       <button class="btn danger" data-act="fam-delete-yes">Delete song</button>
+     </div>`,
+    {
+      'fam-back': () => songMenuSheet(id),
+      'fam-delete-yes': async (btn) => {
+        btn.disabled = true;
+        if (await removeFamily(id)) {
+          openSheet(`<h2>Deleted</h2><p>“${esc(rec.song.title)}” is gone from this phone.</p><button class="btn primary wide" data-act="sheet-close">Done</button>`, {}, { label: 'Deleted' });
+        }
+      },
+    },
+    { label: 'Delete song', key: 'fam-delete', cls: 'fam' }
+  );
+}
+
+async function removeFamily(id) {
+  try {
+    await library.remove(id);
+  } catch (e) {
+    openSheet(`<h2>Not deleted</h2><p>${esc(e && e.message ? e.message : 'Something went wrong. Try again.')}</p><button class="btn primary wide" data-act="sheet-close">OK</button>`, {}, { label: 'Not deleted' });
+    return false;
+  }
+  familySongs = familySongs.filter((r) => r.id !== id);
+  if (store.data.progress['song:' + id]) {
+    delete store.data.progress['song:' + id];
+    store.save();
+  }
+  refreshHome();
+  return true;
+}
+
+// ---- Moving a song to another family phone ----
+
+function moveSheet(id, keep = false) {
+  const rec = findRecord(id);
+  if (!rec) return closeSheet();
+  openSheet(
+    `<p class="eyebrow">Move to another family phone</p>
+     <h2>${esc(rec.song.title)}</h2>
+     <p class="notice">${NOTICE_SEND}</p>
+     <ol class="fam-steps">
+       <li>Tap <b>Send</b>, then choose AirDrop or Messages, to your own family’s phone.</li>
+       <li>On that phone, save the file to Files.</li>
+       <li>Open Note by Note there, go to Songs, tap <b>Add a song</b> and choose the file.</li>
+     </ol>
+     <div class="field keep-field">
+       <div><b id="keep-l">Also keep a copy here</b><p>Song shops usually allow personal use only. Check the shop’s terms before keeping a song on two phones.</p></div>
+       <button class="switch ${keep ? 'on' : ''}" role="switch" aria-checked="${keep}" aria-labelledby="keep-l" data-act="fam-keep"><i></i></button>
+     </div>
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="fam-back">Cancel</button>
+       <button class="btn primary" data-act="fam-send">${ICON_SEND}<span>Send</span></button>
+     </div>`,
+    {
+      'fam-back': () => songMenuSheet(id),
+      'fam-keep': () => {
+        moveSheet(id, !keep);
+        focusIn('[data-act="fam-keep"]');
+      },
+      'fam-send': (btn) => sendFamily(rec, keep, btn),
+    },
+    { label: 'Move to another family phone', key: 'fam-move', cls: 'fam' }
+  );
+}
+
+// The .nbn file goes out through the share sheet (AirDrop, Messages) as JSON with a .nbn name,
+// or is downloaded where sharing files isn't supported. share() is called straight from the
+// tap, before anything is awaited, so the browser counts it as the grown-up's own action.
+async function sendFamily(rec, keep, btn) {
+  let file;
+  try {
+    const text = writeFamilySongFile(rec.song, rec.source);
+    file = new File([text], familySongFileName(rec.song), { type: 'application/json' });
+  } catch (e) {
+    openSheet(`<h2>Can’t send this song</h2><p>${esc(e && e.message ? e.message : 'Something went wrong.')}</p><button class="btn primary wide" data-act="sheet-close">OK</button>`, {}, { label: 'Can’t send' });
+    return;
+  }
+  let how = 'shared';
+  let canShare = false;
+  try {
+    canShare = !!(navigator.share && navigator.canShare && navigator.canShare({ files: [file] }));
+  } catch (e) {
+    canShare = false;
+  }
+  if (canShare) {
+    btn.disabled = true;
+    try {
+      await navigator.share({ files: [file] });
+    } catch (e) {
+      btn.disabled = false;
+      if (e && e.name === 'AbortError') return; // the grown-up closed the share sheet
+      how = 'saved';
+      if (!downloadFile(file)) return;
+    }
+  } else {
+    how = 'saved';
+    if (!downloadFile(file)) return;
+  }
+  arrivedSheet(rec.id, keep, how);
+}
+
+function downloadFile(file) {
+  try {
+    const url = URL.createObjectURL(file);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = file.name;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function arrivedSheet(id, keep, how) {
+  const rec = findRecord(id);
+  if (!rec) return closeSheet();
+  const saved = how === 'saved' ? '<p>I saved the song file to your downloads. Send it to the other phone from Files.</p>' : '';
+  if (keep) {
+    openSheet(
+      `<h2>Sent</h2>
+       ${saved}
+       <p>A copy of “${esc(rec.song.title)}” stays on this phone too.</p>
+       <button class="btn primary wide" data-act="sheet-close">Done</button>`,
+      {},
+      { label: 'Sent', key: 'fam-arrived', cls: 'fam' }
+    );
+    return;
+  }
+  openSheet(
+    `<h2>Did it arrive?</h2>
+     ${saved}
+     <p>Check that “${esc(rec.song.title)}” is on the other phone. Then I’ll delete it here, so the song is moved, not copied.</p>
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="fam-notyet">Not yet</button>
+       <button class="btn primary" data-act="fam-arrived">Yes, delete it here</button>
+     </div>`,
+    {
+      'fam-notyet': () => moveSheet(id, false),
+      'fam-arrived': async (btn) => {
+        btn.disabled = true;
+        if (await removeFamily(id)) {
+          openSheet(
+            `<h2>Moved</h2><p>“${esc(rec.song.title)}” is on the other phone now, and gone from this one.</p><button class="btn primary wide" data-act="sheet-close">Done</button>`,
+            {},
+            { label: 'Moved', key: 'fam-moved', cls: 'fam' }
+          );
+        }
+      },
+    },
+    { label: 'Did it arrive?', key: 'fam-arrived', cls: 'fam' }
+  );
+}
+
 // ---------- Boot ----------
 
 function loop() {
@@ -2836,6 +3732,7 @@ function loop() {
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 current = homeCtrl();
 history.replaceState({ nbn: 0 }, '');
+loadFamily();
 requestAnimationFrame(loop);
 
 // Read-only hook used by automated tests.

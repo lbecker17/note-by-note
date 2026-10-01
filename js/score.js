@@ -301,7 +301,9 @@ function cents(c) {
 }
 
 // Plain-text summary to paste into Claude for coaching. rangeFrom says where the range came
-// from ('test', or a typical range: 'child', 'high', 'low').
+// from ('test', or a typical range: 'child', 'high', 'low'). family: a family song (imported
+// from a bought file): its words are left out and each part is marked "(family song)"; the
+// caller marks the title.
 const RANGE_SOURCE = {
   test: 'from the range test',
   child: 'a typical child range, not tested',
@@ -309,7 +311,7 @@ const RANGE_SOURCE = {
   low: 'a typical lower-voice range, not tested',
 };
 
-export function reportText({ title, sum, range, rangeFrom, strictKey, date }) {
+export function reportText({ title, sum, range, rangeFrom, strictKey, date, family = false }) {
   const tol = STRICTNESS[strictKey];
   const lines = [];
   lines.push('Note by Note practice results');
@@ -334,14 +336,14 @@ export function reportText({ title, sum, range, rangeFrom, strictKey, date }) {
     row = [];
   };
   for (const n of sum.all) {
-    const part = n.step.title;
+    const part = family ? `${n.step.title} (family song)` : n.step.title;
     if (part !== current) {
       flush();
       current = part;
     }
     const flats = prefersFlats(keyOf(n.ev, n.step), !!n.step.minor);
     const name = n.ev.m2 != null ? `slide ${letterName(n.ev.m, { flats })}→${letterName(n.ev.m2, { flats })}` : letterName(n.ev.m, { flats });
-    const word = n.ev.text ? ` “${n.ev.text}”` : '';
+    const word = n.ev.text && !family ? ` “${n.ev.text}”` : '';
     row.push(n.voiced ? `${name}${word} ${cents(n.avgSigned)} (${Math.round(n.score * 100)}%)` : `${name}${word} not heard`);
   }
   flush();

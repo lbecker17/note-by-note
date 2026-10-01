@@ -13,6 +13,8 @@ const DEFAULTS = () => ({
   days: [],
   warm: null, // { day: 'YYYY-MM-DD', at: ms, heard: 0.86, ctl: 'bounce' }: the last warm-up that counted
   nudge: {}, // { range: 'YYYY-MM-DD' } when the range re-test nudge was last put off
+  pin: null, // the grown-up PIN as { v, salt, hash } (js/pin.js), never the digits
+  persistAsked: false, // navigator.storage.persist() asked once, after the first family song
 });
 
 function load() {
@@ -72,10 +74,15 @@ export const store = {
     this.data.days = this.data.days.slice(-120);
     this.save();
   },
-  // Clears scores and practice days. Resetting scores shouldn't lock songs again, so today's warm-up stays.
+  setPin(pin) {
+    this.data.pin = pin;
+    this.save();
+  },
+  // Clears scores and practice days. Resetting scores shouldn't lock songs again, so today's warm-up
+  // stays, and neither the PIN nor the family songs (which live in IndexedDB) are touched.
   reset() {
-    const { range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm } = this.data;
-    this.data = { ...DEFAULTS(), range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm };
+    const { range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, pin, persistAsked } = this.data;
+    this.data = { ...DEFAULTS(), range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, pin, persistAsked };
     this.save();
   },
 };

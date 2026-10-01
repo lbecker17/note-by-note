@@ -1,5 +1,5 @@
 // Network first, so updates show up straight away; the cache keeps the app working offline.
-const CACHE = 'note-by-note-v7';
+const CACHE = 'note-by-note-v8';
 const ASSETS = [
   './',
   'index.html',
@@ -8,14 +8,23 @@ const ASSETS = [
   'js/app.js',
   'js/art.js',
   'js/audio.js',
+  'js/import.js',
   'js/lane.js',
   'js/lessons.js',
+  'js/library.js',
+  'js/midi.js',
   'js/music.js',
+  'js/musicxml.js',
+  'js/nbn.js',
+  'js/pin.js',
   'js/pitch.js',
   'js/score.js',
   'js/songs.js',
   'js/store.js',
+  'js/text.js',
   'js/tune.js',
+  'js/unzip.js',
+  'js/xml.js',
   'fonts/fraunces-soft.woff2',
   'fonts/nunito.woff2',
   'icons/icon-180.png',
