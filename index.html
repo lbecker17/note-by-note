@@ -22,5 +22,25 @@
 <div id="app"></div>
 <noscript><p style="padding:24px">Note by Note needs JavaScript turned on.</p></noscript>
 <script type="module" src="js/app.js"></script>
+<script>
+  // If the app hasn't drawn anything after a few seconds (for example an older iPad that
+  // can't run part of it), say so instead of leaving a blank screen.
+  (function () {
+    var shown = false;
+    function help(detail) {
+      var app = document.getElementById('app');
+      if (shown || !app || app.children.length) return;
+      shown = true;
+      app.innerHTML = '<div style="padding:32px 24px;max-width:30em;margin:0 auto;font:17px/1.5 -apple-system,system-ui,sans-serif;color:#3a2a20">' +
+        '<h1 style="font-size:24px;margin:0 0 12px">Note by Note couldn\u2019t start</h1>' +
+        '<p>This device\u2019s browser may be too old for this version. Updating it usually fixes this: Settings \u203a General \u203a Software Update.</p>' +
+        '<p>Then close the app fully and open it again.</p>' +
+        '<p style="color:#7a6656;font-size:14px">' + String(detail || 'No details').replace(/[<>&]/g, '') + '</p></div>';
+    }
+    var last = '';
+    window.addEventListener('error', function (e) { last = (e.message || '') + (e.filename ? ' (' + e.filename.split('/').pop() + ')' : ''); }, true);
+    setTimeout(function () { help(last); }, 6000);
+  })();
+</script>
 </body>
 </html>

@@ -79,8 +79,11 @@ export function toBytes(data) {
 // C0 controls (other than the whitespace the caller allows), DEL, C1 controls, the
 // Unicode bidi overrides and isolates, line/paragraph separators and lone surrogates.
 // Text from files someone sent can't use these to hide or reorder what the app shows.
-export const UNSAFE_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff\ufff9-\ufffb]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
-export const UNSAFE_CHARS_G = new RegExp(UNSAFE_CHARS.source, 'g');
+// The u flag makes a surrogate pair one character, so the surrogate range below only
+// matches lone halves. (No lookbehind: Safari before 16.4 can't parse it, and one
+// unparseable pattern stops the whole app loading.)
+export const UNSAFE_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff\ufff9-\ufffb\ud800-\udfff]/u;
+export const UNSAFE_CHARS_G = new RegExp(UNSAFE_CHARS.source, 'gu');
 
 // The first `max` code units of a string, without cutting a character in half (emoji and
 // other astral characters take two code units).
