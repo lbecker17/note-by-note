@@ -1,5 +1,5 @@
 // Network first, so updates show up straight away; the cache keeps the app working offline.
-const CACHE = 'note-by-note-v6';
+const CACHE = 'note-by-note-v7';
 const ASSETS = [
   './',
   'index.html',
@@ -15,6 +15,7 @@ const ASSETS = [
   'js/score.js',
   'js/songs.js',
   'js/store.js',
+  'js/tune.js',
   'fonts/fraunces-soft.woff2',
   'fonts/nunito.woff2',
   'icons/icon-180.png',

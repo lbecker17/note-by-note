@@ -1,10 +1,11 @@
 import { AudioEngine } from './audio.js';
 import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './lessons.js';
 import { SONGS, buildSong, difficulty, songGlyph } from './songs.js';
-import { Lane, drawOverview } from './lane.js';
+import { Lane, drawOverview, drawSong } from './lane.js';
 import { letterName, label, family, prefersFlats, pc } from './music.js';
 import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, offWords } from './score.js';
 import { store, today, week, warmedToday } from './store.js';
+import { findNotes, findKey, quantize, harmonize, arrange, describe, TEMPOS } from './tune.js';
 import { ICON, PHASE_ICON, MARK, SQUIGGLE, STAFF, BURST, AROUND, confetti, rating, hum, WARM_STEPS, CONTROL_STEP, MOVE_ART, moveRing } from './art.js';
 
 const audio = new AudioEngine();
@@ -935,7 +936,7 @@ function tilesHTML(due) {
     <button class="tile" data-act="free">
       <span class="free-ico">${ICON.wave}</span>
       <span class="ttl">Free sing</span>
-      <span class="blurb">See your voice as a line. No score.</span>
+      <span class="blurb">Make up a song and hear it back.</span>
     </button>
   </div>`;
 }
@@ -2301,15 +2302,106 @@ function rangeCtrl() {
 }
 
 // ---------- Free sing ----------
+// Sing, see, hear, sing again. The take's whole pitch line is kept (never any sound), up to
+// TAKE_MAX seconds. Done turns it into notes, a key, beats and chords (tune.js) and shows "Your
+// song": the notes as blocks, a few kind facts, and the tune played back on piano or as a song.
+
+const TAKE_MAX = 180; // seconds of singing one take keeps
+const QUIET = 0.3; // seconds after the app's own playback before the mic counts as singing again
+const FREE_SUB = 'Make up a song. Hear it back.';
+const FREE_CUE = 'Sing any tune you like, then tap Done to see and hear it.';
+const FREE_RUN = 'Sing your tune. Tap Done at the end.';
+const FREE_FULL = 'That’s a long song! Tap Done to hear it.';
+// Song starters: a picture and a few words for children who freeze at "sing anything". They
+// only change the cue.
+const STARTERS = [
+  { id: 'pet', icon: 'paw', label: 'Sing about your pet', cue: 'Sing about your pet, or a pet you’d love to have.' },
+  { id: 'dragon', icon: 'dragon', label: 'Sing like a sleepy dragon', cue: 'Sing like a sleepy dragon: slow and yawny.' },
+  { id: 'name', icon: 'name', label: 'Sing your name', cue: 'Sing your name, then sing it a new way.' },
+  { id: 'happy', icon: 'sun', label: 'Make up a happy tune', cue: 'Make up a happy tune, with any notes you like.' },
+  { id: 'breakfast', icon: 'bowl', label: 'Sing about breakfast', cue: 'Sing about what you had for breakfast.' },
+];
+// describe()'s shapes in a child's words, each with a picture.
+const SHAPE_WORDS = {
+  'up-down': ['siren', 'Your tune went up and down like a roller-coaster.'],
+  'down-up': ['wave', 'Your tune went down and back up, like a roller-coaster.'],
+  wave: ['wave', 'You sang a wavy tune, up and down and up again.'],
+  up: ['scale', 'Your tune went climbing up.'],
+  down: ['oodown', 'Your tune went sliding down.'],
+  flat: ['hold', 'Your tune stayed nice and steady.'],
+};
+const SONG_STYLES = [['pop', 'Pop with drums'], ['gentle', 'Gentle']];
+const SONG_SPEEDS = [['slow', 'Slow'], ['medium', 'Medium'], ['fast', 'Fast']];
+// "Make it a song" choices, kept for the next take.
+let songStyle = 'pop';
+let songSpeed = 'medium';
+
+const clock = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+// The take, heard: its notes, key, beats and chords, and the plain facts for the feedback card.
+function hearTake(frames) {
+  const found = findNotes(frames);
+  const key = findKey(found.notes);
+  const q = quantize(found.notes, { bpm: TEMPOS.medium });
+  return { frames, found, notes: found.notes, key, q, chords: harmonize(q, key), facts: describe(found.notes, key) };
+}
+
+const keyFlats = (key) => !!key.enough && prefersFlats(key.tonic, key.mode === 'minor');
+const keyName = (key) => `${letterName(key.tonic, { flats: keyFlats(key), octave: false })} ${key.mode}`;
+
+// The note grid in words: its text alternative, and the caption under it.
+function songSummary(res) {
+  const { notes, facts } = res;
+  const nm = (m) => letterName(m, { flats: keyFlats(res.key) });
+  if (!notes.length) return 'Your pitch line, with no held notes';
+  if (notes.length === 1) return `1 note, ${nm(notes[0].p)}`;
+  if (facts.low === facts.high) return `${notes.length} notes, all ${nm(facts.low)}`;
+  return `${notes.length} notes from ${nm(facts.low)} to ${nm(facts.high)}`;
+}
+
+// The feedback card: plain facts and kind words, never a grade or a percentage. The key is
+// named only when findKey is sure; a take that is mostly slides gets praise for sliding.
+function songWords(res) {
+  const { notes, found, facts, key } = res;
+  const n = notes.length;
+  const glides = found.glideShare >= 0.5 && found.sungSeconds >= 1;
+  if (!n && !glides) return { stats: [], lines: [['mic', 'I couldn’t hear a tune. Try singing a bit louder, or longer.']] };
+  const secs = Math.max(1, Math.round(n ? facts.seconds : found.sungSeconds));
+  const stats = [[String(secs), secs === 1 ? 'second of singing' : 'seconds of singing']];
+  if (n) stats.push([String(facts.distinct), facts.distinct === 1 ? 'note' : 'different notes']);
+  const lines = [];
+  if (glides) lines.push(['slide', 'Great sliding! Try some notes you can hold too.']);
+  else if (n < 3) lines.push(['hold', 'A short tune. Try a few more notes next time.']);
+  if (n >= 3) {
+    lines.push(SHAPE_WORDS[facts.shape] || SHAPE_WORDS.flat);
+    // One exclamation mark per screen: sliding praise already has it.
+    if (facts.endsHome && !glides) lines.push(['home', 'Your tune came home!']);
+    if (key.enough) lines.push(['songs', `Your song is in ${keyName(key)}.`]);
+  }
+  return { stats, lines };
+}
 
 function freeCtrl() {
+  let state = 'ready'; // ready | running | song
+  let starter = null;
+  let take = []; // the whole take: { t (seconds from Start), m, rms }
+  let T0 = 0;
+  let full = false;
+  let quietUntil = 0; // audio clock: the mic is ignored until then (playback, and just after)
+  let play = null; // { kind: 'tune' | 'song', h (audio.playSong), song, mel (its tune notes), k }
+  let res = null; // hearTake() of the last take
+  let lit = -1; // the note block playing now
+  let xs = []; // each block's [x0, x1] on the grid
   let lastLevel = -1;
-  let frames = [];
+  let lastSecs = -1;
+  let draws = 0; // lane draws, and what the last one showed (for tests)
+  let drawn = { frames: 0, live: false };
+  let ro = null;
   document.body.dataset.screen = 'player';
   root.innerHTML = `<section class="player free-screen" data-state="ready">
     <header class="p-head">
       <button class="icon-btn" data-act="close" aria-label="Close">${ICON.close}</button>
-      <div class="p-title"><h2>Free sing</h2><p id="p-sub">No score. Just your voice.</p></div>
+      <div class="p-title"><h2>Free sing</h2><p id="p-sub"></p></div>
       <span></span>
     </header>
     ${CUE_MARKUP}
@@ -2318,57 +2410,325 @@ function freeCtrl() {
       <span class="note-now" id="note"></span>
       <span class="note-info"><span class="tune" id="cents">Tap Start to turn on the mic</span><span class="level"><i id="level"></i></span></span>
     </div>
-    <div class="p-controls"><button class="btn primary big wide" data-act="f-start" id="startBtn"></button></div>
+    <div class="p-controls">
+      <p class="eyebrow starters-h" id="ideas" aria-hidden="true">Need an idea?</p>
+      <div class="starters" role="group" aria-labelledby="ideas">
+        ${STARTERS.map((s) => `<button class="starter" data-act="f-starter" data-v="${s.id}" aria-pressed="false">${ICON[s.icon]}<span>${esc(s.label)}</span></button>`).join('')}
+      </div>
+      <button class="btn primary big wide" data-act="f-start" id="startBtn"></button>
+    </div>
+    <div class="song-view" id="songView"></div>
   </section>`;
   const $ = (s) => root.querySelector(s);
-  const el = { cue: $('#cue'), note: $('#note'), cents: $('#cents'), level: $('#level'), start: $('#startBtn'), player: $('.player') };
-  cueWriter(el.cue)('Sing anything. The line follows your pitch and the names on the left show where you are.', '');
+  const el = { player: $('.player'), cue: $('#cue'), sub: $('#p-sub'), note: $('#note'), cents: $('#cents'), level: $('#level'), start: $('#startBtn'), view: $('#songView') };
+  const setCue = cueWriter(el.cue);
   const setTune = tuneWriter(el.cents);
-  setBtn(el.start, 'start');
   const lane = new Lane($('#lane'));
   const range = store.data.range;
   lane.setModel({ events: [], free: true, center: range ? (range.low + range.high) / 2 : 57 });
   const unwatch = watchSize(lane, $('.lane-wrap'));
-  const on = () => {
-    el.player.dataset.state = 'running';
-    setBtn(el.start, 'done');
-    requestWake();
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const onTheme = () => {
+    lane.readColors();
+    drawGrid();
   };
-  if (audio.micOn) on();
+  if (mq.addEventListener) mq.addEventListener('change', onTheme);
+
+  const cueText = () => (starter ? STARTERS.find((s) => s.id === starter).cue : state === 'running' ? FREE_RUN : FREE_CUE);
+  const setState = (s) => {
+    state = s;
+    el.player.dataset.state = s;
+  };
+
+  // A new take. Anything still playing stops first, and the mic waits QUIET seconds after it.
+  function begin() {
+    stopPlay();
+    if (ro) ro.disconnect();
+    ro = null;
+    res = null;
+    lit = -1;
+    take = [];
+    full = false;
+    T0 = audio.now();
+    lastSecs = -1;
+    el.view.innerHTML = '';
+    setState('running');
+    setBtn(el.start, 'done');
+    setCue(cueText(), 'sing');
+    if (!wakeLock) requestWake();
+  }
+
+  function finish() {
+    res = hearTake(take);
+    setState('song');
+    setText(el.sub, FREE_SUB);
+    renderSong();
+  }
+
+  function renderSong() {
+    const words = songWords(res);
+    const has = res.notes.length > 0;
+    const line = res.frames.some((f) => f.m != null);
+    const summary = songSummary(res);
+    const seg = (name, value, opts) =>
+      `<div class="seg" role="radiogroup" aria-labelledby="f-${name}-h">${opts
+        .map(([v, l]) => `<button role="radio" aria-checked="${v === value}" class="${v === value ? 'on' : ''}" data-act="f-${name}" data-v="${v}">${l}</button>`)
+        .join('')}</div>`;
+    const stats = words.stats.length
+      ? `<div class="stats ${words.stats.length === 2 ? 'two' : 'one'}">${words.stats.map(([b, s]) => `<div><b>${esc(b)}</b><span>${s}</span></div>`).join('')}</div>`
+      : '';
+    el.view.innerHTML = `
+      <h2 class="song-title" tabindex="-1">${has || line ? 'Your song' : 'Let’s sing again'}</h2>
+      ${
+        has || line
+          ? `<div class="song-grid" id="songGrid" role="group" aria-label="Note blocks"><canvas role="img" aria-label="${esc(summary)}"></canvas></div>
+             <p class="song-cap" aria-hidden="true">${esc(summary)}${res.key.enough && has ? ` · ${esc(keyName(res.key))}` : ''}</p>`
+          : ''
+      }
+      <div class="card song-card">
+        ${stats}
+        <ul class="song-facts">${words.lines.map(([ic, t]) => `<li><i>${ICON[ic]}</i><span>${esc(t)}</span></li>`).join('')}</ul>
+      </div>
+      ${
+        has
+          ? `<button class="btn primary big wide" data-act="f-tune" id="tuneBtn"></button>
+             <div class="card song-maker">
+               <h3>Make it a song</h3>
+               <p class="seg-h" id="f-style-h">Style</p>
+               ${seg('style', songStyle, SONG_STYLES)}
+               <p class="seg-h" id="f-speed-h">Speed</p>
+               ${seg('speed', songSpeed, SONG_SPEEDS)}
+               <button class="btn secondary wide" data-act="f-song" id="songBtn"></button>
+             </div>`
+          : ''
+      }
+      <div class="song-actions">
+        <button class="btn secondary" data-act="f-done">Done</button>
+        <button class="btn ${has ? 'secondary' : 'primary'}" data-act="f-again">${ICON.mic}Sing again</button>
+      </div>`;
+    playButtons();
+    el.player.scrollTop = 0;
+    drawGrid();
+    const box = el.view.querySelector('#songGrid');
+    if (box && window.ResizeObserver) {
+      ro = new ResizeObserver(() => drawGrid());
+      ro.observe(box);
+    }
+    // Canvas text is drawn once per change, so draw again once the font has loaded.
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => drawGrid());
+    el.view.querySelector('.song-title').focus({ preventScroll: true });
+  }
+
+  function drawGrid() {
+    const box = state === 'song' && el.view.querySelector('#songGrid');
+    if (!box || !res) return;
+    xs = drawSong(box.querySelector('canvas'), { notes: res.notes, frames: res.frames, key: res.key, names: S().names, lit, width: box.clientWidth });
+    // A grid wider than the screen scrolls, so it needs to be reachable from the keyboard.
+    if (box.scrollWidth > box.clientWidth + 1) box.setAttribute('tabindex', '0');
+    else box.removeAttribute('tabindex');
+  }
+
+  // Light up the block that is playing, and keep it in view on a grid that scrolls.
+  function setLit(k) {
+    if (k === lit) return;
+    lit = k;
+    drawGrid();
+    const box = el.view.querySelector('#songGrid');
+    if (!box || k < 0 || !xs[k]) return;
+    const [a, b] = xs[k];
+    if (a < box.scrollLeft + 16 || b > box.scrollLeft + box.clientWidth - 16)
+      box.scrollTo({ left: Math.max(0, a - box.clientWidth * 0.25), behavior: reducedMotion() ? 'auto' : 'smooth' });
+  }
+
+  const PLAY_LOOK = {
+    tune: ['btn primary big wide', 'btn quiet big wide', `${ICON.play}Play my tune`],
+    song: ['btn secondary wide', 'btn quiet wide', `${ICON.songs}Make it a song`],
+  };
+  // While a button's playback runs, it becomes its Stop button.
+  function playButtons() {
+    for (const kind of ['tune', 'song']) {
+      const b = el.view.querySelector(kind === 'tune' ? '#tuneBtn' : '#songBtn');
+      if (!b) continue;
+      const on = !!play && play.kind === kind;
+      b.className = PLAY_LOOK[kind][on ? 1 : 0];
+      b.innerHTML = on ? `${ICON.stop}Stop` : PLAY_LOOK[kind][2];
+    }
+  }
+
+  // 'tune': the tune alone on piano, at the speed it was sung, tidied onto the beat and the
+  // notes. 'song': chords and bass too (and drums for pop), at the speed picked.
+  function startPlay(kind) {
+    stopPlay();
+    audio.unlock();
+    if (!audio.ctx || !res || !res.notes.length) return;
+    const { q, chords, key } = res;
+    let song;
+    if (kind === 'tune') {
+      const events = arrange(q, chords, key, { style: 'gentle' }).events.filter((e) => e.kind === 'melody');
+      song = { events, duration: events.reduce((d, e) => Math.max(d, e.t + e.d), 0) };
+    } else song = arrange(q, chords, key, { style: songStyle, bpm: TEMPOS[songSpeed] });
+    const mel = song.events.filter((e) => e.kind === 'melody');
+    // One tune note per block, in order; anything else and nothing lights up.
+    play = { kind, h: audio.playSong(song), song, mel: mel.length === res.notes.length ? mel : [], k: -1 };
+    quietUntil = Infinity;
+    playButtons();
+  }
+
+  function stopPlay() {
+    if (!play) return;
+    play.h.stop();
+    endPlay();
+  }
+
+  // After playback, stopped or run to its end. The last notes ring on a moment, so the mic waits.
+  function endPlay() {
+    play = null;
+    quietUntil = audio.now() + QUIET;
+    setLit(-1);
+    playButtons();
+  }
+
+  function pick(what, v) {
+    if (what === 'style') {
+      if (!SONG_STYLES.some(([k]) => k === v)) return;
+      songStyle = v;
+    } else {
+      if (!TEMPOS[v]) return;
+      songSpeed = v;
+    }
+    el.view.querySelectorAll(`[data-act="f-${what}"]`).forEach((b) => {
+      const on = b.dataset.v === v;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-checked', String(on));
+    });
+    // Changing the style or speed while the song plays starts it again that way.
+    if (play && play.kind === 'song') startPlay('song');
+  }
+
+  function drawLane(t, frames, live) {
+    lane.draw(t, frames, live);
+    draws++;
+    drawn = { frames: frames.length, live: !!live };
+  }
+
+  setState('ready');
+  setBtn(el.start, 'start');
+  setText(el.sub, FREE_SUB);
+  setCue(cueText(), '');
+
   return {
     name: 'free',
     actions: {
       'f-start': () => {
-        if (audio.micOn && el.player.dataset.state === 'running') return goBack();
+        if (state === 'running') return finish();
         audio.unlock();
-        if (!audio.micOn) return micSheet(on);
-        on();
+        if (!audio.micOn) return micSheet(begin);
+        begin();
       },
+      'f-starter': (btn) => {
+        starter = starter === btn.dataset.v ? null : btn.dataset.v;
+        root.querySelectorAll('.starter').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === starter)));
+        setCue(cueText(), state === 'running' ? 'sing' : '');
+      },
+      'f-tune': () => (play && play.kind === 'tune' ? stopPlay() : startPlay('tune')),
+      'f-song': () => (play && play.kind === 'song' ? stopPlay() : startPlay('song')),
+      'f-style': (btn) => pick('style', btn.dataset.v),
+      'f-speed': (btn) => pick('speed', btn.dataset.v),
+      'f-again': () => {
+        audio.unlock();
+        if (!audio.micOn) {
+          stopPlay();
+          return micSheet(begin);
+        }
+        begin();
+        el.start.focus({ preventScroll: true });
+      },
+      'f-done': () => goBack(),
     },
     frame() {
-      const r = audio.micOn ? audio.read() : null;
       const now = audio.now();
-      if (r) {
-        frames.push({ t: r.t, m: r.m, dm: r.m });
-        if (frames.length > 600) frames.splice(0, frames.length - 600);
+      if (state === 'song') {
+        // Nothing from the mic here: just follow the playback with the highlight.
+        if (!play) return;
+        if (now >= play.h.end) return endPlay();
+        const t = now - play.h.at;
+        const mel = play.mel;
+        while (play.k + 1 < mel.length && mel[play.k + 1].t <= t) play.k++;
+        const k = play.k;
+        setLit(k >= 0 && t < mel[k].t + mel[k].d ? k : -1);
+        return;
       }
-      lane.draw(now, frames, r && r.m != null ? { t: r.t, m: r.m, dm: r.m } : null);
-      if (r && r.m != null) {
-        setText(el.note, letterName(r.m));
-        setTune('tune', nearestWords(r.m));
+      const r = audio.micOn ? audio.read() : null;
+      // The app's own playback, and the moment after it, is never singing: it's neither kept nor
+      // drawn. A reading's time is the middle of the sound it heard, so that is what must be clear.
+      const heard = r && r.t >= quietUntil ? r : null;
+      if (state === 'running') {
+        const t = now - T0;
+        if (!full && t >= TAKE_MAX) {
+          full = true;
+          setCue(FREE_FULL, '');
+        }
+        if (heard && !full) take.push({ t: heard.t - T0, m: heard.m, rms: heard.rms });
+        drawLane(t, take, heard && !full && heard.m != null ? { t: heard.t - T0, m: heard.m } : null);
+        const secs = Math.min(TAKE_MAX, Math.floor(t));
+        if (secs !== lastSecs) {
+          lastSecs = secs;
+          setText(el.sub, `Singing · ${clock(secs)}`);
+        }
+      } else drawLane(0, [], heard && heard.m != null ? { t: 0, m: heard.m } : null);
+      if (full) {
+        setText(el.note, '');
+        setTune('tune', 'Tap Done to hear it');
+      } else if (heard && heard.m != null) {
+        setText(el.note, letterName(heard.m));
+        setTune('tune', nearestWords(heard.m));
       } else {
         setText(el.note, audio.micOn ? '–' : '');
         setTune('tune', audio.micOn ? 'Listening…' : 'Tap Start to turn on the mic');
       }
-      const lv = levelOf(r);
+      const lv = full ? 0 : levelOf(heard);
       if (Math.abs(lv - lastLevel) > 0.02) {
         lastLevel = lv;
         el.level.style.width = `${Math.round(lv * 100)}%`;
       }
     },
+    // The app went to the background, or the sound dropped: stop playback. A take keeps what it has.
+    pause() {
+      stopPlay();
+    },
+    probe() {
+      const kinds = {};
+      if (play) for (const e of play.song.events) kinds[e.kind] = (kinds[e.kind] || 0) + 1;
+      return {
+        screen: 'free',
+        state,
+        starter,
+        take: take.length,
+        first: take.length ? take[0].t : null,
+        seconds: Math.max(0, audio.now() - T0),
+        full,
+        quiet: audio.now() < quietUntil,
+        draws,
+        drawn,
+        playing: play ? { kind: play.kind, at: play.h.at, end: play.h.end, bpm: play.song.bpm || null, kinds } : null,
+        lit,
+        song: res && {
+          notes: res.notes.map((n) => ({ p: n.p, t0: n.t0, t1: n.t1 })),
+          key: res.key,
+          facts: res.facts,
+          glideShare: res.found.glideShare,
+          sungSeconds: res.found.sungSeconds,
+          bpm: res.q.bpm,
+          chords: res.chords.map((c) => c.numeral),
+        },
+      };
+    },
     destroy() {
+      stopPlay();
       releaseWake();
       unwatch();
+      if (ro) ro.disconnect();
+      if (mq.removeEventListener) mq.removeEventListener('change', onTheme);
     },
   };
 }

@@ -779,6 +779,54 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
   .adj span { grid-column: auto; text-align: left; font-size: 14px; }
 }
 
+/* ---------- Free sing: sing, see, hear, sing again ---------- */
+/* Song starters: a row of picture chips under "Need an idea?", before a take starts. On a narrow
+   phone the row scrolls sideways (the page never does); when it fits, it sits in the middle. */
+.starters-h { text-align: center; }
+.starters {
+  display: flex; gap: 8px; overflow-x: auto; margin: -4px -16px 2px; padding: 6px 16px;
+  scroll-snap-type: x proximity; scrollbar-width: none; overscroll-behavior-x: contain;
+}
+.starters::-webkit-scrollbar { display: none; }
+.starter {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 6px 14px 6px 10px; scroll-snap-align: start;
+  border: 0; border-radius: var(--r-pill); background: var(--surface); color: var(--fg); font: 800 14px/1.15 var(--font-body); white-space: nowrap;
+  box-shadow: inset 0 0 0 1.5px var(--line-strong);
+}
+.starter:first-child { margin-left: auto; }
+.starter:last-child { margin-right: auto; }
+.starter svg { width: 22px; height: 22px; color: var(--accent); flex: none; }
+.starter[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-ink); box-shadow: inset 0 0 0 2px var(--accent); }
+.free-screen:not([data-state="ready"]) .starters-h, .free-screen:not([data-state="ready"]) .starters { display: none; }
+/* "Your song" takes the place of the lane once the take is done, and scrolls with the player. */
+.song-view { display: none; flex-direction: column; gap: 14px; padding: 8px 16px 0; animation: rise 0.28s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.free-screen[data-state="song"] .song-view { display: flex; flex: 1 0 auto; }
+.free-screen[data-state="song"] > .cue, .free-screen[data-state="song"] > .lane-wrap,
+.free-screen[data-state="song"] > .readout, .free-screen[data-state="song"] > .p-controls { display: none; }
+.song-title { font: 600 28px/1.1 var(--font-display); letter-spacing: -0.01em; }
+.song-grid {
+  flex: none; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain;
+  border-radius: var(--r-lg); background: var(--lane-bg); border: 1px solid var(--line); box-shadow: var(--shadow);
+}
+.song-grid canvas { display: block; height: 168px; min-width: 100%; }
+.song-cap { margin-top: -6px; font-size: 14px; font-weight: 700; color: var(--muted); text-align: center; }
+.stats.one { grid-template-columns: 1fr; }
+.song-facts { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.song-facts li { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 10px; align-items: center; font: 700 16px/1.35 var(--font-body); }
+.song-facts i { width: 36px; height: 36px; border-radius: 12px; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; }
+.song-facts i svg { width: 22px; height: 22px; }
+.song-maker { gap: 10px; }
+.seg-h { font: 800 13px/1.2 var(--font-body); color: var(--muted); margin: 2px 0 -4px 2px; }
+/* Sing again and Done stay in reach at the bottom while the view scrolls under them. */
+.song-actions {
+  position: sticky; bottom: 0; z-index: 1; display: grid; grid-template-columns: 1fr 1.5fr; gap: 10px;
+  margin: auto -16px 0; padding: 16px 16px calc(14px + var(--safe-bottom)); background: linear-gradient(to bottom, transparent, var(--bg) 14px);
+}
+.song-actions .btn { padding: 0 12px; }
+@media (max-height: 700px) {
+  .song-grid canvas { height: 140px; }
+}
+
 /* ---------- Celebration (good runs only) NEW ---------- */
 .confetti { position: absolute; left: 0; right: 0; top: 0; height: 0; overflow: visible; pointer-events: none; z-index: 2; }
 .confetti i {

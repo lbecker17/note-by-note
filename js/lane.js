@@ -494,3 +494,137 @@ export function drawOverview(canvas, results) {
     off += st.end;
   });
 }
+
+// "See my song": a Free sing take as rounded note blocks on a pitch grid (time across, pitch
+// up), with the take's pitch line faint behind them, so slides show too. With a sure key each
+// block takes its scale-degree colour and the name Settings asks for; otherwise every block is
+// one warm neutral, named by letter. lit is the block playing now (-1 for none). A long take
+// scrolls sideways: each second gets about SONG_PPS pixels. Returns each block's [x0, x1]
+// in CSS pixels, so the page can keep the lit one in view.
+const SONG_PPS = 36;
+const SONG_MAX_W = 6000;
+export function drawSong(canvas, { notes, frames = [], key = null, names = 'letters', lit = -1, width }) {
+  const C = readTokens();
+  const plain = getComputedStyle(document.documentElement).getPropertyValue('--line-strong').trim() || C['bar-ghost'];
+  const font = C['font-body'] || 'system-ui, sans-serif';
+  const voiced = frames.filter((f) => f.m != null);
+  let t0 = Infinity, t1 = -Infinity;
+  for (const n of notes) {
+    t0 = Math.min(t0, n.t0);
+    t1 = Math.max(t1, n.t1);
+  }
+  if (voiced.length) {
+    t0 = Math.min(t0, voiced[0].t);
+    t1 = Math.max(t1, voiced[voiced.length - 1].t);
+  }
+  if (!isFinite(t0)) {
+    t0 = 0;
+    t1 = 1;
+  }
+  t0 = Math.max(0, t0 - 0.25);
+  t1 += 0.25;
+  // Pitch: the notes' span, or the middle of the line when there are no notes (one wild
+  // reading shouldn't squash the picture).
+  let lo = Infinity, hi = -Infinity;
+  for (const n of notes) {
+    lo = Math.min(lo, n.p);
+    hi = Math.max(hi, n.p);
+  }
+  if (!isFinite(lo)) {
+    const ms = voiced.map((f) => f.m).sort((a, b) => a - b);
+    lo = ms.length ? ms[Math.floor(ms.length * 0.05)] : 57;
+    hi = ms.length ? ms[Math.floor(ms.length * 0.95)] : 64;
+  }
+  if (hi - lo < 7) {
+    const pad = (7 - (hi - lo)) / 2;
+    lo -= pad;
+    hi += pad;
+  }
+  lo -= 1;
+  hi += 1;
+
+  const W0 = Math.max(40, width || canvas.parentElement.clientWidth);
+  // Fit the screen when that is nearly roomy enough, rather than scroll for the last few pixels.
+  const W = W0 / (t1 - t0) >= SONG_PPS * 0.75 ? W0 : Math.min(SONG_MAX_W, (t1 - t0) * SONG_PPS);
+  canvas.style.width = `${Math.round(W)}px`;
+  const H = Math.max(60, canvas.getBoundingClientRect().height);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  const g = canvas.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = C['lane-bg'];
+  g.fillRect(0, 0, W, H);
+  const padX = 8, top = 10, bot = H - 10;
+  const X = (t) => padX + ((t - t0) / (t1 - t0)) * (W - padX * 2);
+  const Y = (m) => bot - ((m - lo) / (hi - lo)) * (bot - top);
+  const rh = (bot - top) / (hi - lo);
+
+  // Rows: the key's scale notes (home a little stronger), or the white keys when the key isn't sure.
+  const sure = !!(key && key.enough);
+  const tonic = sure ? pc(key.tonic) : 0;
+  const scale = sure && key.mode === 'minor' ? MINOR : MAJOR;
+  for (let m = Math.ceil(lo); m <= Math.floor(hi); m++) {
+    const deg = pc(m - tonic);
+    if (!scale.includes(deg)) continue;
+    const strong = sure && deg === 0;
+    const yy = Math.round(Y(m)) + 0.5;
+    g.strokeStyle = strong ? C['lane-row-strong'] : C['lane-row'];
+    g.lineWidth = strong ? 1.5 : 1;
+    g.beginPath();
+    g.moveTo(0, yy);
+    g.lineTo(W, yy);
+    g.stroke();
+  }
+
+  // The pitch line, faint
+  g.strokeStyle = C.trace;
+  g.globalAlpha = 0.3;
+  g.lineWidth = 2;
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+  g.beginPath();
+  let prev = null;
+  for (const f of voiced) {
+    const px = X(f.t), py = Y(Math.max(lo + 0.2, Math.min(hi - 0.2, f.m)));
+    if (prev && f.t - prev.t < 0.1) g.lineTo(px, py);
+    else g.moveTo(px, py);
+    prev = f;
+  }
+  g.stroke();
+  g.globalAlpha = 1;
+
+  // The blocks, each named when its name fits inside it
+  // Taller than a row, so a name fits (neighbours a semitone apart never sound at the same
+  // time), but no taller than the tune's usual note is wide, so short notes stay round.
+  const widths = notes.map((n) => X(n.t1) - X(n.t0) - 2.5).sort((a, b) => a - b);
+  const usual = widths.length ? widths[widths.length >> 1] : Infinity;
+  const bh = Math.max(14, Math.min(28, rh * 1.45, usual + 2));
+  const flats = sure && prefersFlats(tonic, key.mode === 'minor');
+  g.font = `800 12px ${font}`;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  const xs = [];
+  notes.forEach((n, i) => {
+    const x0 = X(n.t0) + 1;
+    const w = Math.max(6, X(n.t1) - 1.5 - x0);
+    const yy = Y(n.p);
+    const fam = sure ? family(n.p, tonic) : null;
+    roundRect(g, x0, yy - bh / 2, w, bh, Math.min(bh / 2, 8));
+    g.fillStyle = fam ? C[fam] : plain;
+    g.fill();
+    if (i === lit) {
+      roundRect(g, x0 - 2.5, yy - bh / 2 - 2.5, w + 5, bh + 5, Math.min(bh / 2 + 2.5, 10));
+      g.strokeStyle = C.fg;
+      g.lineWidth = 2.5;
+      g.stroke();
+    }
+    const text = label(n.p, { tonic: sure ? tonic : null, flats, names: sure ? names : 'letters', octave: false });
+    if (g.measureText(text).width + 6 <= w) {
+      g.fillStyle = fam ? C['on-' + fam] : C.fg;
+      g.fillText(text, x0 + w / 2, yy + 0.5);
+    }
+    xs.push([x0, x0 + w]);
+  });
+  return xs;
+}

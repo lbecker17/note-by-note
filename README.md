@@ -13,6 +13,7 @@ Open **https://lbecker17.github.io/note-by-note/** in Safari on your iPhone, the
 - **Daily warm-up.** About four minutes: stretch and breathe, small hum slides, a light "oo" pattern, a five-note scale, "today's challenge", a control move that changes by weekday (a steady hold, bouncy "ha", grow and shrink, or a slow slide down), then one big siren to finish. Nothing in it goes near the very top of your range, and the biggest slide comes last. Today shows the days you sang this week, aiming for three.
 - **Warm up before songs.** Songs open once you've done today's warm-up, and stay open until midnight. Lessons are always open. The warm-up only counts if the app hears you sing every part, going up and down with the notes. It doesn't need to be in tune.
 - **Songs.** Public-domain songs with lyrics and piano: learn them line by line, then sing them through.
+- **Free sing.** Make up a tune (or pick an idea like "Sing like a sleepy dragon"), tap Done, and see it as coloured note blocks with a few kind words about it; play it back on piano or as a song with chords and drums, then sing again. It works from the pitch line only, so nothing is recorded.
 - **Results.** Score, notes landed and how much of the time the mic heard you, with tips in plain words ("a little low", "a little high"). Singing the right note in another octave counts, and the lane says "same note, lower" or "same note, higher". Under "For grown-ups", a quiet "Copy results for Claude" link copies the details, in cents, for coaching.
 
 ## Good to know
