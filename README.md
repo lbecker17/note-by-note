@@ -26,3 +26,4 @@ Open **https://lbecker17.github.io/note-by-note/** in Safari on your iPhone, the
 - **Look after your voice** (from Today, any results sheet, the Songs lock, or Settings) has short voice-care tips for children and a section for grown-ups: what the app can't hear, how much singing is sensible, and when to see a GP.
 
 Plain HTML, CSS and JavaScript. No build step. The look is "warm paper": cream and terracotta, or warm cocoa in dark mode, with the Fraunces and Nunito fonts bundled in `fonts/` (SIL Open Font License, see `fonts/OFL.txt`).
+Tests for the tune engine (`js/tune.js`) run with `node --test tests/` (Node 22 or later, nothing to install).
