@@ -3,7 +3,7 @@ import { LESSONS, UNITS, ORDER, WARMUP } from './lessons.js';
 import { SONGS, buildSong, songData, difficulty, songGlyph } from './songs.js';
 import { Lane, drawOverview } from './lane.js';
 import { letterName, label, family, prefersFlats, voiceType, spanWords, pc } from './music.js';
-import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor } from './score.js';
+import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard } from './score.js';
 import { store, streak, week } from './store.js';
 
 const audio = new AudioEngine();
@@ -11,6 +11,7 @@ const root = document.getElementById('app');
 const LEAD = 2.4;
 const PRESETS = { low: { low: 45, high: 62 }, high: { low: 57, high: 74 } };
 const VERSION = '1.0';
+const NOT_HEARD = 'We couldn’t hear you';
 
 let current = null;
 let sheet = null;
@@ -556,7 +557,6 @@ function playerCtrl({ kind, id }) {
     events: st.events,
     tonic: st.tonic,
     minor: !!st.minor,
-    flats: prefersFlats(st.tonic, !!st.minor),
     names: S().names,
   });
   lane.setModel(modelFor(step()));
@@ -689,7 +689,7 @@ function playerCtrl({ kind, id }) {
       f.dm = target + x.d;
       f.octave = x.octave;
       f.k = creditFor(x.d * 100, tol, ev.m2 != null ? 2 : 1);
-      f.fam = family(ev.m, st.tonic);
+      f.fam = family(ev.m, keyOf(ev, st));
       if (f.k > 0) {
         if (!ev.hits) ev.hits = [];
         const h = ev.hits[ev.hits.length - 1];
@@ -752,20 +752,22 @@ function playerCtrl({ kind, id }) {
     el.lyrics.innerHTML = html;
   }
 
-  function readout(r, target) {
+  // st and t say which key to name notes in: the one at that moment of that step.
+  function readout(r, target, st, t) {
     let noteTxt = '–';
     let centsTxt;
     if (r && r.m != null) {
-      const st = step();
       const solfa = S().names === 'solfa';
-      noteTxt = label(r.m, { tonic: st.tonic, flats: prefersFlats(st.tonic, !!st.minor), names: S().names, octave: !solfa });
+      const tonic = keyAt(st, t);
+      const key = { tonic, flats: prefersFlats(tonic, !!st.minor), names: S().names, octave: !solfa };
+      noteTxt = label(r.m, key);
       if (target != null) {
         const x = foldDiff(r.m, target);
         const c = Math.round(x.d * 100);
         centsTxt = Math.abs(c) <= tol.good ? 'In tune' : `${Math.abs(c)}¢ ${c < 0 ? 'flat' : 'sharp'}`;
       } else {
         const c = Math.round((r.m - Math.round(r.m)) * 100);
-        centsTxt = c === 0 ? 'Right on the note' : `${c > 0 ? '+' : '−'}${Math.abs(c)}¢ from ${label(Math.round(r.m), { tonic: st.tonic, flats: prefersFlats(st.tonic, !!st.minor), names: S().names, octave: !solfa })}`;
+        centsTxt = c === 0 ? 'Right on the note' : `${c > 0 ? '+' : '−'}${Math.abs(c)}¢ from ${label(Math.round(r.m), key)}`;
       }
     } else {
       centsTxt = audio.micOn ? 'Listening…' : state === 'ready' ? 'Tap Start to begin' : 'Mic is off';
@@ -801,13 +803,15 @@ function playerCtrl({ kind, id }) {
     releaseWake();
     const sum = summarize(results);
     lastSum = sum;
-    store.record(plan.id, sum.score);
+    // A run the mic barely heard still shows its result, but doesn't count as practice.
+    const heard = wasHeard(sum);
+    if (heard) store.record(plan.id, sum.score);
     el.start.textContent = 'Start again';
-    setText(el.cue, verdict(sum.score));
-    resultsSheet(sum);
+    setText(el.cue, heard ? verdict(sum.score) : NOT_HEARD);
+    resultsSheet(sum, heard);
   }
 
-  function resultsSheet(sum) {
+  function resultsSheet(sum, heard) {
     const pct = Math.round(sum.score * 100);
     const lean =
       sum.avgAbs == null ? '–' : Math.abs(sum.tendency) < 6 ? 'Centred' : `${Math.round(Math.abs(sum.tendency))}¢ ${sum.tendency < 0 ? 'flat' : 'sharp'}`;
@@ -819,13 +823,13 @@ function playerCtrl({ kind, id }) {
     const nx = nextAfter(kind, id);
     const html = `
       <p class="eyebrow">${esc(plan.title)}</p>
-      <div class="score-row"><span class="score">${pct}<small>%</small></span><span class="verdict">${verdict(sum.score)}</span></div>
+      <div class="score-row"><span class="score">${pct}<small>%</small></span><span class="verdict">${heard ? verdict(sum.score) : NOT_HEARD}</span></div>
       <div class="stats">${stats.map(([b, s]) => `<div><b>${esc(b)}</b><span>${s}</span></div>`).join('')}</div>
       <canvas class="replay" aria-label="Your pitch across the whole exercise"></canvas>
-      <p class="tip">${esc(tip(sum))}</p>
+      <p class="tip">${esc(heard ? tip(sum) : 'The mic hardly heard you that time, so this one won’t count toward your streak. Hold the phone a little closer, sing out, and try again.')}</p>
       <div class="sheet-actions">
-        <button class="btn secondary" data-act="again">Try again</button>
-        ${nx ? `<button class="btn primary" data-act="next">Next: ${esc(nx.title)}</button>` : `<button class="btn primary" data-act="done">Done</button>`}
+        <button class="btn ${heard ? 'secondary' : 'primary'}" data-act="again">Try again</button>
+        ${nx ? `<button class="btn ${heard ? 'primary' : 'secondary'}" data-act="next">Next: ${esc(nx.title)}</button>` : `<button class="btn ${heard ? 'primary' : 'secondary'}" data-act="done">Done</button>`}
       </div>
       <button class="btn text wide" data-act="copy">Copy results for Claude</button>`;
     const bd = openSheet(
@@ -926,7 +930,7 @@ function playerCtrl({ kind, id }) {
         } else if (!el.countin.hidden) el.countin.hidden = true;
         updateCue(st, t, cur, next);
         renderLyrics(t);
-        readout(r, cur && cur.role === 'sing' ? targetAt(cur, t) : null);
+        readout(r, cur && cur.role === 'sing' ? targetAt(cur, t) : null, st, t);
         if (t > st.end + 0.35) endStep();
       } else if (state === 'between') {
         const nx = plan.steps[stepIdx + 1];
@@ -934,7 +938,7 @@ function playerCtrl({ kind, id }) {
         const bc = el.between.querySelector('#bcount');
         if (bc) setText(bc, String(Math.max(1, Math.ceil(left))));
         lane.draw(previewTime(nx), [], null);
-        readout(r, null);
+        readout(r, null, nx, previewTime(nx));
         if (left <= 0) {
           stepIdx++;
           startStep();
@@ -943,7 +947,7 @@ function playerCtrl({ kind, id }) {
         const t = previewTime(step());
         const dot = r && r.m != null ? { t, m: r.m, dm: r.m } : null;
         lane.draw(t, [], dot);
-        readout(r, null);
+        readout(r, null, step(), t);
       }
     },
     pause() {

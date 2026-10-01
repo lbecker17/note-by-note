@@ -1,8 +1,8 @@
 // The pitch lane: target notes scroll right to left past a fixed line,
 // and your voice draws a line across them. Notes light up in their colour as you hit them.
 
-import { family, label, pc, MAJOR } from './music.js';
-import { targetAt } from './score.js';
+import { family, label, pc, prefersFlats, MAJOR } from './music.js';
+import { targetAt, keyOf, keyAt } from './score.js';
 
 const MINOR = [0, 2, 3, 5, 7, 8, 10];
 const TOKENS = [
@@ -65,7 +65,8 @@ export class Lane {
     this.c.height = Math.round(this.h * this.dpr);
   }
 
-  // model: { events, tonic, minor, flats, names, free, center, marks }
+  // model: { events, tonic, minor, names, free, center, marks }
+  // Events may carry their own tonic when an exercise changes key part way through.
   setModel(model) {
     this.model = model;
     if (model.free) {
@@ -108,11 +109,12 @@ export class Lane {
   rowH() {
     return (this.h - 24) / (this.view.hi - this.view.lo);
   }
-  noteLabel(m) {
+  noteLabel(m, tonic) {
     const M = this.model;
+    const T = M.free ? null : tonic;
     return label(m, {
-      tonic: M.free ? null : M.tonic,
-      flats: !!M.flats,
+      tonic: T,
+      flats: T != null && prefersFlats(T, !!M.minor),
       names: M.free ? 'letters' : M.names,
       octave: !(M.names === 'solfa' && !M.free),
     });
@@ -131,9 +133,9 @@ export class Lane {
       this.view = { lo: this.center - 7, hi: this.center + 7 };
     }
 
-    // Rows and note names
+    // Rows and note names, in the key of the note at (or coming up to) the line
     const rh = this.rowH();
-    const tonic = M.free ? null : M.tonic;
+    const tonic = M.free ? null : keyAt(M, now);
     const scale = M.minor ? MINOR : MAJOR;
     g.textAlign = 'right';
     g.textBaseline = 'middle';
@@ -152,7 +154,7 @@ export class Lane {
       if (inScale && rh >= 8) {
         g.fillStyle = C['lane-label'];
         g.font = `${strong ? 700 : 600} 11px ${font}`;
-        g.fillText(this.noteLabel(m), this.gutter - 8, yy);
+        g.fillText(this.noteLabel(m, tonic), this.gutter - 8, yy);
       }
     }
 
@@ -184,7 +186,8 @@ export class Lane {
     const barH = Math.max(8, Math.min(rh * 0.76, 28));
     for (const ev of M.events || []) {
       if (ev.t + ev.d < t0 || ev.t > t1) continue;
-      const fam = family(ev.m, tonic != null ? tonic : 0);
+      const key = M.free ? null : keyOf(ev, M);
+      const fam = family(ev.m, key != null ? key : 0);
       if (ev.m2 != null) {
         this.drawGlide(ev, now, C[fam], barH);
         continue;
@@ -227,7 +230,7 @@ export class Lane {
         }
       }
       // Label on the bar: the syllable for songs, the note name for exercises.
-      const text = ev.text != null ? (ev.melisma ? '' : ev.text) : this.noteLabel(ev.m);
+      const text = ev.text != null ? (ev.melisma ? '' : ev.text) : this.noteLabel(ev.m, key);
       if (text && barH >= 13 && x1 - x0 >= 18) {
         let ink = ev.role === 'listen' ? C['lane-label'] : C.fg;
         if (ev.hits && ev.hits.length) {
@@ -395,7 +398,7 @@ export function drawOverview(canvas, results) {
     }
     for (const ev of st.events) {
       if (ev.role !== 'sing') continue;
-      const fam = family(ev.m, st.tonic);
+      const fam = family(ev.m, keyOf(ev, st));
       if (ev.m2 != null) {
         g.strokeStyle = C['bar-idle'];
         g.lineWidth = bh;

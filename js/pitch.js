@@ -83,6 +83,7 @@ export function createDetector(sampleRate, { minHz = 60, maxHz = 1250, threshold
 export class Tracker {
   constructor() {
     this.floor = 0.002;
+    this.lastPitched = -Infinity;
     this.recent = [];
   }
 
@@ -95,11 +96,16 @@ export class Tracker {
   }
 
   push(r, time) {
-    // Noise floor falls quickly and rises slowly, so a held note never becomes "noise".
+    // The noise floor follows the room: it falls quickly in quiet moments and rises slowly,
+    // but only after nothing has sounded like a pitch for a moment. Room noise has no clear
+    // pitch, so the floor still rises with it. A held note, however quiet, never feeds the
+    // floor, so the gate can't creep up and cut it off part way through.
+    const pitched = r.hz >= 60 && r.hz <= 1250 && r.ap < 0.3;
+    if (pitched) this.lastPitched = time;
     if (r.rms < this.floor) this.floor = this.floor * 0.7 + r.rms * 0.3;
-    else this.floor = this.floor * 0.9985 + r.rms * 0.0015;
+    else if (time - this.lastPitched > 0.3) this.floor = this.floor * 0.9985 + r.rms * 0.0015;
 
-    const voiced = r.hz >= 60 && r.hz <= 1250 && r.ap < 0.3 && r.rms > this.gate();
+    const voiced = pitched && r.rms > this.gate();
     this.recent = this.recent.filter((p) => time - p.t < 0.1);
     if (!voiced) return null;
 

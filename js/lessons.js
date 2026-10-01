@@ -10,6 +10,7 @@ export class Builder {
     this.events = [];
     this.audio = [];
     this.cues = [];
+    this.tonic = null;
   }
   get spb() {
     return 60 / this.bpm;
@@ -25,9 +26,15 @@ export class Builder {
     this.cues.push({ t: this.t, text });
     return this;
   }
+  // Exercises that climb through keys set the key before each round, and every note
+  // after that carries it, so names, colours and do-re-mi follow the key change.
+  key(tonic) {
+    this.tonic = tonic;
+    return this;
+  }
   note(role, m, beats, extra = {}) {
     const d = this.sec(beats);
-    this.events.push({ t: this.t, d, m, role, ...extra });
+    this.events.push({ t: this.t, d, m, role, tonic: this.tonic, ...extra });
     // Sing notes only sound when the singer wears headphones (hp), so the mic never hears the guide.
     this.audio.push({ t: this.t, d, kind: 'guide', m, hp: role === 'sing' });
     this.t += d;
@@ -41,7 +48,7 @@ export class Builder {
   }
   glide(role, m1, m2, beats, extra = {}) {
     const d = this.sec(beats);
-    this.events.push({ t: this.t, d, m: m1, m2, role, ...extra });
+    this.events.push({ t: this.t, d, m: m1, m2, role, tonic: this.tonic, ...extra });
     this.audio.push({ t: this.t, d, kind: 'glide', m: m1, m2, hp: role === 'sing' });
     this.t += d;
     return this;
@@ -128,7 +135,7 @@ function patternStep(range, { title, degrees, patterns, keys = 3, bpm = 90, vowe
   const tonics = keyLadder(range, lo, hi, keys);
   const b = new Builder(bpm);
   tonics.forEach((T, k) => {
-    b.cue(tonics.length > 1 ? `Key ${k + 1} of ${tonics.length}` : '');
+    b.key(T).cue(tonics.length > 1 ? `Key ${k + 1} of ${tonics.length}` : '');
     for (const p of pats) echo(b, pattern(T, p, last), { chord: triad(T, minor) });
   });
   return b.build({ title, vowel, tonic: tonics[0], minor, intro });
@@ -163,7 +170,7 @@ function staccatoStep(range, keys = 3) {
   const b = new Builder(100);
   const tonics = keyLadder(range, 0, 7, keys);
   tonics.forEach((T, k) => {
-    b.cue(`Key ${k + 1} of ${tonics.length}`);
+    b.key(T).cue(`Key ${k + 1} of ${tonics.length}`);
     const degs = [0, 4, 7, 4, 0];
     for (const d of degs) {
       b.listen(T + d, 0.5);

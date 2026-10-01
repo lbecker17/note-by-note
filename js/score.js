@@ -14,6 +14,19 @@ export function targetAt(ev, time) {
   return ev.m + (ev.m2 - ev.m) * u;
 }
 
+// The key (tonic) a note belongs to. Exercises that climb through keys tag each note;
+// everything else is in the step's one key.
+export function keyOf(ev, step) {
+  return ev && ev.tonic != null ? ev.tonic : step.tonic;
+}
+
+// The key at a moment in a step: the note under the playhead, or the next one coming.
+export function keyAt(step, time) {
+  const evs = step.events || [];
+  for (const ev of evs) if (ev.t + ev.d > time) return keyOf(ev, step);
+  return keyOf(evs[evs.length - 1], step);
+}
+
 // Distance to the target in semitones. Singing the right note in another octave
 // counts (octave says which way); any other miss is measured as sung.
 export function foldDiff(m, target) {
@@ -139,6 +152,19 @@ export function summarize(steps) {
   };
 }
 
+// Share of the singing time (0 to 1) when the mic heard a voice, from a summarize() result.
+// A run heard for less than HEARD_MIN of it doesn't count toward progress or the streak:
+// most likely nobody sang, or the mic couldn't pick them up.
+export const HEARD_MIN = 0.2;
+
+export function heardShare(sum) {
+  return sum && sum.total ? sum.coverage : 0;
+}
+
+export function wasHeard(sum) {
+  return heardShare(sum) >= HEARD_MIN;
+}
+
 export function verdict(score) {
   if (score >= 0.85) return 'Spot on';
   if (score >= 0.65) return 'Nicely done';
@@ -192,7 +218,7 @@ export function reportText({ title, sum, range, voice, strictKey, date }) {
       flush();
       current = part;
     }
-    const flats = prefersFlats(n.step.tonic, !!n.step.minor);
+    const flats = prefersFlats(keyOf(n.ev, n.step), !!n.step.minor);
     const name = n.ev.m2 != null ? `slide ${letterName(n.ev.m, { flats })}→${letterName(n.ev.m2, { flats })}` : letterName(n.ev.m, { flats });
     const word = n.ev.text ? ` “${n.ev.text}”` : '';
     row.push(n.voiced ? `${name}${word} ${cents(n.avgSigned)} (${Math.round(n.score * 100)}%)` : `${name}${word} not heard`);

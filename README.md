@@ -16,7 +16,7 @@ Open **https://lbecker17.github.io/note-by-note/** in Safari on your iPhone, the
 ## Good to know
 
 - Nothing you sing is recorded or sent anywhere. Pitch detection runs on the phone.
-- Progress is stored on the device only.
+- Progress is stored on the device only. A run only counts toward your streak and best scores if the mic heard you for at least a fifth of the singing time.
 - Headphones let you hear the guide note while you sing. Without them, you hear each part first, then sing it back.
 - Works offline once it has loaded.
 
