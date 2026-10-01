@@ -4,7 +4,7 @@ import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer } from './songs.
 import { Lane, drawOverview, drawSong } from './lane.js';
 import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, fitShift } from './music.js';
 import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, offWords } from './score.js';
-import { store, today, week, warmedToday } from './store.js';
+import { store, today, week, warmedToday, songPassToday } from './store.js';
 import { findNotes, findKey, quantize, harmonize, arrange, describe, TEMPOS } from './tune.js';
 import { writeFamilySongFile, familySongFileName, validateSong, isFamilySongId, SONG_LIMITS } from './nbn.js';
 import { library, askToPersist } from './library.js';
@@ -73,7 +73,9 @@ const sset = (k, v) => {
 // openItem, read these.
 const lockEnabled = () => S().warmupLock !== false;
 const warmedUpToday = () => warmedToday();
-const songsUnlocked = () => !lockEnabled() || warmedUpToday();
+// A grown-up can also open songs for the rest of today from the lock sheet (PIN), e.g. to try a
+// new family song. It doesn't mark the warm-up as done.
+const songsUnlocked = () => !lockEnabled() || warmedUpToday() || songPassToday();
 
 // The warm-up's steps as pictures, for the Today hero and the "Up next" card. Step 5 is today's
 // challenge, a control move (ctl: 'hold' | 'bounce' | 'swell' | 'slide'), marked { today: true }.
@@ -346,7 +348,9 @@ function settingsSheet(gate = null) {
   const warm = store.data.warm;
   const status = warmedUpToday()
     ? `${ICON.check}Today: warmed up${warm.at ? ` at ${clockTime(warm.at)}` : ''}`
-    : 'Not yet today';
+    : songPassToday()
+      ? `${ICON.unlock}Today: songs opened by a grown-up`
+      : 'Not yet today';
   const strictCents = Object.values(STRICTNESS).map((t) => `${t.good} (${t.label})`);
   const html = `
     <h2>Settings</h2>
@@ -647,8 +651,22 @@ function lockSheet(target) {
      <p>Today’s challenge: <span class="ctl">${esc(WARMUP.controlTitle())}</span></p>
      <button class="btn primary big wide" data-act="lock-warm">${ICON.play}Start warm-up</button>
      <button class="btn text wide" data-act="sheet-close">Not now</button>
-     <button class="care-link" data-act="lock-care">${ICON.heart}Throat sore today? Rest your voice</button>`,
+     <button class="care-link" data-act="lock-care">${ICON.heart}Throat sore today? Rest your voice</button>
+     <div class="grown-ups"><span>For grown-ups:</span><button class="quiet-link" data-act="lock-pass">Open songs for today</button></div>`,
     {
+      'lock-pass': () => {
+        const song = pendingSong;
+        grownUp({
+          why: 'Enter your PIN to open songs for the rest of today without a warm-up.',
+          then: () => {
+            store.setSongPass();
+            closeSheet(true);
+            if (current && current.refresh) current.refresh();
+            if (song) openItem(song.kind, song.id);
+          },
+          back: () => lockSheet(song),
+        });
+      },
       'lock-warm': () => {
         closeSheet(true);
         openItem('warmup', 'warmup');

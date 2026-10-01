@@ -59,6 +59,12 @@ export const store = {
     this.data.warm = w;
     this.save();
   },
+  // A grown-up opened songs for today without a warm-up (PIN). Like a warm-up it lasts until local
+  // midnight, but it isn't a practice day and the warm-up still shows as not done.
+  setSongPass() {
+    this.data.songPass = { day: today() };
+    this.save();
+  },
   putOffNudge(kind) {
     this.data.nudge = { ...this.data.nudge, [kind]: today() };
     this.save();
@@ -82,8 +88,8 @@ export const store = {
   // Clears scores and practice days. Resetting scores shouldn't lock songs again, so today's warm-up
   // stays, and neither the PIN nor the family songs (which live in IndexedDB) are touched.
   reset() {
-    const { range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, pin, pinLock, persistAsked } = this.data;
-    this.data = { ...DEFAULTS(), range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, pin, pinLock, persistAsked };
+    const { range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, songPass, pin, pinLock, persistAsked } = this.data;
+    this.data = { ...DEFAULTS(), range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, songPass, pin, pinLock, persistAsked };
     this.save();
   },
 };
@@ -97,6 +103,10 @@ export function today(d = new Date()) {
 
 // True once a warm-up has counted today. It resets at local midnight with no timer:
 // everything that shows or enforces the lock asks again when it renders or opens.
+export function songPassToday() {
+  return !!(store.data.songPass && store.data.songPass.day === today());
+}
+
 export function warmedToday() {
   return !!(store.data.warm && store.data.warm.day === today());
 }
