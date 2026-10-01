@@ -377,8 +377,9 @@ export const ORDER = UNITS.flatMap((u) => u.lessons);
 
 export const WARMUP = {
   id: 'warmup',
-  title: 'Daily warmup',
+  title: 'Daily warm-up',
   blurb: 'Sirens, scales, an arpeggio and a long note. About three minutes.',
+  minutes: 3, // the one place the warm-up's length lives: Today, Songs and the lock all read it
   build: (range) => [
     sirenStep(range, 3, { title: 'Sirens' }),
     patternStep(range, {

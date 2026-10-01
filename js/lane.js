@@ -153,7 +153,7 @@ export class Lane {
       g.stroke();
       if (inScale && rh >= 8) {
         g.fillStyle = C['lane-label'];
-        g.font = `${strong ? 700 : 600} 11px ${font}`;
+        g.font = `${strong ? 800 : 700} 12px ${font}`;
         g.fillText(this.noteLabel(m, tonic), this.gutter - 8, yy);
       }
     }
@@ -242,7 +242,7 @@ export class Lane {
         g.rect(x0 + 5, top, x1 - x0 - 8, barH);
         g.clip();
         g.fillStyle = ink;
-        g.font = `700 ${Math.round(Math.min(13, barH * 0.56))}px ${font}`;
+        g.font = `800 ${Math.round(Math.min(13, barH * 0.56))}px ${font}`;
         g.textAlign = 'left';
         g.fillText(text, x0 + 7, yy + 0.5);
         g.restore();
@@ -287,6 +287,15 @@ export class Lane {
       const dm = live.dm != null ? live.dm : live.m;
       const px = this.playX, py = this.y(clampM(dm));
       const color = live.k === 1 ? C[live.fam] : live.k === 0.5 ? C.near : live.k === 0 ? C.off : C.trace;
+      // A soft halo when you're in tune: a wordless "yes".
+      if (live.k === 1) {
+        g.globalAlpha = 0.25;
+        g.fillStyle = color;
+        g.beginPath();
+        g.arc(px, py, 13, 0, Math.PI * 2);
+        g.fill();
+        g.globalAlpha = 1;
+      }
       g.fillStyle = color;
       g.beginPath();
       g.arc(px, py, 7.5, 0, Math.PI * 2);
