@@ -127,11 +127,11 @@ function circularMean(xs, ws) {
 // often, and then plain rounding picks a note the tune never uses. So each note weighs how
 // close it is to each semitone (a bell curve as wide as this singer's own scatter round the
 // tuning) against how much the take uses that pitch class: its own sung pitch classes, plus
-// the scale of the key they suggest. An accurate singer's chromatic note stays put (it is
-// close to its semitone); a wobbly note between two semitones goes to the one in the tune.
+// the scale its pitches fit. An accurate singer's chromatic note stays put (it is close to
+// its semitone); a wobbly note between two semitones goes to the one in the tune.
 // p never moves more than a semitone from the measured centre.
-const SCALES = { major: [0, 2, 4, 5, 7, 9, 11], minor: [0, 2, 3, 5, 7, 8, 10] };
-const KEY_CLOSE = 0.1; // keys scoring within this of the best are all still in the running
+const MAJOR = [0, 2, 4, 5, 7, 9, 11];
+const SCALE_CLOSE = 1; // scales whose fit is within this (log-likelihood, seconds) of the best still count
 function aimedNotes(found, tuning, R) {
   const p = found.map((n) => Math.round(n.m - tuning));
   if (found.length < 3) return p;
@@ -152,35 +152,46 @@ function aimedNotes(found, tuning, R) {
     return { f, a: (w * a) / (a + b), b: (w * b) / (a + b), w };
   });
   const total = used.reduce((s, u) => s + u, 0);
-  for (let pass = 0; pass < 2; pass++) {
-    // The scale counts only as far as the likely keys agree on it: when major and minor (or
-    // a key and its neighbour) are close, the notes they disagree about are left to the
-    // singing itself, or a guessed key would pull its own third into line and prove itself.
-    const { keys } = rankKeys(found.map((n, i) => ({ t0: n.t0, t1: n.t1, p: p[i], conf: n.conf })));
-    const likely = keys.filter((k) => k.score >= keys[0].score - KEY_CLOSE);
-    const inScale = new Array(12).fill(0);
-    for (const k of likely) for (const step of SCALES[k.mode]) inScale[pc(k.tonic + step)] += 1 / likely.length;
+  // Which scale the tune is in, judged on the measured pitches themselves rather than on
+  // rounded notes (whose mistakes would only confirm themselves): each of the twelve major
+  // scales (a minor key shares its relative major's) scores how well it explains every note,
+  // a note counting as either of its two nearest semitones. Scales that do about as well as
+  // the best all count, so a pentatonic tune, which fits three scales, leans on the five
+  // notes they share and leaves the rest to the singing.
+  const fit = new Float64Array(12);
+  for (let tonic = 0; tonic < 12; tonic++) {
+    const inKey = (q) => (MAJOR.includes(pc(q - tonic)) ? 0.9 / 7 : 0.1 / 5);
     found.forEach((n, i) => {
-      const x = n.m - tuning;
       const o = own[i];
-      const rest = Math.max(1e-9, total - o.w);
-      const prior = (q) => {
-        const c = pc(q);
-        const mine = c === pc(o.f) ? o.a : c === pc(o.f + 1) ? o.b : 0;
-        return Math.max(0, used[c] - mine) / rest + (2 / 7) * inScale[c] + 0.02;
-      };
-      let best = p[i];
-      let bestS = -Infinity;
-      for (let q = Math.ceil(n.m - 1); q <= Math.floor(n.m + 1); q++) {
-        const s = -((x - q) ** 2) / (2 * sig * sig) + Math.log(prior(q));
-        if (s > bestS) {
-          bestS = s;
-          best = q;
-        }
-      }
-      p[i] = best;
+      const x = n.m - tuning;
+      fit[tonic] += o.w * Math.log(near(x, o.f) * inKey(o.f) + near(x, o.f + 1) * inKey(o.f + 1) + 1e-12);
     });
   }
+  const top = Math.max(...fit);
+  const likely = [];
+  for (let tonic = 0; tonic < 12; tonic++) if (fit[tonic] >= top - SCALE_CLOSE) likely.push(tonic);
+  const inScale = new Array(12).fill(0);
+  for (const tonic of likely) for (const step of MAJOR) inScale[pc(tonic + step)] += 1 / likely.length;
+  found.forEach((n, i) => {
+    const x = n.m - tuning;
+    const o = own[i];
+    const rest = Math.max(1e-9, total - o.w);
+    const prior = (q) => {
+      const c = pc(q);
+      const mine = c === pc(o.f) ? o.a : c === pc(o.f + 1) ? o.b : 0;
+      return Math.max(0, used[c] - mine) / rest + (2 / 7) * inScale[c] + 0.02;
+    };
+    let best = p[i];
+    let bestS = -Infinity;
+    for (let q = Math.ceil(n.m - 1); q <= Math.floor(n.m + 1); q++) {
+      const s = -((x - q) ** 2) / (2 * sig * sig) + Math.log(prior(q));
+      if (s > bestS) {
+        bestS = s;
+        best = q;
+      }
+    }
+    p[i] = best;
+  });
   return p;
 }
 
