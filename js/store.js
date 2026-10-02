@@ -1,6 +1,14 @@
-// Progress and settings, kept on this device only.
+// Progress and settings: the working copy for the singer using this device. Signed out, it is
+// all there is. With a family account (js/family.js) it is one singer's copy, synced with the
+// family's profile_state row; the keys in PROFILE_KEYS travel with the singer, and the grown-up
+// PIN and its lockout stay with the device.
+
+import { PROFILE_KEYS, clean } from './sync.js';
 
 const KEY = 'note-by-note:v1';
+// When the range and settings last changed, and the last "Reset progress", in ms. The family
+// sync uses them to tell which side is newer (js/sync.js).
+const NO_STAMPS = () => ({ range: 0, settings: 0, reset: 0 });
 
 const DEFAULTS = () => ({
   range: null,
@@ -16,6 +24,7 @@ const DEFAULTS = () => ({
   pin: null, // the grown-up PIN as { v, salt, hash } (js/pin.js), never the digits
   pinLock: null, // wrong PINs: { fails, until, lockouts }, so a reload doesn't end a lockout
   persistAsked: false, // navigator.storage.persist() asked once, after the first family song
+  stamps: NO_STAMPS(),
 });
 
 function load() {
@@ -24,7 +33,7 @@ function load() {
     if (!raw) return DEFAULTS();
     const d = JSON.parse(raw);
     const base = DEFAULTS();
-    const data = { ...base, ...d, settings: { ...base.settings, ...(d.settings || {}) } };
+    const data = { ...base, ...d, settings: { ...base.settings, ...(d.settings || {}) }, stamps: { ...NO_STAMPS(), ...(d.stamps || {}) } };
     // Saves from before rangeAt existed start the re-test clock today, so there's no nag on first launch.
     if (data.range && !data.rangeAt) data.rangeAt = today();
     return data;
@@ -35,15 +44,34 @@ function load() {
 
 export const store = {
   data: load(),
-  save() {
+  // Called after every save (js/family.js uses it to sync the singer's changes).
+  onSave: null,
+  save(notify = true) {
     try {
       localStorage.setItem(KEY, JSON.stringify(this.data));
     } catch (e) {
       /* storage unavailable: the app still works for this session */
     }
+    if (notify && this.onSave) this.onSave();
+  },
+  // The singer's own part of the data (what syncs), as a copy.
+  profileData() {
+    const out = {};
+    for (const k of PROFILE_KEYS) out[k] = this.data[k] === undefined ? null : JSON.parse(JSON.stringify(this.data[k]));
+    return out;
+  },
+  // Make another singer's data (or a fresh start, with null) the working copy. The device's own
+  // keys (PIN, lockout, persistAsked) stay. Saved without telling onSave: nothing new to sync.
+  useProfile(d) {
+    const c = clean(d || {});
+    const base = DEFAULTS();
+    for (const k of PROFILE_KEYS) this.data[k] = c[k] == null ? base[k] : c[k];
+    if (!d) this.data.songPass = null;
+    this.save(false);
   },
   setSetting(k, v) {
     this.data.settings[k] = v;
+    this.data.stamps = { ...NO_STAMPS(), ...this.data.stamps, settings: Date.now() };
     this.save();
   },
   // from: 'test' for the range test, or the preset's key ('child', 'high', 'low').
@@ -52,6 +80,7 @@ export const store = {
     this.data.range = range;
     this.data.rangeAt = today();
     this.data.rangeFrom = from;
+    this.data.stamps = { ...NO_STAMPS(), ...this.data.stamps, range: Date.now() };
     this.save();
   },
   // A warm-up the app heard: it opens songs until local midnight.
@@ -75,6 +104,7 @@ export const store = {
     p.last = score;
     p.runs += 1;
     p.at = today();
+    p.t = Date.now();
     this.data.progress[id] = p;
     const t = today();
     if (!this.data.days.includes(t)) this.data.days.push(t);
@@ -88,8 +118,8 @@ export const store = {
   // Clears scores and practice days. Resetting scores shouldn't lock songs again, so today's warm-up
   // stays, and neither the PIN nor the family songs (which live in IndexedDB) are touched.
   reset() {
-    const { range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, songPass, pin, pinLock, persistAsked } = this.data;
-    this.data = { ...DEFAULTS(), range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, songPass, pin, pinLock, persistAsked };
+    const { range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, songPass, pin, pinLock, persistAsked, stamps } = this.data;
+    this.data = { ...DEFAULTS(), range, rangeAt, rangePrev, rangeFrom, settings, nudge, warm, songPass, pin, pinLock, persistAsked, stamps: { ...NO_STAMPS(), ...stamps, reset: Date.now() } };
     this.save();
   },
 };

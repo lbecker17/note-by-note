@@ -6,9 +6,10 @@ import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, 
 import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, speakerBleed, offWords } from './score.js';
 import { store, today, week, warmedToday, songPassToday } from './store.js';
 import { findNotes, findKey, quantize, harmonize, arrange, describe, TEMPOS } from './tune.js';
-import { writeFamilySongFile, familySongFileName, validateSong, isFamilySongId, SONG_LIMITS } from './nbn.js';
+import { writeFamilySongFile, familySongFileName, validateSong, isFamilySongId, SONG_LIMITS, FAMILY_CREDIT } from './nbn.js';
 import { library, askToPersist } from './library.js';
 import { makePin, checkPin, isPinShape, pinSupported } from './pin.js';
+import { family as account, hooks, cleanName as cleanSinger, NAME_MAX } from './family.js';
 import { ICON, PHASE_ICON, MARK, SQUIGGLE, STAFF, BURST, AROUND, confetti, rating, hum, WARM_STEPS, CONTROL_STEP, MOVE_ART, moveRing } from './art.js';
 
 const audio = new AudioEngine();
@@ -25,7 +26,7 @@ const PRESET_INFO = [
   ['low', 'Lower voice', 'men, and teen boys whose voice has dropped'],
 ];
 const VOICE_CHANGING = 'Voice changing (cracks, squeaks, new low notes)? Do the range test instead. It finds where your voice is right now.';
-const VERSION = '1.1';
+const VERSION = '1.2';
 // The app talks in one voice, as “I”: “I couldn’t hear you”, “I set How strict to Relaxed”.
 const NOT_HEARD = 'I couldn’t hear you';
 const NOT_FOLLOWED = 'I couldn’t hear the tune';
@@ -386,12 +387,13 @@ function settingsSheet(gate = null) {
         : ''
     }
     <p class="lock-note">This is a gentle nudge, not a real lock. I check that someone sang along with the warm-up, but I can’t be certain.</p>
+    ${accountFieldHTML()}
     <div class="field">
-      <div><b>Family songs</b><p>${familyState === 'unavailable' ? 'Can’t be saved in this browser window.' : `${familySongs.length || 'None'} on this phone. Songs you’ve bought, kept private.`}</p></div>
+      <div><b>Family songs</b><p>${familyState === 'unavailable' ? 'Can’t be saved in this browser window.' : `${familySongs.length || 'None'} ${onDevice()}. Songs you’ve bought, kept private.`}</p></div>
       ${familyState === 'unavailable' ? '' : '<button class="btn small secondary" data-act="fam-add">Add a song</button>'}
     </div>
     <div class="field">
-      <div><b>Grown-up PIN</b><p>${store.data.pin ? 'Set. Needed to add, move or delete family songs, and to turn off the warm-up switch.' : 'Not set yet. I’ll ask for one the first time a grown-up needs it.'}</p></div>
+      <div><b>Grown-up PIN</b><p>${store.data.pin ? `Set on this device. Needed to add, ${signedIn() ? 'rename' : 'move'} or delete family songs${signedIn() ? ', add singers' : ''}, and to turn off the warm-up switch.` : 'Not set yet. I’ll ask for one the first time a grown-up needs it.'}</p></div>
       <button class="btn small secondary" data-act="pin-change">${store.data.pin ? 'Change PIN' : 'Set PIN'}</button>
     </div>
     <div class="field">
@@ -401,7 +403,7 @@ function settingsSheet(gate = null) {
     <div class="field">
       <div><b>How strict, in cents</b><p>Singing counts as in tune within ${strictCents.slice(0, -1).join(', ')} or ${strictCents[strictCents.length - 1]} cents of the note. 100 cents is one half step.</p></div>
     </div>
-    <p class="about">Note by Note ${VERSION} · Nothing you sing is recorded or leaves this device.</p>
+    <p class="about">Note by Note ${VERSION} · ${signedIn() ? esc(ACCOUNT_PRIVACY) : 'Nothing you sing is recorded or leaves this device.'}</p>
     <button class="btn primary wide" data-act="sheet-close">Done</button>`;
   let armed = false;
   openSheet(
@@ -458,6 +460,7 @@ function settingsSheet(gate = null) {
       },
       gate: () => checkGate(),
       'pin-change': () => changePin(),
+      'acct-open': () => openAccount(),
     },
     { label: 'Settings', key: 'settings', cls: 'settings', onClose: () => current && current.refresh && current.refresh() }
   );
@@ -728,6 +731,7 @@ const GLOBAL = {
     show(rangeCtrl(), !(current && current.name === 'range'));
   },
   'fam-add': () => familyAdd(),
+  who: () => showWho(),
   'fam-menu': (el) => familyMenu(el.dataset.id),
   preset: (el) => {
     const relaxed = applyPreset(el.dataset.v);
@@ -997,8 +1001,11 @@ function tilesHTML(due) {
 function todayHTML() {
   const noRange = !store.data.range;
   const due = rangeDue();
+  const who = singer();
   return `<header class="top">
-      <div><p class="brandline">${MARK}Note by Note</p><h1>${greeting()}</h1>${SQUIGGLE}</div>
+      <div><p class="brandline">${MARK}Note by Note</p><h1>${greeting()}${who ? `, <span class="who-hi">${esc(who.name)}</span>` : ''}</h1>${SQUIGGLE}${
+        signedIn() ? `<button class="who-chip" data-act="who">${who ? avatarHTML(who, 'sm') : ''}<span>Switch singer</span></button>` : ''
+      }</div>
       <button class="icon-btn" data-act="settings" aria-label="Settings">${ICON.gear}</button>
     </header>
     ${noRange ? voiceStartHTML() : ''}
@@ -1014,7 +1021,8 @@ function todayHTML() {
           </section>`
         : ''
     }
-    <p class="foot">${ICON.heart}Nothing you sing is recorded or leaves this phone.</p>`;
+    <p class="foot">${ICON.heart}${signedIn() ? 'Nothing you sing is recorded. Scores are saved to your family.' : 'Nothing you sing is recorded or leaves this phone.'}</p>
+    ${syncLineHTML()}`;
 }
 
 const UNIT_META = {
@@ -1073,7 +1081,10 @@ function songRowHTML(s, locked, fam = false) {
   return `<li class="fam-item">${row}<button class="fam-more" data-act="fam-menu" data-id="${esc(s.id)}" aria-label="Grown-ups: change ${esc(s.title)}">${ICON_MORE}</button></li>`;
 }
 
-const FAMILY_FOOT = 'These songs are private to your family. They stay on this phone and are never shared by the app.';
+const familyFoot = () =>
+  signedIn()
+    ? 'These songs are private to your family. They’re shared with your family’s devices and no one else.'
+    : 'These songs are private to your family. They stay on this phone and are never shared by the app.';
 
 // Family songs: above the built-in songs once there are some; before that, a small card for
 // grown-ups below them.
@@ -1088,16 +1099,16 @@ function familyHTML(locked) {
   if (!familySongs.length) {
     return `<section class="card fam-empty" aria-labelledby="fam-h">
         <h2 id="fam-h">Family songs</h2>
-        <p>Grown-ups can add a song they’ve bought, like a karaoke file or sheet music. It stays on this phone only.</p>
+        <p>Grown-ups can add a song they’ve bought, like a karaoke file or sheet music. ${signedIn() ? 'It’s shared with your family’s devices only.' : 'It stays on this phone only.'}</p>
         <button class="btn secondary" data-act="fam-add">${ICON_PLUS}Add a song</button>
       </section>`;
   }
   const rows = familySongs.map((r) => songRowHTML(r.song, locked, true)).join('');
   return `<section class="family" aria-labelledby="fam-h">
-      <div class="section-label"><h2 id="fam-h">Family songs</h2><p class="only-here">${ICON.lock}Only on this phone</p></div>
+      <div class="section-label"><h2 id="fam-h">Family songs</h2><p class="only-here">${ICON.lock}${signedIn() ? 'Just for your family' : 'Only on this phone'}</p></div>
       <ol class="song-list${locked ? ' locked' : ''}">${rows}</ol>
       <div class="fam-foot">
-        <p>${FAMILY_FOOT}</p>
+        <p>${familyFoot()}</p>
         <button class="btn small secondary" data-act="fam-add">${ICON_PLUS}Add a song</button>
       </div>
     </section>`;
@@ -2972,7 +2983,9 @@ const ICON_MORE = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy
 const ICON_PLUS = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M12 5.5v13M5.5 12h13"/></svg>`;
 const ICON_SEND = `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 15V4M7.5 8.5 12 4l4.5 4.5M6 12.5v5a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-5"/></svg>`;
 
-const NOTICE_ADD = 'Only add a song file that you bought or have permission to use. Family songs are saved only on this phone. Note by Note never uploads them, and they are never part of the public app or website.';
+const NOTICE_ADD_LOCAL = 'Only add a song file that you bought or have permission to use. Family songs are saved only on this phone. Note by Note never uploads them, and they are never part of the public app or website.';
+const NOTICE_ADD_FAMILY = 'Only add a song file that you bought or have permission to use. Only the tune and words are kept (never the file), in your family’s private account, so your family’s devices can sing it. Family songs are never part of the public app or website.';
+const noticeAdd = () => (signedIn() ? NOTICE_ADD_FAMILY : NOTICE_ADD_LOCAL);
 const NOTICE_SEND = 'Only send songs to phones belonging to your own family. Song shops usually allow personal use only, and some don’t allow extra copies. Moving the song (not copying it) is the safest choice. Never post song files online or share them outside your family.';
 const LIBRARY_OFF = 'Family songs can’t be saved in this browser window. Private Browsing turns saving off: open Note by Note from the Home Screen, or in a normal Safari tab.';
 const FILE_MAX = 16 * 1024 * 1024; // bigger than any song file (the importers have their own limits)
@@ -2987,7 +3000,8 @@ const findRecord = (id) => familySongs.find((r) => r.id === id) || null;
 
 async function loadFamily() {
   try {
-    familySongs = await library.list();
+    const credit = signedIn() ? 'Family song · just for your family' : FAMILY_CREDIT;
+    familySongs = (await library.list()).map((r) => ({ ...r, song: { ...r.song, credit } }));
     familyState = 'ready';
   } catch (e) {
     familySongs = [];
@@ -3237,6 +3251,7 @@ function pinSheet(o) {
 // way around the PIN. Afterwards a new PIN is set and Settings opens; the action that asked for
 // the PIN is not carried out.
 function forgotPinSheet(o) {
+  if (signedIn()) return forgotPinFamily(o);
   let armed = false;
   const toSettings = () => settingsSheet();
   const n = familySongs.length;
@@ -3285,6 +3300,56 @@ function forgotPinSheet(o) {
   }
 }
 
+// Signed in, a forgotten PIN is reset with the family account's password instead: real proof of a
+// grown-up, so no family songs need deleting.
+function forgotPinFamily(o, msg = '') {
+  const toSettings = () => settingsSheet();
+  const bd = openSheet(
+    `<div class="pin-art" aria-hidden="true">${ICON.lock}</div>
+     <h2>Forgot the PIN?</h2>
+     <p>Type the family account’s password, then choose a new PIN.</p>
+     <div class="fam-field">
+       <label for="acct-pw">Password for ${esc(account.email())}</label>
+       <input id="acct-pw" class="text-input" type="password" autocomplete="current-password">
+     </div>
+     ${msg ? `<p class="err" role="alert">${esc(msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="pin-keep">Go back</button>
+       <button class="btn primary" data-act="pin-pw">Continue</button>
+     </div>
+     <details class="fam-help"><summary>Forgot the password?${ICON.chev}</summary><p>${NO_EMAIL_HELP}</p></details>`,
+    {
+      'pin-keep': () => pinSheet({ ...o, mode: 'check', msg: '' }),
+      'pin-pw': (btn) => go(btn),
+    },
+    { label: 'Forgot PIN', key: 'pin-forgot', cls: 'pin' }
+  );
+  const input = bd.querySelector('#acct-pw');
+  input.focus({ preventScroll: true });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      go(bd.querySelector('[data-act="pin-pw"]'));
+    }
+  });
+  let busy = false;
+  async function go(btn) {
+    if (busy) return;
+    if (!input.value) return forgotPinFamily(o, 'Type the password.');
+    if (navigator.onLine === false) return forgotPinFamily(o, 'I need the internet to check the password. Try again when you’re online.');
+    busy = true;
+    btn.disabled = true;
+    try {
+      await account.signIn(account.email(), input.value);
+    } catch (e) {
+      return forgotPinFamily(o, e && e.code === 'bad' ? 'That password didn’t work. Try again.' : netWords(e, 'I couldn’t check that. Try again.'));
+    }
+    store.setPin(null);
+    setPinLock(null);
+    pinSheet({ mode: 'new', then: toSettings, back: toSettings });
+  }
+}
+
 // ---- Adding a song ----
 
 function familyAdd() {
@@ -3299,7 +3364,7 @@ function addSheet(msg = '') {
   openSheet(
     `<p class="eyebrow">Family songs</p>
      <h2>Add a song from a file</h2>
-     <p class="notice">${NOTICE_ADD}</p>
+     <p class="notice">${noticeAdd()}</p>
      ${msg ? `<p class="err" role="alert">${esc(msg)}</p>` : ''}
      <button class="btn primary big wide" data-act="fam-pick">${ICON_PLUS}Choose a file</button>
      <details class="fam-help">
@@ -3309,7 +3374,7 @@ function addSheet(msg = '') {
          <li><b>Save it to Files.</b> Tap Download. It goes to Files, in Downloads. If it’s a .zip, tap it once in Files to unzip it.</li>
          <li><b>Come back here</b>, tap Choose a file and pick it. I’ll show you the song before it’s added.</li>
        </ol>
-       <p class="muted">From another family phone? Save the .nbn file to Files, then choose it here.</p>
+       ${signedIn() ? '' : '<p class="muted">From another family phone? Save the .nbn file to Files, then choose it here.</p>'}
      </details>
      <button class="btn text wide" data-act="sheet-close">Cancel</button>`,
     {
@@ -3499,7 +3564,7 @@ function previewSheet(pv) {
         : ''
     }
     ${warnings.length ? `<div class="fam-warn"><h3>Good to know</h3><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
-    <p class="notice">${NOTICE_ADD}</p>
+    <p class="notice">${noticeAdd()}</p>
     ${pv.msg ? `<p class="err" role="alert">${esc(pv.msg)}</p>` : ''}
     <div class="sheet-actions">
       <button class="btn secondary" data-act="fam-cancel">Cancel</button>
@@ -3588,6 +3653,7 @@ async function saveFamily(pv, piece, btn) {
   try {
     const saved = await library.put(rec);
     familySongs = [...familySongs.filter((r) => r.id !== saved.id), saved];
+    account.songPut(saved.id);
   } catch (e) {
     pv.msg = e && e.message ? e.message : 'I couldn’t save that. Try again.';
     previewSheet(pv);
@@ -3621,7 +3687,7 @@ function familyMenu(id) {
 function songMenuSheet(id) {
   const rec = findRecord(id);
   if (!rec) return closeSheet();
-  const from = rec.via === 'nbn' ? 'from another family phone' : rec.source && rec.source.fileName ? `from “${cleanName(rec.source.fileName)}”` : '';
+  const from = rec.via === 'nbn' ? 'from another family phone' : !rec.via && signedIn() ? '' : rec.source && rec.source.fileName ? `from “${cleanName(rec.source.fileName)}”` : '';
   const added = shortDate(rec.addedAt);
   openSheet(
     `<p class="eyebrow">Family song</p>
@@ -3629,7 +3695,7 @@ function songMenuSheet(id) {
      ${added || from ? `<p class="muted">${esc([added && `Added ${added}`, from].filter(Boolean).join(', '))}</p>` : ''}
      <div class="fam-menu">
        <button class="field link-row" data-act="fam-rename"><span><b>Rename</b></span>${ICON.chev}</button>
-       <button class="field link-row" data-act="fam-move"><span>${ICON_SEND}<b>Move to another family phone</b></span>${ICON.chev}</button>
+       ${signedIn() ? '' : `<button class="field link-row" data-act="fam-move"><span>${ICON_SEND}<b>Move to another family phone</b></span>${ICON.chev}</button>`}
        <button class="field link-row danger" data-act="fam-delete"><span><b>Delete</b></span>${ICON.chev}</button>
      </div>
      <button class="btn primary wide" data-act="sheet-close">Done</button>`,
@@ -3683,6 +3749,7 @@ function renameSheet(id, msg = '') {
     try {
       const saved = await library.put({ ...rec, song: { ...v.song, id: rec.id } });
       familySongs = familySongs.map((r) => (r.id === id ? saved : r));
+      account.songPut(id);
     } catch (e) {
       return renameSheet(id, e && e.message ? e.message : 'I couldn’t save that. Try again.');
     }
@@ -3696,7 +3763,7 @@ function deleteSheet(id) {
   if (!rec) return closeSheet();
   openSheet(
     `<h2>Delete this song?</h2>
-     <p>“${esc(rec.song.title)}” and its scores will be gone from this phone. To sing it again, a grown-up adds the song file again.</p>
+     <p>“${esc(rec.song.title)}” and its scores will be gone from ${signedIn() ? 'every family device' : 'this phone'}. To sing it again, a grown-up adds the song file again.</p>
      <div class="sheet-actions">
        <button class="btn secondary" data-act="fam-back">Keep it</button>
        <button class="btn danger" data-act="fam-delete-yes">Delete song</button>
@@ -3706,7 +3773,7 @@ function deleteSheet(id) {
       'fam-delete-yes': async (btn) => {
         btn.disabled = true;
         if (await removeFamily(id)) {
-          openSheet(`<h2>Deleted</h2><p>“${esc(rec.song.title)}” is gone from this phone.</p><button class="btn primary wide" data-act="sheet-close">Done</button>`, {}, { label: 'Deleted' });
+          openSheet(`<h2>Deleted</h2><p>“${esc(rec.song.title)}” is gone from ${signedIn() ? 'your family’s devices' : 'this phone'}.</p><button class="btn primary wide" data-act="sheet-close">Done</button>`, {}, { label: 'Deleted' });
         }
       },
     },
@@ -3722,6 +3789,7 @@ async function removeFamily(id) {
     return false;
   }
   familySongs = familySongs.filter((r) => r.id !== id);
+  account.songDelete(id);
   if (store.data.progress['song:' + id]) {
     delete store.data.progress['song:' + id];
     store.save();
@@ -3857,6 +3925,599 @@ function arrivedSheet(id, keep, how) {
   );
 }
 
+// ---------- Family account: singers on every family device (js/family.js) ----------
+// A grown-up signs a device in once (email and password). Then the app opens on "Who's singing?",
+// each child has their own range, settings and scores, and family songs are shared by every
+// family device. Signed out, nothing here shows and the app works as a single-singer app.
+// Every string from the server (names, titles) is escaped before it reaches the page.
+
+const AVATARS = ['initial.apricot', 'star.honey', 'heart.plum', 'sprout.leaf', 'wave.sky', 'mic.apricot', 'ladder.honey', 'wind.sky', 'songs.plum', 'initial.leaf'];
+const AV_MOTIFS = ['initial', 'star', 'heart', 'sprout', 'wave', 'mic', 'ladder', 'wind', 'songs'];
+const AV_COLOURS = ['apricot', 'honey', 'plum', 'leaf', 'sky'];
+const SYNC_WORDS = {
+  syncing: 'Saving to family…',
+  saved: 'Saved to family',
+  offline: 'Will sync when online',
+  later: 'Will sync in a little while',
+  signin: 'Sign in again to sync',
+};
+const ACCOUNT_PRIVACY = 'With a family account, singers, scores and family songs (tune and words only) are kept in your family’s private account in Sydney. Singing is never recorded or uploaded.';
+const NO_EMAIL_HELP = 'I can’t email a new password. The grown-up who set up the family’s Supabase project can set one: in the Supabase dashboard, open Authentication, then Users, choose your email and reset the password.';
+const signedIn = () => account.signedIn();
+const singer = () => (signedIn() ? account.profile() : null);
+const onDevice = () => (signedIn() ? 'in your family' : 'on this phone');
+
+function parseAvatar(a) {
+  const [m, c] = String(a || '').split('.');
+  return { m: AV_MOTIFS.includes(m) ? m : 'initial', c: AV_COLOURS.includes(c) ? c : 'apricot' };
+}
+const initialOf = (name) => (Array.from(String(name || '?').trim())[0] || '?').toUpperCase();
+function avatarHTML(p, cls = '') {
+  const { m, c } = parseAvatar(p && p.avatar);
+  const inner = m === 'initial' ? `<b>${esc(initialOf(p && p.name))}</b>` : ICON[m];
+  return `<span class="av av-${c}${cls ? ' ' + cls : ''}" aria-hidden="true">${inner}</span>`;
+}
+
+// The quiet sync line: "Saved to family", "Will sync when online". Updated in place.
+function syncLineHTML() {
+  if (!signedIn()) return '';
+  const w = SYNC_WORDS[account.status] || '';
+  return `<p class="sync-line" data-sync="${esc(account.status)}" role="status">${w}</p>`;
+}
+function updateSyncLines() {
+  const w = SYNC_WORDS[account.status] || '';
+  for (const el of document.querySelectorAll('.sync-line')) {
+    el.dataset.sync = account.status;
+    setText(el, w);
+  }
+}
+
+const shortDay = (day) => {
+  const t = Date.parse(day + 'T12:00:00');
+  return Number.isFinite(t) ? new Date(t).toLocaleDateString('en-AU', { weekday: 'short', day: 'numeric', month: 'short' }) : '';
+};
+function summaryText(s) {
+  if (!s) return '…';
+  if (!s.last && !s.lessons) return 'Not sung yet';
+  return [
+    `${s.week} ${s.week === 1 ? 'day' : 'days'} this week`,
+    `${s.lessons} ${s.lessons === 1 ? 'lesson' : 'lessons'} with a best score`,
+    s.last ? `last sang ${shortDay(s.last)}` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+const isEmail = (s) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s);
+const netWords = (e, fallback) => (e && e.code === 'offline' ? 'I need the internet for that. Try again when you’re online.' : (e && e.message) || fallback);
+
+// ---- "Who's singing?" ----
+
+function whoCtrl() {
+  document.body.dataset.screen = 'who';
+  const render = () => {
+    const list = account.profiles();
+    const cur = account.profileId();
+    const cards = list
+      .map(
+        (p) => `<li><button class="who-card${p.id === cur ? ' current' : ''}" data-act="who-pick" data-id="${esc(p.id)}" aria-label="${esc(p.name)}${p.code ? ', has a code' : ''}">
+          ${avatarHTML(p, 'lg')}<span class="who-name">${esc(p.name)}</span>${p.code ? `<span class="who-code">${ICON.lock}Code</span>` : ''}
+        </button></li>`
+      )
+      .join('');
+    root.innerHTML = `<main class="tabscreen who" id="main">
+      <header class="top"><div><p class="brandline">${MARK}Note by Note</p><h1>Who’s singing?</h1>${SQUIGGLE}</div></header>
+      ${list.length ? '' : '<p class="who-empty">No singers yet. A grown-up can add one.</p>'}
+      <ul class="who-grid">${cards}
+        <li><button class="who-card add" data-act="who-add"><span class="av lg av-add" aria-hidden="true">${ICON_PLUS}</span><span class="who-name">Add a singer</span><span class="who-code">Grown-ups</span></button></li>
+      </ul>
+      ${syncLineHTML()}
+      <div class="grown-ups"><span>For grown-ups:</span><button class="quiet-link" data-act="who-family">Family</button></div>
+    </main>`;
+  };
+  render();
+  return {
+    name: 'who',
+    actions: {
+      'who-pick': (el) => {
+        const p = account.profile(el.dataset.id);
+        if (!p) return;
+        if (p.code && p.id !== account.profileId()) codeSheet(p);
+        else pickSinger(p.id);
+      },
+      'who-add': () => grownUp({ why: 'Enter your PIN to add a singer.', then: () => singerSheet({}) }),
+      'who-family': () => grownUp({ why: 'Enter your PIN to see the family.', then: () => familySheet() }),
+    },
+    refresh: render,
+    probe: () => ({ screen: 'who', singers: account.profiles().map((p) => p.name) }),
+  };
+}
+
+function showWho(push = true) {
+  show(whoCtrl(), push);
+}
+
+function pickSinger(id) {
+  closeSheet(true);
+  const was = account.profileId();
+  account.select(id).then(() => refreshHome());
+  if (was !== id) {
+    tab = 'today';
+    sset('nbn:tab', 'today');
+    for (const k of Object.keys(scrollMem)) scrollMem[k] = 0;
+  }
+  show(homeCtrl(), false);
+  history.replaceState({ nbn: 0 }, '');
+}
+
+// A singer's own code (optional): asked when choosing them. A grown-up's PIN opens it too.
+function codeSheet(p, msg = '') {
+  const bd = openSheet(
+    `<div class="who-art">${avatarHTML(p, 'lg')}</div>
+     <h2>Hi, ${esc(p.name)}!</h2>
+     <p>Type your code.</p>
+     <label class="pin-label" for="pin">Your code</label>
+     <input id="pin" class="pin-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="done"${msg ? ' aria-describedby="pin-msg"' : ''}>
+     ${msg ? `<p class="err" id="pin-msg" role="alert">${esc(msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="sheet-close">Cancel</button>
+       <button class="btn primary" data-act="code-go">Go</button>
+     </div>
+     <button class="quiet-link pin-forgot" data-act="code-forgot">Forgot it? Ask a grown-up</button>`,
+    {
+      'code-go': () => submit(),
+      'code-forgot': () =>
+        grownUp({
+          why: `Enter your PIN to open ${p.name}’s singing.`,
+          then: () => pickSinger(p.id),
+          back: () => codeSheet(p),
+        }),
+    },
+    { label: `${p.name}’s code`, key: 'code', cls: 'pin' }
+  );
+  const input = bd.querySelector('#pin');
+  let busy = false;
+  async function submit() {
+    if (busy) return;
+    const v = input.value.trim();
+    if (!isPinShape(v)) {
+      codeSheet(p, 'A code is 4 numbers.');
+      return focusIn('#pin');
+    }
+    busy = true;
+    const ok = await checkPin(p.code, v);
+    busy = false;
+    if (!sheet || sheet.key !== 'code') return;
+    if (ok) return pickSinger(p.id);
+    codeSheet(p, 'That’s not it. Try again.');
+    focusIn('#pin');
+  }
+  input.addEventListener('input', () => {
+    const d = input.value.replace(/\D/g, '').slice(0, 4);
+    if (d !== input.value) input.value = d;
+    if (d.length === 4) submit();
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submit();
+    }
+  });
+  input.focus({ preventScroll: true });
+}
+
+// ---- Adding and changing a singer (grown-ups) ----
+
+function avatarPickerHTML(sel, name) {
+  return `<div class="av-pick" role="radiogroup" aria-label="Picture">${AVATARS.map(
+    (a, i) =>
+      `<button type="button" role="radio" aria-checked="${a === sel}" aria-label="Picture ${i + 1}" class="${a === sel ? 'on' : ''}" data-act="av" data-v="${a}">${avatarHTML({ avatar: a, name })}</button>`
+  ).join('')}</div>`;
+}
+
+// o: { id (to change one), name, avatar, code: '' | digits, removeCode, msg, back }
+function singerSheet(o) {
+  const p = o.id ? account.profile(o.id) : null;
+  if (o.id && !p) return closeSheet();
+  const st = { name: o.name != null ? o.name : p ? p.name : '', avatar: o.avatar || (p ? p.avatar : '') || AVATARS[account.profiles().length % AVATARS.length], code: o.code || '', removeCode: !!o.removeCode };
+  const hasCode = p && p.code && !st.removeCode;
+  const bd = openSheet(
+    `<p class="eyebrow">${p ? 'Change a singer' : 'New singer'}</p>
+     <h2>${p ? esc(p.name) : 'Add a singer'}</h2>
+     <div class="fam-field">
+       <label for="singer-name">Name</label>
+       <input id="singer-name" class="text-input" type="text" maxlength="${NAME_MAX}" autocomplete="off" autocapitalize="words" value="${esc(st.name)}">
+     </div>
+     <div class="fam-field"><span class="label">Picture</span>${avatarPickerHTML(st.avatar, st.name)}</div>
+     <div class="fam-field">
+       <label for="singer-code">${hasCode ? 'New code (optional)' : 'Code to open (optional)'}</label>
+       <input id="singer-code" class="text-input code-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="off" placeholder="${hasCode ? 'Keep the code' : 'No code'}" value="${esc(st.code)}">
+       <p class="muted">${hasCode ? 'This singer has a code. Type 4 new numbers to change it.' : 'Four numbers this singer types to open their singing. It keeps brothers and sisters out of each other’s scores, nothing more.'}</p>
+       ${hasCode ? '<button class="quiet-link" data-act="code-remove">Remove the code</button>' : ''}
+     </div>
+     ${o.msg ? `<p class="err" role="alert">${esc(o.msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="singer-back">Cancel</button>
+       <button class="btn primary" data-act="singer-save">${p ? 'Save' : 'Add singer'}</button>
+     </div>
+     ${p ? `<button class="field link-row danger" data-act="person-delete"><span><b>Delete ${esc(p.name)}</b></span>${ICON.chev}</button>` : ''}`,
+    {
+      av: (el) => {
+        st.avatar = el.dataset.v;
+        singerSheet({ ...o, ...read(), avatar: st.avatar, msg: '' });
+        focusIn(`[data-act="av"][data-v="${st.avatar}"]`);
+      },
+      'code-remove': () => singerSheet({ ...o, ...read(), removeCode: true, msg: '' }),
+      'singer-back': () => (o.back ? o.back() : closeSheet()),
+      'singer-save': (btn) => save(btn),
+      'person-delete': () => deleteSingerSheet(p.id),
+    },
+    { label: p ? 'Change a singer' : 'Add a singer', key: 'singer', cls: 'fam singer' }
+  );
+  const nameIn = bd.querySelector('#singer-name');
+  const codeIn = bd.querySelector('#singer-code');
+  codeIn.addEventListener('input', () => {
+    const d = codeIn.value.replace(/\D/g, '').slice(0, 4);
+    if (d !== codeIn.value) codeIn.value = d;
+  });
+  function read() {
+    return { name: nameIn.value, code: codeIn.value, avatar: st.avatar, removeCode: st.removeCode };
+  }
+  if (!o.id && !o.msg) nameIn.focus({ preventScroll: true });
+  async function save(btn) {
+    const v = read();
+    const name = cleanSinger(v.name);
+    if (!name) return singerSheet({ ...o, ...v, msg: 'Give the singer a name.' });
+    if (v.code && !isPinShape(v.code)) return singerSheet({ ...o, ...v, msg: 'A code is 4 numbers, or leave it empty.' });
+    btn.disabled = true;
+    try {
+      const code = v.code ? await makePin(v.code) : null;
+      if (p) {
+        await account.updateProfile(p.id, { name, avatar: v.avatar, ...(code ? { code } : v.removeCode ? { code: null } : {}) });
+      } else {
+        await account.addProfile({ name, avatar: v.avatar, code });
+      }
+    } catch (e) {
+      return singerSheet({ ...o, ...v, msg: netWords(e, 'I couldn’t save that. Try again.') });
+    }
+    if (o.back) return o.back();
+    closeSheet(true);
+    if (current && current.refresh) current.refresh();
+  }
+}
+
+// ---- The grown-ups' Family sheet ----
+
+let summaries = {};
+function familySheet() {
+  const list = account.profiles();
+  const rows = list
+    .map(
+      (p) => `<li class="person">
+        ${avatarHTML(p)}
+        <div><b>${esc(p.name)}</b><span>${esc(summaryText(summaries[p.id]))}</span></div>
+        <button class="btn small secondary" data-act="person" data-id="${esc(p.id)}" aria-label="Change ${esc(p.name)}">Change</button>
+      </li>`
+    )
+    .join('');
+  openSheet(
+    `<p class="eyebrow">For grown-ups</p>
+     <h2>Family</h2>
+     <p class="muted">Signed in as ${esc(account.email())}</p>
+     ${syncLineHTML()}
+     ${list.length ? `<ul class="people">${rows}</ul>` : '<p>No singers yet.</p>'}
+     <button class="btn secondary wide" data-act="person-add">${ICON_PLUS}Add a singer</button>
+     <p class="notice">${ACCOUNT_PRIVACY}</p>
+     <button class="field link-row danger" data-act="sign-out"><span><b>Sign this device out</b></span>${ICON.chev}</button>
+     <button class="btn primary wide" data-act="sheet-close">Done</button>`,
+    {
+      person: (el) => singerSheet({ id: el.dataset.id, back: () => familySheet() }),
+      'person-add': () => singerSheet({ back: () => familySheet() }),
+      'sign-out': () => signOutSheet(),
+    },
+    { label: 'Family', key: 'family', cls: 'fam family-sheet', onClose: () => current && current.refresh && current.refresh() }
+  );
+  account.summaries(ORDER.filter((id) => id !== 'range')).then((s) => {
+    const changed = JSON.stringify(s) !== JSON.stringify(summaries);
+    summaries = s;
+    if (changed && sheet && sheet.key === 'family') familySheet();
+  });
+}
+
+function deleteSingerSheet(id, msg = '') {
+  const p = account.profile(id);
+  if (!p) return familySheet();
+  let armed = false;
+  openSheet(
+    `<h2>Delete ${esc(p.name)}?</h2>
+     <p>${esc(p.name)}’s range, scores and practice days will be gone from every family device. This can’t be undone.</p>
+     ${msg ? `<p class="err" role="alert">${esc(msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="person-keep">Keep</button>
+       <button class="btn danger" data-act="person-delete-yes">Delete</button>
+     </div>`,
+    {
+      'person-keep': () => singerSheet({ id, back: () => familySheet() }),
+      'person-delete-yes': async (btn) => {
+        if (!armed) {
+          armed = true;
+          btn.textContent = 'Tap to confirm';
+          return;
+        }
+        btn.disabled = true;
+        try {
+          await account.deleteProfile(id);
+        } catch (e) {
+          return deleteSingerSheet(id, netWords(e, 'I couldn’t delete that. Try again.'));
+        }
+        delete summaries[id];
+        familySheet();
+      },
+    },
+    { label: 'Delete a singer', key: 'person-delete', cls: 'fam' }
+  );
+}
+
+function signOutSheet() {
+  const waiting = account.pending();
+  openSheet(
+    `<h2>Sign this device out?</h2>
+     <p>Singers, scores and family songs stay safe in the family account. This device forgets them until a grown-up signs in again.</p>
+     ${waiting ? '<p class="err">Some changes on this device haven’t reached the family yet. Connect to the internet first, or they’ll be lost.</p>' : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="out-keep">Stay signed in</button>
+       <button class="btn danger" data-act="out-yes">Sign out</button>
+     </div>`,
+    {
+      'out-keep': () => familySheet(),
+      'out-yes': async (btn) => {
+        btn.disabled = true;
+        if (account.pending() && navigator.onLine !== false) await account.sync().catch(() => {});
+        await account.signOut();
+        familySongs = [];
+        await loadFamily();
+        closeSheet(true);
+        tab = 'today';
+        sset('nbn:tab', 'today');
+        show(homeCtrl(), false);
+        history.replaceState({ nbn: 0 }, '');
+        openSheet(
+          `<h2>Signed out</h2><p>This device is back to one singer, kept on this device only.</p><button class="btn primary wide" data-act="sheet-close">OK</button>`,
+          {},
+          { label: 'Signed out', cls: 'centered' }
+        );
+      },
+    },
+    { label: 'Sign out', key: 'sign-out', cls: 'fam' }
+  );
+}
+
+// ---- Signing in ----
+
+// Each grown-up has their own account (email and password); they all land in the one family.
+// o: { mode: 'signin' | 'create', email, msg, again (the session ended) }
+function accountSheet(o = {}) {
+  const mode = o.mode || 'signin';
+  const create = mode === 'create';
+  const bd = openSheet(
+    `<p class="eyebrow">Family account</p>
+     <h2>${o.again ? 'Sign in again' : 'Sign in or create your grown-up account'}</h2>
+     <p>${o.again ? 'Sign in so this device keeps syncing. Everything sung here meanwhile is kept.' : 'Each grown-up uses their own email, and everyone joins the same family. Each child gets their own singer, and family songs show up on every family device.'}</p>
+     ${
+       o.again
+         ? ''
+         : `<div class="seg" role="radiogroup" aria-label="Account">${[
+             ['signin', 'Sign in'],
+             ['create', 'Create account'],
+           ]
+             .map(([v, l]) => `<button role="radio" aria-checked="${mode === v}" class="${mode === v ? 'on' : ''}" data-act="acct-mode" data-v="${v}">${l}</button>`)
+             .join('')}</div>`
+     }
+     <div class="fam-field">
+       <label for="acct-email">Email</label>
+       <input id="acct-email" class="text-input" type="email" inputmode="email" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" value="${esc(o.email || '')}">
+     </div>
+     <div class="fam-field">
+       <label for="acct-pw">Password${create ? ' (at least 8 characters)' : ''}</label>
+       <input id="acct-pw" class="text-input" type="password" autocomplete="${create ? 'new-password' : 'current-password'}">
+     </div>
+     ${
+       create
+         ? `<div class="fam-field">
+             <label for="acct-pw2">Password again</label>
+             <input id="acct-pw2" class="text-input" type="password" autocomplete="new-password">
+           </div>`
+         : ''
+     }
+     ${o.msg ? `<p class="err" role="alert">${esc(o.msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="sheet-close">Cancel</button>
+       <button class="btn primary" data-act="acct-go">${create ? 'Create account' : 'Sign in'}</button>
+     </div>
+     <details class="fam-help">
+       <summary>Forgot the password?${ICON.chev}</summary>
+       <p>${NO_EMAIL_HELP}</p>
+     </details>
+     <p class="notice">${ACCOUNT_PRIVACY}</p>`,
+    {
+      'acct-mode': (el) => {
+        if (el.dataset.v === mode) return;
+        accountSheet({ mode: el.dataset.v, email: bd.querySelector('#acct-email').value });
+        focusIn(`[data-act="acct-mode"][data-v="${el.dataset.v}"]`);
+      },
+      'acct-go': (btn) => go(btn),
+    },
+    { label: 'Family account', key: 'account', cls: 'fam account' }
+  );
+  const emailIn = bd.querySelector('#acct-email');
+  const pwIn = bd.querySelector('#acct-pw');
+  const pw2In = bd.querySelector('#acct-pw2');
+  if (o.msg || o.again) (o.email ? pwIn : emailIn).focus({ preventScroll: true });
+  for (const el of [emailIn, pwIn, pw2In].filter(Boolean)) {
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        go(bd.querySelector('[data-act="acct-go"]'));
+      }
+    });
+  }
+  let busy = false;
+  async function go(btn) {
+    if (busy) return;
+    const email = emailIn.value.trim();
+    const pw = pwIn.value;
+    const again = (msg, focus = '#acct-pw') => {
+      accountSheet({ ...o, mode, email, msg });
+      focusIn(focus);
+    };
+    if (!isEmail(email)) return again('Type the family’s email address.', '#acct-email');
+    if (create && pw.length < 8) return again('Choose a password with at least 8 characters.');
+    if (!create && !pw) return again('Type the password.');
+    if (create && pw !== pw2In.value) return again('Those passwords don’t match. Type them again.');
+    if (navigator.onLine === false) return again('I need the internet to sign in. Try again when you’re online.');
+    busy = true;
+    btn.disabled = true;
+    btn.textContent = create ? 'Creating…' : 'Signing in…';
+    const localSongs = familySongs.slice();
+    let profiles;
+    try {
+      profiles = await account.signIn(email, pw, create);
+    } catch (e) {
+      busy = false;
+      if (e && e.code === 'exists') return accountSheet({ mode: 'signin', email, msg: e.message });
+      if (e && e.code === 'notallowed') return again(e.message, '#acct-email');
+      if (e && e.code === 'confirm') return again('This account still needs its email confirmed. The grown-up who set up the family’s Supabase project can confirm it under Authentication, then Users.');
+      return again(e && e.code === 'offline' ? 'I need the internet to sign in. Try again when you’re online.' : (e && e.message) || 'I couldn’t sign in. Try again.');
+    }
+    loadFamily();
+    if (o.again) {
+      closeSheet(true);
+      account.sync();
+      if (o.then) o.then();
+      return;
+    }
+    afterSignIn(profiles, localSongs);
+  }
+}
+
+const hasSinging = (d) => !!(d && (d.range || Object.keys(d.progress || {}).length || (d.days || []).length));
+
+// Straight after signing in: this device's own singing can become a singer (the first one, in a
+// new family), and its family songs join the family's.
+function afterSignIn(profiles, localSongs) {
+  const local = account.localData() || store.profileData();
+  const keepable = hasSinging(local);
+  const upload = () => (localSongs.length ? account.uploadSongs(localSongs).then(loadFamily, () => {}) : account.sync());
+  if (!profiles.length || keepable) return firstSingerSheet({ first: !profiles.length, keepable, local, upload, songs: localSongs.length });
+  upload();
+  closeSheet(true);
+  showWho(false);
+}
+
+function firstSingerSheet(o) {
+  const st = { name: o.name || '', avatar: o.avatar || AVATARS[account.profiles().length % AVATARS.length], keep: o.keep !== false };
+  const songsLine = o.songs ? `<p class="muted">${o.songs === 1 ? 'The family song' : `The ${o.songs} family songs`} on this device ${o.songs === 1 ? 'goes' : 'go'} to the family too.</p>` : '';
+  const bd = openSheet(
+    `${hum('happy')}
+     <h2>${o.first ? 'Who sings on this device?' : 'Keep this device’s singing?'}</h2>
+     <p>${o.first ? (o.keepable ? 'I’ll make them the first singer, with the comfy notes, scores and practice days already on this device.' : 'Add the first singer. You can add more later.') : 'This device has scores of its own. I can keep them as a new singer.'}</p>
+     <div class="fam-field">
+       <label for="singer-name">Name</label>
+       <input id="singer-name" class="text-input" type="text" maxlength="${NAME_MAX}" autocomplete="off" autocapitalize="words" value="${esc(st.name)}">
+     </div>
+     <div class="fam-field"><span class="label">Picture</span>${avatarPickerHTML(st.avatar, st.name)}</div>
+     ${
+       o.first && o.keepable
+         ? `<div class="field keep-field">
+             <div><b id="keep-l">Keep this device’s scores</b><p>Off: this singer starts fresh.</p></div>
+             <button class="switch ${st.keep ? 'on' : ''}" role="switch" aria-checked="${st.keep}" aria-labelledby="keep-l" data-act="first-keep"><i></i></button>
+           </div>`
+         : ''
+     }
+     ${songsLine}
+     ${o.msg ? `<p class="err" role="alert">${esc(o.msg)}</p>` : ''}
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="first-skip">${o.first ? 'Later' : 'Not now'}</button>
+       <button class="btn primary" data-act="first-save">${o.first ? 'Save singer' : 'Add singer'}</button>
+     </div>`,
+    {
+      av: (el) => {
+        firstSingerSheet({ ...o, ...read(), avatar: el.dataset.v, msg: '' });
+        focusIn(`[data-act="av"][data-v="${el.dataset.v}"]`);
+      },
+      'first-keep': () => {
+        firstSingerSheet({ ...o, ...read(), keep: !st.keep, msg: '' });
+        focusIn('[data-act="first-keep"]');
+      },
+      'first-skip': () => {
+        o.upload();
+        closeSheet(true);
+        showWho(false);
+      },
+      'first-save': (btn) => save(btn),
+    },
+    { label: 'First singer', key: 'first', cls: 'fam', dismissable: false }
+  );
+  const nameIn = bd.querySelector('#singer-name');
+  const read = () => ({ name: nameIn.value, avatar: st.avatar, keep: st.keep });
+  if (!o.msg) nameIn.focus({ preventScroll: true });
+  async function save(btn) {
+    const name = cleanSinger(nameIn.value);
+    if (!name) return firstSingerSheet({ ...o, ...read(), msg: 'Give the singer a name.' });
+    btn.disabled = true;
+    const keep = o.keepable && (o.first ? st.keep : true);
+    let p;
+    try {
+      p = await account.addProfile({ name, avatar: st.avatar, data: keep ? o.local : null });
+    } catch (e) {
+      return firstSingerSheet({ ...o, ...read(), msg: netWords(e, 'I couldn’t save that. Try again.') });
+    }
+    if (keep) account.dropLocal();
+    o.upload();
+    closeSheet(true);
+    // The singer who was singing here carries on; otherwise everyone chooses.
+    if (keep) pickSinger(p.id);
+    else showWho(false);
+  }
+}
+
+// Settings → For grown-ups: the account row.
+function accountFieldHTML() {
+  if (!signedIn()) {
+    return `<div class="field">
+      <div><b>Family account</b><p>Give each child their own singer, and share family songs with your family’s other devices.</p></div>
+      <button class="btn small secondary" data-act="acct-open">Set up</button>
+    </div>`;
+  }
+  const n = account.profiles().length;
+  return `<div class="field">
+      <div><b>Family</b><p>${n} ${n === 1 ? 'singer' : 'singers'} · ${esc(account.email())}</p>${syncLineHTML()}</div>
+      <button class="btn small secondary" data-act="acct-open">${account.needsSignIn() ? 'Sign in' : 'Open'}</button>
+    </div>`;
+}
+
+function openAccount() {
+  if (!signedIn()) return grownUp({ why: 'Enter your PIN to set up the family account.', then: () => accountSheet(), back: () => settingsSheet() });
+  if (account.needsSignIn()) return grownUp({ why: 'Enter your PIN to sign in again.', then: () => accountSheet({ mode: 'signin', email: account.email(), again: true }), back: () => settingsSheet() });
+  grownUp({ why: 'Enter your PIN to see the family.', then: () => familySheet(), back: () => settingsSheet() });
+}
+
+// The account's events, from js/family.js.
+hooks.status = () => updateSyncLines();
+hooks.songs = () => loadFamily();
+hooks.state = () => refreshHome();
+hooks.profiles = () => {
+  if (current && current.name === 'who' && !sheet) current.refresh();
+  else refreshHome();
+};
+hooks.gone = () => {
+  // The singer here was deleted on another device: everyone chooses again.
+  if (!current || current.name === 'home' || current.name === 'who') {
+    closeSheet(true);
+    showWho(false);
+  }
+};
+
 // ---------- Boot ----------
 
 function loop() {
@@ -3872,7 +4533,9 @@ function loop() {
 
 // The app puts each tab back at its own scroll position, so the browser shouldn't also try.
 if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
-current = homeCtrl();
+account.start();
+// Signed in: "Who's singing?" first, unless this device has one singer who is already chosen.
+current = signedIn() && (!account.profile() || account.profiles().length > 1) ? whoCtrl() : homeCtrl();
 history.replaceState({ nbn: 0 }, '');
 loadFamily();
 requestAnimationFrame(loop);
@@ -3881,6 +4544,7 @@ requestAnimationFrame(loop);
 window.__nbn = {
   probe: () => (current && current.probe ? current.probe() : null),
   screen: () => (current ? current.name : null),
+  family: () => ({ signedIn: signedIn(), status: account.status, singer: (singer() || {}).name || null, singers: account.profiles().map((p) => p.name), pending: account.pending() }),
   tab: () => (current && current.name === 'home' ? tab : null),
 };
 
