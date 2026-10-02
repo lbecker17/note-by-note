@@ -629,7 +629,13 @@ button.safe-line svg { display: inline-block; vertical-align: -3px; margin-right
 .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; background: var(--surface-2); border-radius: 14px; padding: 4px; gap: 4px; }
 .seg button { border: 0; background: transparent; border-radius: 10px; min-height: 44px; font: 800 15px/1.1 var(--font-body); color: var(--fg-2); }
 .seg button.on { background: var(--seg-on); color: var(--fg); box-shadow: 0 1px 3px rgba(58, 39, 27, 0.16); }
-.player:not([data-state="ready"]):not([data-state="done"]) .seg.mode { opacity: 0.45; pointer-events: none; }
+.player:not([data-state="ready"]):not([data-state="done"]) .seg.mode,
+.player:not([data-state="ready"]):not([data-state="done"]) .seg.speed { opacity: 0.45; pointer-events: none; }
+/* Song speed: a smaller control under the mode, with its name beside it. */
+.speed-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; }
+.speed-row .seg-h { margin: 0 0 0 4px; }
+.seg.speed { padding: 3px; gap: 3px; }
+.seg.speed button { min-height: 40px; font-size: 14px; }
 .switch { flex: none; width: 52px; height: 32px; padding: 0; border: 0; border-radius: 16px; background: var(--track); position: relative; transition: background-color 0.15s ease; }
 .switch i { position: absolute; top: 3px; left: 3px; width: 26px; height: 26px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: transform 0.15s ease; }
 .switch.on { background: var(--good-fill); }

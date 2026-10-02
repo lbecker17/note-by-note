@@ -241,7 +241,7 @@ test('MIDI: .kar karaoke file with Latin-1 words, markers, tempo change and a bu
   );
   assert.equal(
     r.song.lyrics,
-    'Sun- ny days at ca- fé glow,\nBir- dies sing ü- ber- all snow.\nHap- py moon a- bove the sea,\nSmi- ling down on you and me. ~'
+    'Sun- ny days at ca- fé glow,\nBir- dies sing ü- ber- all snow.\n\nHap- py moon a- bove the sea,\nSmi- ling down on you and me. ~'
   );
   assert.equal(r.song.bpm, 90, 'the tempo that covers most of the song');
   assert.ok(r.warnings.some((w) => /tempo changes/.test(w)), r.warnings.join(' | '));
@@ -631,7 +631,7 @@ const NB_MELODY_VERSE = [
   'D4 | G4/2 B4/0.5 G4/0.5 | B4/2 A4 | D5/5',
 ];
 const NB_MELODY = [NB_MELODY_VERSE[0], NB_MELODY_VERSE[1] + ' r/1', NB_MELODY_VERSE[0], NB_MELODY_VERSE[1]].join(' //\n');
-const NB_LYRICS = 'The morn- ing ~ light so warm and bright,\nwakes up the ~ sleep- y town.\nThe eve- ning ~ stars come out to play,\nand wave a ~ sil- ver hand.';
+const NB_LYRICS = 'The morn- ing ~ light so warm and bright,\nwakes up the ~ sleep- y town.\n\nThe eve- ning ~ stars come out to play,\nand wave a ~ sil- ver hand.';
 const NB_CHORDS = '-/1 | G/3 | G/3 | C/3 | G/3 | G/3 | D7/3 | G/3 | G/3 | G/1 | G/3 | G/3 | C/3 | G/3 | G/3 | D7/3 | G/3 | G/2';
 
 test('MusicXML: pickup, melisma, tie, chord symbols and two verses', () => {

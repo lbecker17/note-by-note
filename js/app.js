@@ -1,6 +1,6 @@
 import { AudioEngine } from './audio.js';
 import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './lessons.js';
-import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer } from './songs.js';
+import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer, SPEEDS, SPEED_LABEL, defaultSpeed } from './songs.js';
 import { Lane, drawOverview, drawSong } from './lane.js';
 import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, fitShift } from './music.js';
 import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, speakerBleed, offWords } from './score.js';
@@ -48,6 +48,12 @@ const setText = (el, txt) => {
   if (el && el.textContent !== txt) el.textContent = txt;
 };
 const S = () => store.data.settings;
+// The speed a song was last sung at ('slow' | 'steady' | 'normal'), else its default.
+const speedFor = (song) => {
+  const v = (S().speeds || {})[song.id];
+  return SPEEDS[v] ? v : defaultSpeed(song);
+};
+const speedText = (k) => `${SPEED_LABEL[k]} (${Math.round(SPEEDS[k] * 100)}%)`;
 const tolerance = () => STRICTNESS[S().strict] || STRICTNESS.standard;
 const reducedMotion = () => !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
@@ -357,7 +363,7 @@ function settingsSheet(gate = null) {
   const html = `
     <h2>Settings</h2>
     <div class="field">
-      <div><b>Headphones</b><p>Only switch this on when you’re wearing headphones. Then you hear the tune while you sing. With it off, you hear each part (or its first note) before you sing, so the mic only hears you. Wired headphones work best: Bluetooth drops to call quality while the mic is on.</p></div>
+      <div><b>Headphones</b><p>Only switch this on when you’re wearing headphones. Then you hear the tune while you sing. With it off, you hear each part before you sing (in Sing it through, a soft piano that never plays your note), so the mic only hears you. Wired headphones work best: Bluetooth drops to call quality while the mic is on.</p></div>
       <button class="switch ${s.headphones ? 'on' : ''}" role="switch" aria-checked="${s.headphones}" aria-label="Headphones" data-act="set" data-k="headphones" data-v="${!s.headphones}"><i></i></button>
     </div>
     <div class="field col"><b>Note names</b>${seg('names', [['letters', 'C D E'], ['solfa', 'Do Re Mi']])}</div>
@@ -1200,7 +1206,7 @@ function homeCtrl() {
 
 // ---------- Player (lessons, warm-up, songs) ----------
 
-function buildPlan(kind, id, mode) {
+function buildPlan(kind, id, mode, speed = 'normal') {
   const range = store.data.range;
   if (kind === 'warmup') {
     const date = new Date();
@@ -1208,7 +1214,7 @@ function buildPlan(kind, id, mode) {
   }
   if (kind === 'song') {
     const song = findSong(id);
-    return { id: 'song:' + id, title: song.title, song, steps: buildSong(song, range, { mode, headphones: S().headphones }) };
+    return { id: 'song:' + id, title: song.title, song, speed, steps: buildSong(song, range, { mode, headphones: S().headphones, speed: SPEEDS[speed] || 1 }) };
   }
   const L = LESSONS[id];
   return { id, title: L.title, steps: L.build(range) };
@@ -1293,9 +1299,16 @@ function levelOf(r) {
   return r ? clamp01((20 * Math.log10(r.rms + 1e-9) + 58) / 46) : 0;
 }
 
+const SPEED_CUE = {
+  slow: 'Slow: plenty of time for every note.',
+  steady: 'Steady: a little slower than the song.',
+  normal: 'Normal: the song’s own speed.',
+};
+
 function playerCtrl({ kind, id }) {
   let mode = kind === 'song' ? 'learn' : null;
-  let plan = buildPlan(kind, id, mode);
+  let speed = kind === 'song' ? speedFor(findSong(id)) : null;
+  let plan = buildPlan(kind, id, mode, speed);
   let stepIdx = 0;
   let state = 'ready';
   let T0 = 0;
@@ -1351,7 +1364,10 @@ function playerCtrl({ kind, id }) {
           ? `<div class="seg mode" role="radiogroup" aria-label="Mode">
               <button role="radio" data-act="mode" data-v="learn" class="on" aria-checked="true">Line by line</button>
               <button role="radio" data-act="mode" data-v="along" aria-checked="false">Sing it through</button>
-            </div>`
+            </div>
+            <div class="speed-row"><span class="seg-h" id="speed-h">Speed</span><div class="seg speed" role="radiogroup" aria-labelledby="speed-h">${Object.keys(SPEEDS)
+              .map((k) => `<button role="radio" data-act="speed" data-v="${k}" class="${k === speed ? 'on' : ''}" aria-checked="${k === speed}">${SPEED_LABEL[k]}</button>`)
+              .join('')}</div></div>`
           : ''
       }
       <button class="btn primary big wide" data-act="start" id="startBtn"></button>
@@ -1502,7 +1518,7 @@ function playerCtrl({ kind, id }) {
   }
 
   function rebuild() {
-    plan = buildPlan(kind, id, mode);
+    plan = buildPlan(kind, id, mode, speed);
     seg = segmentsFor();
     stepIdx = 0;
     lane.setModel(modelFor(step()));
@@ -1871,7 +1887,7 @@ function playerCtrl({ kind, id }) {
         : `<span class="verdict">${verdict(sum.score)}</span>`;
     const care = plan.song || plan.id === 'sirens' || plan.id === 'warmup';
     const html = `
-      <div class="sheet-head"><p class="eyebrow">${esc(plan.title)}</p>${newBest ? `<span class="pb">${ICON.star}New best</span>` : ''}</div>
+      <div class="sheet-head"><p class="eyebrow">${esc(plan.title)}${plan.song ? ` · ${SPEED_LABEL[speed]}` : ''}</p>${newBest ? `<span class="pb">${ICON.star}New best</span>` : ''}</div>
       <div class="score-row">
         <div class="score-col"><span class="score">${pct}<small>%</small></span>${heard ? rating(stars) : ''}</div>
         ${verdictHTML}
@@ -2073,7 +2089,7 @@ function playerCtrl({ kind, id }) {
     const range = store.data.range;
     // A family song's words never leave the app; its title is marked as a family song.
     const fam = !!(plan.song && isFamilySongId(plan.song.id));
-    const how = plan.song ? (mode === 'learn' ? 'line by line' : 'sung through') : '';
+    const how = plan.song ? `${mode === 'learn' ? 'line by line' : 'sung through'}, ${SPEED_LABEL[speed].toLowerCase()} speed` : '';
     const text = reportText({
       title: plan.title + (fam ? ` (family song, ${how})` : how ? ` (${how})` : ''),
       family: fam,
@@ -2081,6 +2097,7 @@ function playerCtrl({ kind, id }) {
       range,
       rangeFrom: store.data.rangeFrom,
       strictKey: S().strict,
+      speed: plan.song ? `${speedText(speed)} · ${Math.round(plan.steps[0].bpm)} beats a minute (the song’s own is ${plan.song.bpm})` : null,
       date: new Date().toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' }),
     });
     try {
@@ -2133,6 +2150,19 @@ function playerCtrl({ kind, id }) {
           b.setAttribute('aria-checked', String(on));
         });
         rebuild();
+      },
+      speed: (btn) => {
+        const v = btn.dataset.v;
+        if (state !== 'ready' || !SPEEDS[v] || v === speed) return;
+        speed = v;
+        store.setSpeed(plan.song.id, v);
+        root.querySelectorAll('.seg.speed button').forEach((b) => {
+          const on = b.dataset.v === speed;
+          b.classList.toggle('on', on);
+          b.setAttribute('aria-checked', String(on));
+        });
+        rebuild();
+        setCue(SPEED_CUE[v], '');
       },
       skip: () => {
         betweenUntil = audio.now();
@@ -2207,7 +2237,7 @@ function playerCtrl({ kind, id }) {
       if (state === 'moving') return { state, t: audio.now() - T0, step: stepIdx, card: cardIdx, role: null, target: null };
       const t = audio.now() - T0;
       const cur = st.events.find((e) => t >= e.t && t < e.t + e.d);
-      return { state, t, step: stepIdx, role: cur ? cur.role : null, target: cur ? targetAt(cur, t) : null };
+      return { state, t, step: stepIdx, role: cur ? cur.role : null, target: cur ? targetAt(cur, t) : null, mode, speed, bpm: st.bpm };
     },
     destroy() {
       if (state !== 'ready' && state !== 'done') {

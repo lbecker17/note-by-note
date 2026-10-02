@@ -3,7 +3,7 @@
 // family's profile_state row; the keys in PROFILE_KEYS travel with the singer, and the grown-up
 // PIN and its lockout stay with the device.
 
-import { PROFILE_KEYS, clean } from './sync.js';
+import { PROFILE_KEYS, SPEEDS_KEPT, clean } from './sync.js';
 
 const KEY = 'note-by-note:v1';
 // When the range and settings last changed, and the last "Reset progress", in ms. The family
@@ -16,7 +16,8 @@ const DEFAULTS = () => ({
   rangePrev: null, // the range before that, {low, high}
   rangeFrom: null, // 'test' | 'child' | 'high' | 'low'
   // warmupLock: songs open only after today's warm-up (the grown-ups' switch in Settings).
-  settings: { headphones: false, names: 'letters', strict: 'standard', warmupLock: true },
+  // speeds: the speed each song was last sung at ({ songId: 'slow' | 'steady' | 'normal' }).
+  settings: { headphones: false, names: 'letters', strict: 'standard', warmupLock: true, speeds: {} },
   progress: {},
   days: [],
   warm: null, // { day: 'YYYY-MM-DD', at: ms, heard: 0.86, ctl: 'bounce' }: the last warm-up that counted
@@ -68,6 +69,15 @@ export const store = {
     for (const k of PROFILE_KEYS) this.data[k] = c[k] == null ? base[k] : c[k];
     if (!d) this.data.songPass = null;
     this.save(false);
+  },
+  // The speed chosen for a song. Most recent last, so the oldest go first when there are many.
+  setSpeed(songId, v) {
+    const speeds = { ...(this.data.settings.speeds || {}) };
+    delete speeds[songId];
+    speeds[songId] = v;
+    const keys = Object.keys(speeds);
+    for (const k of keys.slice(0, Math.max(0, keys.length - SPEEDS_KEPT))) delete speeds[k];
+    this.setSetting('speeds', speeds);
   },
   setSetting(k, v) {
     this.data.settings[k] = v;
