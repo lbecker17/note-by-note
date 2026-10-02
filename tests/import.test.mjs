@@ -13,7 +13,7 @@ import { crc32 } from '../js/unzip.js';
 import { decodeCp1252, cutText, UNSAFE_CHARS } from '../js/text.js';
 import { importSongFile, importMidi, importMusicXML, sliceSong, songSections, karaokeSyllables, parseChordSymbol, ImportError, IMPORT_LIMITS } from '../js/import.js';
 import { readFamilySongFile, writeFamilySongFile, validateSong, familySongFileName, cleanFileName, songId, FAMILY_CREDIT } from '../js/nbn.js';
-import { buildSong, songData, songGlyph, setHarmonizer, SONGS } from '../js/songs.js';
+import { buildSong, songData, songGlyph, setHarmonizer, SONGS, defaultSpeed, tempoText } from '../js/songs.js';
 import { parseMelody, parseLyrics } from '../js/music.js';
 
 // ---------- MIDI files, byte by byte ----------
@@ -243,8 +243,14 @@ test('MIDI: .kar karaoke file with Latin-1 words, markers, tempo change and a bu
     r.song.lyrics,
     'Sun- ny days at ca- fé glow,\nBir- dies sing ü- ber- all snow.\n\nHap- py moon a- bove the sea,\nSmi- ling down on you and me. ~'
   );
-  assert.equal(r.song.bpm, 90, 'the tempo that covers most of the song');
-  assert.ok(r.warnings.some((w) => /tempo changes/.test(w)), r.warnings.join(' | '));
+  // The song follows the file's tempo change: 100 for the first two bars, then 90.
+  assert.equal(r.song.bpm, 100, 'the tempo at the first note');
+  assert.equal(r.song.tempos, '8:90');
+  assert.ok(r.warnings.some((w) => /tempo changes in this file \(90 to 100 beats a minute\); the song follows it/.test(w)), r.warnings.join(' | '));
+  const [along] = buildSong(r.song, RANGE, { mode: 'along' });
+  const sungNotes = along.events.filter((e) => e.role === 'sing');
+  assert.ok(Math.abs(sungNotes[7].t - sungNotes[0].t - 8 * 0.6) < 1e-6, 'two bars at 100');
+  assert.ok(Math.abs(sungNotes[8].t - sungNotes[7].t - 60 / 90) < 1e-6, 'then 90');
   assert.ok(!r.warnings.some((w) => /guessed|close second/.test(w)), r.warnings.join(' | '));
   assertPlayable(r.song);
   // The held "me." shows once and is sung over two notes.
@@ -1145,4 +1151,223 @@ test('songs.js: no chords, no words, and a harmonizer hook', () => {
     setHarmonizer(null);
   }
   assert.deepEqual(songData(song).chords, []);
+});
+
+// ---------- Piano-vocal scores, instrumental runs and tempo (family-song importer fixes) ----------
+// Public-domain tunes (Twinkle, Ode to Joy) with made-up words, laid out the way MuseScore 4
+// exports piano-vocal scores and piano arrangements with the words on the right hand.
+
+const DUR = { e: 1, q: 2, h: 4, w: 8 };
+const TYPE = { e: 'eighth', q: 'quarter', h: 'half', w: 'whole' };
+// One note. len: e q h w. o: { staff, voice (null: no <voice>), chord, lyric, syllabic, size, grace }
+function pn(len, p, o = {}) {
+  const { staff = null, voice = '1', chord = false, lyric = null, syllabic = 'single', size = null, grace = false } = o;
+  let pitch = '<rest/>';
+  if (p !== 'r') {
+    const [, step, acc, oct] = /^([A-G])([#b]?)(\d)$/.exec(p);
+    pitch = `<pitch><step>${step}</step>${acc ? `<alter>${acc === '#' ? 1 : -1}</alter>` : ''}<octave>${oct}</octave></pitch>`;
+  }
+  return (
+    `<note${o.invisible ? ' print-object="no"' : ''}>${grace ? '<grace/>' : ''}${chord ? '<chord/>' : ''}${pitch}${grace ? '' : `<duration>${DUR[len]}</duration>`}` +
+    `${voice != null ? `<voice>${voice}</voice>` : ''}<type${size ? ` size="${size}"` : ''}>${TYPE[len]}</type>${staff ? `<staff>${staff}</staff>` : ''}` +
+    `${lyric ? `<lyric number="1"><syllabic>${syllabic}</syllabic><text>${lyric}</text></lyric>` : ''}</note>`
+  );
+}
+const backup = (len) => `<backup><duration>${DUR[len]}</duration></backup>`;
+const ATTR = (beats = 4, type = 4, more = '') => `<attributes><divisions>2</divisions><key><fifths>0</fifths></key><time><beats>${beats}</beats><beat-type>${type}</beat-type></time>${more}</attributes>`;
+// The words and the note each one is sung on, from a song: [[pitch, token], ...].
+const pairs = (song) => {
+  const lyr = parseLyrics(song.lyrics);
+  return notesOnly(song.melody)
+    .filter((t) => !t.startsWith('r'))
+    .map((t, i) => [t.split('/')[0], lyr[i]]);
+};
+// The tune of the tests below, with its words: Twinkle up an octave.
+const TWINKLE_WORDS = [
+  ['C5', 'Shine'], ['C5', 'on'], ['G5', 'the'], ['G5', 'hill'], ['A5', 'so'], ['A5', 'high'], ['G5', 'and'],
+  ['F5', 'bright,'], ['F5', 'the'], ['E5', 'stars'], ['E5', 'come'], ['D5', 'out'], ['D5', 'to'], ['C5', 'play.'],
+];
+// Right hand of a piano arrangement (or the voice of a piano-vocal score) for those words:
+// bar by bar, the sung note gets the next word. low(bar): an accompaniment note in the
+// tune's rest at the start of the bar. riff: an instrumental bar between the two lines.
+function twinkleRH({ staff = null, voice = '1', low = true, riff = true, chordTones = true } = {}) {
+  const w = TWINKLE_WORDS.map(([, t]) => t);
+  let k = 0;
+  const sing = (len, p, extra = {}) => pn(len, p, { staff, voice, lyric: w[k++], ...extra });
+  const acc = (len, p) => pn(len, p, { staff, voice });
+  const under = (len, p) => (chordTones ? pn(len, p, { staff, voice, chord: true }) : '');
+  return [
+    (low ? acc('e', 'C4') : pn('e', 'r', { staff, voice })) + sing('e', 'C5') + sing('q', 'C5') + sing('q', 'G5') + under('q', 'E5') + sing('q', 'G5') + under('q', 'C5'),
+    sing('q', 'A5') + under('q', 'F5') + sing('q', 'A5') + sing('h', 'G5') + under('h', 'E5'),
+    (low ? acc('e', 'E4') : pn('e', 'r', { staff, voice })) + sing('e', 'F5') + sing('q', 'F5') + sing('q', 'E5') + sing('q', 'E5'),
+    sing('q', 'D5') + sing('q', 'D5') + sing('h', 'C5') + under('h', 'G4'),
+    riff ? ['C5', 'E5', 'A5', 'G5', 'D5', 'F5', 'C6', 'B5'].map((p) => acc('e', p)).join('') : pn('w', 'r', { staff, voice }),
+  ];
+}
+// A left hand that plays eighths all the way through.
+const leftHand = (staff, voice) => ['C3', 'G3', 'E3', 'G3', 'C3', 'G3', 'E3', 'G3'].map((p) => pn('e', p, { staff, voice })).join('');
+const measuresOf = (bodies, first = ATTR()) => bodies.map((b, i) => ({ attrs: `number="${i + 1}"`, body: (i === 0 ? first : '') + b }));
+
+test('MusicXML piano arrangement: only the worded top line of the right hand, never the left hand', () => {
+  // One "Piano" part, words on the right hand, chord tones under the tune, accompaniment notes
+  // in the tune's rests and an instrumental riff. The left hand is numbered voice 1 too, as
+  // some programs write it: it is told apart by its staff.
+  for (const lhVoice of ['5', '1']) {
+    const rh = twinkleRH({ staff: '1' });
+    const bodies = rh.map((b) => b + backup('w') + leftHand('2', lhVoice));
+    const xml = partwise('Piano tune', [{ id: 'P1', name: 'Piano', measures: measuresOf(bodies, ATTR(4, 4, '<staves>2</staves>')) }]);
+    const r = importMusicXML(xml);
+    assert.deepEqual(pairs(r.song), TWINKLE_WORDS, `left hand voice ${lhVoice}`);
+    // The accompaniment notes in the rests are rests now; the riff is left out.
+    assert.equal(r.song.melody, 'C5/0.5 C5 G5 G5 | A5 A5 G5/2 | r/0.5 //\nF5/0.5 F5 E5 E5 | D5 D5 C5/2', r.song.melody);
+    assert.ok(r.warnings.some((x) => /^Left out \d+ notes? with no words that don’t look sung/.test(x)), r.warnings.join(' | '));
+    assert.equal(r.choices.find((c) => c.chosen).id, 'p1v1');
+    if (lhVoice === '1') assert.ok(r.choices.some((c) => c.id === 'p1s2v1' && /staff 2, voice 1/.test(c.label)), JSON.stringify(r.choices));
+    assertPlayable(r.song);
+  }
+});
+
+test('MusicXML piano-vocal (MuseScore 4 style): voice 2, cue notes, a grace note and the piano are left out', () => {
+  // The voice part: Twinkle with its words in voice 1, a low harmony in voice 2 after a
+  // <backup>, a divisi chord, a grace note, and a piano cue printed small in the rest bar.
+  const rh = twinkleRH({ low: false, riff: false });
+  rh[1] += backup('w') + pn('q', 'F4', { voice: '2' }) + pn('q', 'F4', { voice: '2' }) + pn('h', 'E4', { voice: '2' });
+  rh[2] = pn('e', 'G5', { grace: true }) + rh[2];
+  rh[4] = pn('q', 'r') + ['C5', 'E5', 'A5', 'G5'].map((p) => pn('e', p, { size: 'cue' })).join('') + pn('e', 'B5', { invisible: true }) + pn('e', 'r') + pn('q', 'r');
+  rh.push(pn('q', 'C5', { lyric: 'Sing' }) + pn('q', 'D5', { lyric: 'it' }) + pn('q', 'E5', { lyric: 'loud' }) + pn('e', 'D5') + pn('e', 'C5'));
+  rh.push(pn('w', 'C5', { lyric: 'now.' }));
+  const piano = rh.map(() => ['C4', 'E4', 'G4', 'C5'].map((p) => pn('q', p, { staff: '1', voice: '1' })).join('') + backup('w') + leftHand('2', '5'));
+  const tempo = '<direction placement="above"><direction-type><metronome parentheses="no"><beat-unit>quarter</beat-unit><per-minute>96</per-minute></metronome></direction-type><sound tempo="96"/></direction>';
+  const xml = partwise('Duo', [
+    { id: 'P1', name: 'Voice', measures: measuresOf(rh, ATTR() + tempo) },
+    { id: 'P2', name: 'Piano', measures: measuresOf(piano, ATTR(4, 4, '<staves>2</staves>')) },
+  ]);
+  const r = importMusicXML(xml);
+  // The short stepwise melisma on "loud" (two eighths) is still sung.
+  assert.deepEqual(pairs(r.song), [...TWINKLE_WORDS, ['C5', 'Sing'], ['D5', 'it'], ['E5', 'loud'], ['D5', '~'], ['C5', '~'], ['C5', 'now.']]);
+  assert.equal(r.song.bpm, 96, 'the tempo written on the voice part');
+  assert.equal(r.choices.find((c) => c.chosen).label, 'Voice, voice 1');
+  assertPlayable(r.song);
+});
+
+test('MusicXML: a staff with no <voice> numbers takes each <backup> as another voice', () => {
+  const rh = twinkleRH({ voice: null, low: false, riff: false, chordTones: false });
+  // A second line under the tune, written after a <backup>, with no voice numbers.
+  const bodies = rh.map((b) => b + backup('w') + ['E4', 'D4', 'C4', 'B3'].map((p) => pn('q', p, { voice: null })).join(''));
+  const r = importMusicXML(voiceScore(measuresOf(bodies)));
+  assert.deepEqual(pairs(r.song), TWINKLE_WORDS);
+  assert.equal(r.song.melody, 'C5/0.5 C5 G5 G5 | A5 A5 G5/2 | r/0.5 //\nF5/0.5 F5 E5 E5 | D5 D5 C5/2');
+  assertPlayable(r.song);
+});
+
+test('melismas: a short singable run is held, a long leaping riff is not', () => {
+  // A riff of 12 leaping notes straight on from the last word: an instrumental part.
+  const riff = ['C#5', 'E5', 'A5', 'G#5', 'D#5', 'F#5', 'C#6', 'B5', 'G#5', 'B5', 'F#6', 'D#6'];
+  const bodies = [
+    pn('q', 'D#5', { lyric: 'We' }) + pn('q', 'D#5', { lyric: 'go' }) + pn('q', 'D#5', { lyric: 'up' }) + pn('q', 'E5', { lyric: 'high,' }),
+    riff.slice(0, 8).map((p) => pn('e', p)).join(''),
+    riff.slice(8).map((p) => pn('e', p)).join('') + pn('h', 'r'),
+    pn('q', 'E5', { lyric: 'and' }) + pn('q', 'D#5', { lyric: 'down' }) + pn('q', 'C#5', { lyric: 'we' }) + pn('q', 'B4', { lyric: 'come,' }),
+    pn('q', 'B4', { lyric: 'oh' }) + pn('q', 'C#5', { lyric: 'so' }) + pn('h', 'E5', { lyric: 'low.' }),
+  ];
+  const r = importMusicXML(voiceScore(measuresOf(bodies)));
+  assert.equal(sung(r), 'We go up high, and down we come, oh so low.');
+  assert.ok(!/C#6|F#6/.test(r.song.melody), r.song.melody);
+  assertPlayable(r.song);
+});
+
+test('play time: an already imported family song leaves out unsung "~" runs and stray low notes', () => {
+  const melody = [
+    'D#5/0.5 D#5/0.5 D#5/0.5 D#5/0.5 D#5 E5 | C#5 E5 A5 G#5 | D#5 F#5 C#6 B5 | G#5 B5 F#6 D#6',
+    'C#5/0.5 G#5/0.5 G#5/0.5 G#5/0.5 C#4/0.5 G#5/0.5 G#5 | F#5 E5/0.5 D#5/0.5 E5/2',
+    'E5 E5 r/2 | C#6/0.5 A5/0.5 F#6/0.5 C#6/0.5 r/2',
+  ].join(' //\n');
+  const lyrics = ['la la la la la la ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~', 'we sing to the ~ sun and ~ ~ the moon', 'come home ~ ~ ~ ~'].join('\n');
+  const song = { id: 'fam-00000oldimp', title: 'Old import', credit: FAMILY_CREDIT, key: 'E', bpm: 124, meter: 4, melody, lyrics, chords: null };
+  const { mel, lyr } = songData(song);
+  // The 12-note riff, the low C#4 an octave and more from both neighbours, and the leaping run
+  // after "home" are rests now; "sun and~~" (two stepwise notes) is still held.
+  assert.equal(lyr.join(' '), 'la la la la la la we sing to the sun and ~ ~ the moon come home');
+  assert.equal(mel.notes.length, 18);
+  assert.equal(mel.phrases.length, 3);
+  assert.ok(!mel.notes.some((n) => n.m === 61 || n.m >= 85), 'no C#4, C#6 or F#6');
+  // The notes keep their places in time.
+  assert.equal(mel.notes[6].beat, 16);
+  for (const mode of ['learn', 'along']) {
+    const [step] = buildSong(song, RANGE, { mode });
+    assert.equal(step.events.filter((e) => e.role === 'sing').length, 18);
+  }
+  // Built-in songs are left as they are.
+  for (const s of SONGS) assert.equal(songData(s).mel.notes.length, parseMelody(s.melody).notes.length, s.id);
+});
+
+const compound = (beats, type, direction, bodiesFn) => {
+  const unit = 3; // a dotted quarter, in eighths of divisions 2
+  const dq = (p, w) => pn('q', p, { lyric: w }).replace('<duration>2</duration>', `<duration>${unit}</duration>`).replace('</type>', '</type><dot/>');
+  return voiceScore(measuresOf(bodiesFn(dq), ATTR(beats, type) + direction));
+};
+const metro = (unit, dots, pm, soundTempo) =>
+  `<direction><direction-type><metronome><beat-unit>${unit}</beat-unit>${'<beat-unit-dot/>'.repeat(dots)}<per-minute>${pm}</per-minute></metronome></direction-type>${soundTempo ? `<sound tempo="${soundTempo}"/>` : ''}</direction>`;
+
+test('tempo: 6/8 and 12/8 count eighths, like "Row, Row"; dotted beats and odd <sound> tempos', () => {
+  const row = SONGS.find((s) => s.id === 'row');
+  assert.deepEqual([row.bpm, row.meter, row.pulse], [192, 6, 3], 'the built-in 6/8 song: 192 eighths a minute, 64 dotted beats');
+  const six = (dq) => [dq('C4', 'Row,') + dq('C4', 'row,'), dq('C4', 'row') + dq('E4', 'your'), dq('E4', 'boat') + dq('D4', 'down'), dq('C4', 'the') + dq('C4', 'stream.')];
+  const twelve = (dq) => [dq('C4', 'Row,') + dq('C4', 'row,') + dq('C4', 'row') + dq('E4', 'your'), dq('E4', 'boat') + dq('D4', 'down') + dq('C4', 'the') + dq('C4', 'stream.')];
+  const cases = [
+    // [what, beats, meter music, direction, bpm, meter]
+    ['6/8, dotted quarter = 60 with its <sound> in quarters', 6, six, metro('quarter', 1, 60, 90), 180, 6],
+    ['12/8, dotted quarter = 56 with its <sound> in quarters', 12, twelve, metro('quarter', 1, 56, 84), 168, 12],
+    ['12/8, dotted quarter = 84 and no <sound>', 12, twelve, metro('quarter', 1, 84), 252, 12],
+    ['12/8, dotted quarter = 56 with the marking\'s own number as <sound>', 12, twelve, metro('quarter', 1, 56, 56), 168, 12],
+    ['12/8, eighth = 168 with <sound> 168', 12, twelve, metro('eighth', 0, 168, 168), 168, 12],
+    ['12/8, only <sound tempo="84">', 12, twelve, sound('tempo="84"'), 168, 12],
+  ];
+  for (const [what, beats, music, dir, bpm, meter] of cases) {
+    const r = importMusicXML(compound(beats, 8, dir, music));
+    assert.deepEqual([r.song.bpm, r.song.meter, r.song.pulse], [bpm, meter, 3], what);
+    assertPlayable(r.song);
+    // It plays at that speed: each dotted beat (3 eighths) takes 180 / bpm seconds.
+    const [step] = buildSong(r.song, RANGE, { mode: 'along', speed: 1 });
+    const s = step.events.filter((e) => e.role === 'sing');
+    assert.ok(Math.abs(s[1].t - s[0].t - 180 / bpm) < 1e-6, what);
+  }
+  // 4/4 with "half = 60": 120 quarters a minute.
+  const r = importMusicXML(voiceScore(measuresOf([n('q', 'C4', 'one') + n('q', 'D4', 'two') + n('h', 'E4', 'three.')], ATTR() + metro('half', 0, 60))));
+  assert.equal(r.song.bpm, 120);
+});
+
+test('tempo: changes in the file are followed, and family songs start at their own speed', () => {
+  const bars = [
+    sound('tempo="80"') + n('q', 'C4', 'Twin') + n('q', 'C4', 'kle') + n('q', 'G4', 'lit') + n('q', 'G4', 'tle'),
+    n('q', 'A4', 'shin') + n('q', 'A4', 'ing') + n('h', 'G4', 'star,'),
+    sound('tempo="120"', 'Faster') + n('q', 'F4', 'how') + n('q', 'F4', 'I') + n('q', 'E4', 'won') + n('q', 'E4', 'der'),
+    n('q', 'D4', 'what') + n('q', 'D4', 'you') + sound('tempo="60"', 'rit.') + n('h', 'C4', 'are.'),
+  ];
+  const r = importMusicXML(voiceScore(bars.map((b, i) => bar(i + 1, b))));
+  assert.equal(r.song.bpm, 80);
+  assert.equal(r.song.tempos, '8:120 14:60');
+  assert.ok(r.warnings.some((w) => /tempo changes in this file \(60 to 120 beats a minute\); the song follows it/.test(w)), r.warnings.join(' | '));
+  assertPlayable(r.song);
+  const [step] = buildSong(r.song, RANGE, { mode: 'along' });
+  const s = step.events.filter((e) => e.role === 'sing');
+  assert.ok(Math.abs(s[1].t - s[0].t - 0.75) < 1e-6, '80 a minute');
+  assert.ok(Math.abs(s[8].t - s[7].t - 0.5) < 1e-6, '120 a minute');
+  assert.ok(Math.abs(s[13].d - 2) < 1e-6, 'the last half note at 60 a minute');
+  // It survives a .nbn file, and a part of the song keeps the tempo where it starts.
+  assert.equal(validateSong(r.song).song.tempos, '8:120 14:60');
+  const tail = sliceSong(r.song, 1, 1);
+  assert.equal(tail.bpm, 120);
+  assert.equal(tail.tempos, '6:60');
+  assert.ok(!validateSong({ ...r.song, tempos: '8:120 4:60' }).ok, 'changes out of order');
+  assert.ok(!validateSong({ ...r.song, tempos: '8:999' }).ok, 'a tempo out of range');
+  // Same id as before for a song with no tempo changes.
+  const plain = { ...r.song, tempos: undefined };
+  delete plain.tempos;
+  assert.equal(validateSong(plain).song.id, songId(plain));
+  // Family songs start at Normal (the file's own tempo); quick built-in songs still at Steady.
+  assert.equal(defaultSpeed({ ...r.song, bpm: 160 }), 'normal');
+  assert.equal(defaultSpeed({ id: 'x', bpm: 160, meter: 4 }), 'steady');
+  assert.equal(tempoText(r.song), 'starts at 80 beats a minute');
+  assert.equal(tempoText(SONGS.find((x) => x.id === 'row')), '64 beats a minute');
 });

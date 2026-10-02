@@ -7,7 +7,7 @@
 // the phone. They may have chords: null (no piano chords, unless a harmonizer is set
 // with setHarmonizer) and lyrics: null (sung on "la").
 
-import { parseMelody, parseLyrics, parseChords, chordTones, parsePitch, fitShift, paraStarts } from './music.js';
+import { parseMelody, parseLyrics, parseChords, chordTones, parsePitch, fitShift, paraStarts, unsungHolds, tempoMap } from './music.js';
 import { Builder } from './lessons.js';
 
 export const SONGS = [
@@ -157,13 +157,54 @@ export function setHarmonizer(fn) {
   cache.clear();
 }
 
+// Family songs imported before the importer knew better can hold "~" notes no one sings (an
+// instrumental riff, a piano note in a rest of the tune): those become rests here, silent and
+// not scored, and a line left with no words is dropped (see unsungHolds in music.js).
+function dropUnsung(song, mel, lyr) {
+  if (!song.lyrics || !String(song.id).startsWith('fam-') || lyr.length !== mel.notes.length) return { mel, lyr, paras: null };
+  const notes = mel.notes.map((n, i) => ({ ...n, hold: lyr[i] === '~' }));
+  const out = unsungHolds(notes, mel.phrases, song.pulse ? 0.5 : 1);
+  if (!out.size) return { mel, lyr, paras: null };
+  const keep = [];
+  const newIndex = new Map();
+  mel.notes.forEach((n, i) => {
+    if (out.has(i)) return;
+    newIndex.set(i, keep.length);
+    keep.push(i);
+  });
+  if (!keep.length) return { mel, lyr, paras: null };
+  // Lines, and which of them start a verse (a blank line in the words), as they are now.
+  const oldParas = paraStarts(song.lyrics, mel.phrases);
+  const phrases = [];
+  const paras = new Set();
+  let pendingPara = false;
+  mel.phrases.forEach(([s, e], p) => {
+    if (oldParas.has(p)) pendingPara = true;
+    const kept = keep.filter((i) => i >= s && i < e);
+    if (!kept.length) return;
+    if (pendingPara && phrases.length) paras.add(phrases.length);
+    pendingPara = false;
+    phrases.push([newIndex.get(kept[0]), newIndex.get(kept[kept.length - 1]) + 1]);
+  });
+  const last = mel.notes[keep[keep.length - 1]];
+  const lastEnd = last.beat + last.beats;
+  const droppedAtEnd = keep[keep.length - 1] < mel.notes.length - 1;
+  return {
+    mel: { notes: keep.map((i) => ({ ...mel.notes[i] })), phrases, totalBeats: droppedAtEnd ? lastEnd : mel.totalBeats },
+    lyr: keep.map((i) => lyr[i]),
+    paras,
+  };
+}
+
 export function songData(song) {
   if (cache.has(song.id)) return cache.get(song.id);
-  const mel = parseMelody(song.melody);
-  const lyr = song.lyrics ? parseLyrics(song.lyrics) : mel.notes.map(() => 'la');
+  let mel = parseMelody(song.melody);
+  let lyr = song.lyrics ? parseLyrics(song.lyrics) : mel.notes.map(() => 'la');
   if (lyr.length !== mel.notes.length) {
     console.warn(`${song.id}: ${mel.notes.length} notes but ${lyr.length} lyric tokens`);
   }
+  let paras;
+  ({ mel, lyr, paras } = dropUnsung(song, mel, lyr));
   let chords = [];
   if (song.chords) chords = parseChords(song.chords);
   else if (harmonizer) {
@@ -201,7 +242,7 @@ export function songData(song) {
       }
     }
   });
-  const data = { mel, lyr, chords, lo, hi, span: hi - lo, tonic: parsePitch(song.key + '4') };
+  const data = { mel, lyr, chords, lo, hi, span: hi - lo, tonic: parsePitch(song.key + '4'), tempo: tempoMap(song), paras };
   cache.set(song.id, data);
   return data;
 }
@@ -225,7 +266,7 @@ const END_COLON = /[:—–]["'’”»)\]]*$/;
 function lineEnds(song, data) {
   const { mel, lyr } = data;
   const beat = song.pulse || 1;
-  const paras = paraStarts(song.lyrics, mel.phrases);
+  const paras = data.paras || paraStarts(song.lyrics, mel.phrases);
   const P = mel.phrases.length;
   // The last syllable sung in a line (skipping "~" holds), and its lyric token.
   const lastSyl = ([s, e]) => {
@@ -341,9 +382,19 @@ export function learnChunks(song) {
 // The child picks how fast to sing a song: Slow, Steady or Normal (the song's own tempo).
 export const SPEEDS = { slow: 0.75, steady: 0.9, normal: 1 };
 export const SPEED_LABEL = { slow: 'Slow', steady: 'Steady', normal: 'Normal' };
-// Quick songs start at Steady. The pulse counts: "Row, Row" at 192 eighths is 64 dotted beats.
+// Quick built-in songs start at Steady. The pulse counts: "Row, Row" at 192 eighths is 64
+// dotted beats. A family song starts at its own tempo, the one in its file: the child can
+// still choose a slower one, and that choice is remembered.
 export function defaultSpeed(song) {
+  if (String(song.id).startsWith('fam-')) return 'normal';
   return song.bpm / (song.pulse || 1) > 110 ? 'steady' : 'normal';
+}
+
+// The song's own tempo for people: "124 beats a minute", "64 beats a minute" for "Row, Row"
+// (counted in dotted beats), or "starts at 106 beats a minute" when it changes on the way.
+export function tempoText(song) {
+  const bpm = Math.round(song.bpm / (song.pulse || 1));
+  return tempoMap(song).changes ? `starts at ${bpm} beats a minute` : `${bpm} beats a minute`;
 }
 
 export function difficulty(song) {
@@ -411,6 +462,10 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
   const low = data.lo + shift;
   const b = new Builder(song.bpm * speed);
   const spb = b.spb;
+  // Seconds between two beats of the song at this speed, following its tempo changes.
+  const tm = data.tempo;
+  const secs = (from, to) => (tm.sec(to) - tm.sec(from)) / speed;
+  const spbAt = (beat) => 60 / (tm.bpmAt(beat) * speed);
   const phraseCount = mel.phrases.length;
   const pulse = song.pulse || 1;
 
@@ -421,7 +476,7 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
       if (z <= a) continue;
       const moved = { ...ch, root: (((ch.root + shift) % 12) + 12) % 12 };
       for (const m of voiceChord(moved, low)) {
-        b.audio.push({ t: startT + (a - fromBeat) * spb, d: (z - a) * spb, kind: 'piano', m, vel, hp });
+        b.audio.push({ t: startT + secs(fromBeat, a), d: secs(a, z), kind: 'piano', m, vel, hp });
       }
     }
   };
@@ -443,13 +498,13 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
       for (let x = ch.beat; x < ch.beat + ch.beats - 1e-6; x += pulse) {
         if (x < fromBeat - 1e-6 || x >= toBeat - 1e-6) continue;
         const end = Math.min(ch.beat + ch.beats, toBeat);
-        const t = startT + (x - fromBeat) * spb;
-        const d = Math.min(pulse, end - x) * spb * 0.9;
+        const t = startT + secs(fromBeat, x);
+        const d = secs(x, x + Math.min(pulse, end - x)) * 0.9;
         for (const m of backingVoicing(moved, sungPcs(t, t + d), low).chord) {
           b.audio.push({ t, d, kind: 'piano', m, vel: 0.028, nohp: true, backing: true });
         }
         if (Math.abs((x - ch.beat) % bassEvery) < 1e-6) {
-          const bd = Math.min(bassEvery, end - x) * spb * 0.9;
+          const bd = secs(x, x + Math.min(bassEvery, end - x)) * 0.9;
           const { bass } = backingVoicing(moved, sungPcs(t, t + bd), low);
           if (bass != null) b.audio.push({ t, d: bd, kind: 'piano', m: bass, vel: 0.05, nohp: true, backing: true });
         }
@@ -469,8 +524,8 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
         si = -1;
       }
       if (!n.hold || si < 0) si++;
-      const t = startT + (n.beat - fromBeat) * spb;
-      const d = n.beats * spb;
+      const t = startT + secs(fromBeat, n.beat);
+      const d = secs(n.beat, n.beat + n.beats);
       b.events.push({ t, d, m: n.m + shift, role, phrase: p, si, text: n.text, join: n.join, melisma: !!n.hold });
       b.audio.push({ t, d, kind: 'guide', m: n.m + shift, hp: role === 'sing', level: role === 'sing' ? 0.16 : 0.22 });
     }
@@ -496,22 +551,23 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
       const listenAt = b.t;
       placeNotes(notes, 'listen', listenAt, from, () => p);
       chordAudio(from, to, listenAt, false, 0.05);
-      b.t += (to - from) * spb;
+      b.t += secs(from, to);
       // A breath, with ticks that set up the beat for your turn.
       const gap = Math.max(2, pulse * 2);
-      for (let i = 0; i < gap; i += pulse) b.audio.push({ t: b.t + i * spb, kind: 'click', accent: i === 0 });
-      b.t += gap * spb;
+      const tick = spbAt(from);
+      for (let i = 0; i < gap; i += pulse) b.audio.push({ t: b.t + i * tick, kind: 'click', accent: i === 0 });
+      b.t += gap * tick;
       const singAt = b.t;
       placeNotes(notes, 'sing', singAt, from, () => p);
       chordAudio(from, to, singAt, true, 0.05);
-      b.t += (to - from) * spb + 1.5 * spb;
+      b.t += secs(from, to) + 1.5 * spbAt(to);
     });
   } else {
     // Sing it through: the whole song in its own time, after one count-in.
     countIn(song.meter);
     const start = b.t;
     placeNotes(mel.notes, 'sing', start, 0, byLine);
-    mel.phrases.forEach(([s], p) => b.cues.push({ t: start + mel.notes[s].beat * spb - 0.01, text: `Line ${p + 1} of ${phraseCount}` }));
+    mel.phrases.forEach(([s], p) => b.cues.push({ t: start + secs(0, mel.notes[s].beat) - 0.01, text: `Line ${p + 1} of ${phraseCount}` }));
     if (headphones) {
       // hp: if headphones are switched off mid-run these stop too (they can hold the sung note).
       chordAudio(0, mel.totalBeats, start, true, 0.07);
@@ -519,7 +575,7 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
       backing(0, mel.totalBeats, start);
       lineCues(start);
     }
-    b.t = start + mel.totalBeats * spb + 1;
+    b.t = start + secs(0, mel.totalBeats) + 1;
   }
 
   // Without headphones, a line that starts after a real rest (a beat or more, and long enough in
@@ -531,8 +587,8 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
       const prev = mel.notes[s - 1];
       const restBeats = mel.notes[s].beat - (prev.beat + prev.beats);
       if (restBeats < pulse - 1e-6) continue;
-      const t0 = start + (prev.beat + prev.beats) * spb + 0.2;
-      const t1 = start + mel.notes[s].beat * spb - 0.45;
+      const t0 = start + secs(0, prev.beat + prev.beats) + 0.2;
+      const t1 = start + secs(0, mel.notes[s].beat) - 0.45;
       const d = Math.min(0.5, t1 - t0);
       if (d < 0.25) continue;
       b.audio.push({ t: t0, d, kind: 'guide', m: mel.notes[s].m + shift, level: 0.08, nohp: true, cue: true });

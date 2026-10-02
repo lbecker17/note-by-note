@@ -634,6 +634,8 @@ button.safe-line svg { display: inline-block; vertical-align: -3px; margin-right
 /* Song speed: a smaller control under the mode, with its name beside it. */
 .speed-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; }
 .speed-row .seg-h { margin: 0 0 0 4px; }
+.speed-row .seg-h { max-width: 8.5em; }
+.speed-tempo { display: block; margin-top: 2px; font: 600 11px/1.25 var(--font-body); color: var(--muted); }
 .seg.speed { padding: 3px; gap: 3px; }
 .seg.speed button { min-height: 40px; font-size: 14px; }
 .switch { flex: none; width: 52px; height: 32px; padding: 0; border: 0; border-radius: 16px; background: var(--track); position: relative; transition: background-color 0.15s ease; }

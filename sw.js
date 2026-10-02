@@ -1,7 +1,7 @@
 // Network first, so updates show up straight away; the cache keeps the app working offline.
 // Only the app's own files are cached: requests to the family account (Supabase) and anything
 // else from another origin go straight to the network and are never stored.
-const CACHE = 'note-by-note-v14';
+const CACHE = 'note-by-note-v15';
 const ASSETS = [
   './',
   'index.html',
