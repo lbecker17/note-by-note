@@ -1299,3 +1299,33 @@ export function sliceSong(song, from, to, opts = {}) {
   piece.id = songId(piece);
   return piece;
 }
+
+// ---------- Choosing what to keep ----------
+export const PIECE_LINES = 16; // a part offered on its own: up to this many lines
+
+// The parts a grown-up can choose from a long song: each section, two sections in a row
+// (often a verse and its chorus) and, when it fits, the whole song.
+export function pieceOptions(result) {
+  const { sections, fits, long } = result;
+  const lines = result.stats.lines;
+  if (fits && !long) return [{ from: 0, to: lines - 1, whole: true }];
+  const out = [];
+  if (fits) out.push({ from: 0, to: lines - 1, whole: true });
+  sections.forEach((s, i) => {
+    out.push({ from: s.from, to: s.to, sec: s });
+    const nx = sections[i + 1];
+    if (nx && nx.to - s.from + 1 <= PIECE_LINES) out.push({ from: s.from, to: nx.to, sec: s, end: nx, pair: true });
+  });
+  return out;
+}
+
+// The whole song whenever it fits (a long one is still learnt a part at a time in Line by line).
+// Only a song too long to keep whole starts on a part: its first verse and chorus when there are
+// sections to pair, or its first part.
+export function defaultPiece(opts) {
+  if (opts.length === 1 || opts[0].whole) return 0;
+  const pair = opts.findIndex((p) => p.pair && p.from === 0);
+  if (pair >= 0) return pair;
+  const first = opts.findIndex((p) => !p.whole);
+  return first >= 0 ? first : 0;
+}

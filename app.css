@@ -965,6 +965,11 @@ textarea.report { width: 100%; min-height: 160px; border-radius: 12px; border: 1
 .fam-steps li { font-size: 15px; color: var(--fg-2); }
 .sheet .fam-help { padding-bottom: 4px; }
 .fam-menu { display: flex; flex-direction: column; border-bottom: 1px solid var(--line); }
+.sheet .fam-part-note { font-size: 14px; color: var(--fg); background: var(--accent-soft); border-radius: 14px; padding: 10px 12px; }
+.fam-part-note b { color: var(--accent-ink); }
+/* Timing check */
+.sheet .t-count { font: 800 22px/1.2 var(--font-body); color: var(--fg); text-align: center; padding: 6px 0; font-variant-numeric: tabular-nums; }
+.btn.t-pad { min-height: 120px; font-size: 22px; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
 .field.link-row.danger b { color: var(--danger); }
 .keep-field p { max-width: 34ch; }
 .sheet.fam h2 { overflow-wrap: anywhere; }

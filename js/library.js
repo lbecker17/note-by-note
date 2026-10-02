@@ -10,6 +10,17 @@
 
 import { validateSong, isFamilySongId } from './nbn.js';
 
+// The song's source, as stored: { kind, fileName, importedAt, part }. part: when only some lines
+// of the file were kept, { from, to, of } (0-based lines, inclusive, and the file's line count).
+export function cleanSource(src) {
+  if (!src || typeof src !== 'object' || Array.isArray(src)) return null;
+  const str = (v) => (typeof v === 'string' ? v : undefined);
+  const p = src.part;
+  const int = (v) => Number.isInteger(v) && v >= 0 && v < 100000;
+  const part = p && typeof p === 'object' && int(p.from) && int(p.to) && int(p.of) && p.from <= p.to && p.to < p.of ? { from: p.from, to: p.to, of: p.of } : undefined;
+  return { kind: str(src.kind), fileName: str(src.fileName), importedAt: str(src.importedAt), part };
+}
+
 const DB_NAME = 'note-by-note-family';
 const DB_VERSION = 1;
 const STORE = 'songs';
@@ -90,11 +101,10 @@ function clean(rec) {
   const v = validateSong(rec.song);
   if (!v.ok) return null;
   const song = { ...v.song, id: rec.id };
-  const src = rec.source && typeof rec.source === 'object' ? rec.source : null;
   return {
     id: rec.id,
     song,
-    source: src ? { kind: typeof src.kind === 'string' ? src.kind : undefined, fileName: typeof src.fileName === 'string' ? src.fileName : undefined, importedAt: typeof src.importedAt === 'string' ? src.importedAt : undefined } : null,
+    source: cleanSource(rec.source),
     via: typeof rec.via === 'string' ? rec.via : null,
     addedAt: typeof rec.addedAt === 'string' ? rec.addedAt : null,
   };

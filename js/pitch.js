@@ -97,10 +97,14 @@ export class Tracker {
     this.lastPitched = -Infinity;
     this.recent = [];
     this.run = null; // the steady stretch under way: { m, rms, n, t } (running averages, start time)
+    // When the pitch push() last returned was sung. The median of three readings follows a change
+    // one reading late, so a median belongs to the middle reading's time, not the newest one's.
+    this.at = null;
   }
 
   reset() {
     this.recent = [];
+    this.at = null;
   }
 
   gate() {
@@ -139,11 +143,14 @@ export class Tracker {
 
     const voiced = pitched && !hum && r.rms > this.gate();
     this.recent = this.recent.filter((p) => time - p.t < 0.1);
+    this.at = time;
     if (!voiced) return null;
 
     const m = hzToMidi(r.hz);
     this.recent.push({ t: time, m });
     if (this.recent.length > 3) this.recent.shift();
-    return this.recent.length >= 3 ? median(this.recent.map((p) => p.m)) : m;
+    if (this.recent.length < 3) return m;
+    this.at = this.recent[1].t;
+    return median(this.recent.map((p) => p.m));
   }
 }

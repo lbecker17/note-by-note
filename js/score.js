@@ -59,8 +59,15 @@ export function graceFor(ev) {
   return Math.min(0.2, ev.d * 0.3);
 }
 
-// frames: [{t, m}] sorted by time
-export function scoreStep(step, frames, tol) {
+// frames: [{t, m}] sorted by time. A frame marked skip (the app's own sound, see fromSpeaker)
+// is not a miss: the note is scored on the frames left. But a note that is mostly the speaker
+// (fewer than SKIP_MIN of its pitched frames left, or fewer than 3) wasn't heard. In a heard note the
+// skipped frames count as heard (they are most likely the child right on the note, or the tune
+// between their syllables); otherwise as silence, so a run of only the speaker isn't heard.
+// shift: seconds to move the whole run of frames earlier before scoring (see bestShift).
+export const SKIP_MIN = 0.2;
+
+export function scoreStep(step, frames, tol, shift = 0) {
   const notes = [];
   let fi = 0;
   for (const ev of step.events) {
@@ -68,19 +75,24 @@ export function scoreStep(step, frames, tol) {
     const wide = ev.m2 != null ? 2 : 1;
     const a = ev.t + graceFor(ev);
     const z = ev.t + ev.d;
-    while (fi < frames.length && frames[fi].t < ev.t - 0.5) fi++;
-    let n = 0, cr = 0, voiced = 0, sumAbs = 0, sumSigned = 0, octaveOff = 0, onset = null;
+    while (fi < frames.length && frames[fi].t - shift < ev.t - 0.5) fi++;
+    let n = 0, cr = 0, voiced = 0, sumAbs = 0, sumSigned = 0, octaveOff = 0, onset = null, skipped = 0;
     let run = 0, longest = 0, lastT = null;
     const devs = [];
     for (let i = fi; i < frames.length; i++) {
       const f = frames[i];
-      if (f.t >= z) break;
-      if (f.t < ev.t) continue;
-      if (f.m != null && onset == null) {
-        const x = foldDiff(f.m, targetAt(ev, f.t));
-        if (Math.abs(x.d * 100) <= tol.near * wide) onset = f.t - ev.t;
+      const ft = f.t - shift;
+      if (ft >= z) break;
+      if (ft < ev.t) continue;
+      if (f.skip) {
+        if (ft >= a) skipped++;
+        continue;
       }
-      if (f.t < a) continue;
+      if (f.m != null && onset == null) {
+        const x = foldDiff(f.m, targetAt(ev, ft));
+        if (Math.abs(x.d * 100) <= tol.near * wide) onset = ft - ev.t;
+      }
+      if (ft < a) continue;
       n++;
       if (f.m == null) {
         run = 0;
@@ -88,7 +100,7 @@ export function scoreStep(step, frames, tol) {
         continue;
       }
       voiced++;
-      const x = foldDiff(f.m, targetAt(ev, f.t));
+      const x = foldDiff(f.m, targetAt(ev, ft));
       const c = x.d * 100;
       if (x.octave !== 0) octaveOff++;
       const k = creditFor(c, tol, wide);
@@ -97,13 +109,24 @@ export function scoreStep(step, frames, tol) {
       sumSigned += c;
       devs.push(c);
       if (Math.abs(c) <= tol.near * wide) {
-        if (lastT != null) run += f.t - lastT;
-        lastT = f.t;
+        if (lastT != null) run += ft - lastT;
+        lastT = ft;
         longest = Math.max(longest, run);
       } else {
         run = 0;
         lastT = null;
       }
+    }
+    if (skipped) {
+      if (voiced < Math.max(3, SKIP_MIN * (voiced + skipped))) {
+        // Mostly the speaker: not heard.
+        notes.push({ ev, score: 0, n: n + skipped, voiced: 0, avgAbs: null, avgSigned: null, octaveOff: 0, onset: null, steadiness: null, longest: ev.hold ? 0 : null });
+        continue;
+      }
+      const sc = cr / n;
+      n += skipped;
+      voiced += skipped;
+      cr = sc * n;
     }
     let steadiness = null;
     if (ev.hold && devs.length > 10) {
@@ -126,6 +149,77 @@ export function scoreStep(step, frames, tol) {
     });
   }
   return notes;
+}
+
+// ---------- A steady lag ----------
+// However well the app guesses this device's delays, a singer can still sit a little behind (or
+// ahead of) the music the whole way through: a Bluetooth speaker, a slow mic, or just how they
+// follow. That isn't a pitch mistake, so before scoring, the whole step's singing may move by up
+// to ALIGN_MAX to where it fits the notes best. It moves as one: single notes are never nudged.
+// A move must earn at least ALIGN_GAIN of the step's notes' worth (by length) to beat staying
+// put, and the smallest of equally good moves wins, so a run that already fits stays where it is.
+export const ALIGN_MAX = 0.25;
+export const ALIGN_STEP = 0.01;
+export const ALIGN_GAIN = 0.01;
+
+const worth = (notes) => notes.reduce((s, n) => s + n.score * n.ev.d, 0);
+
+// Returns { shift, notes } (seconds, positive when the singing was late).
+export function alignStep(step, frames, tol) {
+  const base = scoreStep(step, frames, tol, 0);
+  const total = base.reduce((s, n) => s + n.ev.d, 0);
+  if (!total || !frames.some((f) => f.m != null)) return { shift: 0, notes: base };
+  let best = { shift: 0, notes: base, w: worth(base) };
+  const need = best.w + ALIGN_GAIN * total;
+  const steps = Math.round(ALIGN_MAX / ALIGN_STEP);
+  for (let k = 1; k <= steps; k++) {
+    for (const sh of [k * ALIGN_STEP, -k * ALIGN_STEP]) {
+      const notes = scoreStep(step, frames, tol, sh);
+      const w = worth(notes);
+      if (w >= need && w > best.w + 1e-9) best = { shift: sh, notes, w };
+    }
+  }
+  return { shift: best.shift, notes: best.notes };
+}
+
+// ---------- The app's own sound ----------
+// Without headphones the tune (and the soft piano) comes out of the speaker while the child
+// sings, and the mic hears it. A speaker plays a note machine-exact: its readings sit within a
+// cent or so of the note, where a child's voice wobbles. So a reading within SPEAKER_CENTS of a
+// note the app is playing at that moment (in any octave) is the speaker, and is left out: not
+// heard, and not a miss. A child singing that exact note loses only those few frames.
+export const SPEAKER_CENTS = 3;
+
+// ref: the app's own output read the same way at that moment (AudioEngine.readRef). A reading
+// that matches it is the speaker too, even when chords under the tune move it off the note. Chords
+// on their own read unsteadily (often as a low note they share, measured 0 to 20 cents apart from
+// one read to the next), so a reading that is a miss anyway (miss: true, more than a semitone
+// from the note to sing, or no note to sing) may sit up to REF_FAR_CENTS from the output's.
+// Leaving such a reading out never gives credit; it only stops the piano counting as the child.
+export const REF_FAR_CENTS = 30;
+// ref: one reading or a list of them (the output around that moment).
+export function sameAsRef(m, ref, miss = false) {
+  if (m == null || ref == null) return false;
+  const tol = miss ? REF_FAR_CENTS : SPEAKER_CENTS;
+  for (const x of Array.isArray(ref) ? ref : [ref]) {
+    const diff = m - x;
+    if (Math.abs(diff - 12 * Math.round(diff / 12)) * 100 <= tol) return true;
+  }
+  return false;
+}
+
+// m: the reading (MIDI); t: when it was sung; playing: [{ a, z, s, d, m, m2 }] on the same
+// clock: a..z when that note can reach the mic, s and d its own start and length (for slides).
+export function fromSpeaker(m, t, playing) {
+  if (m == null) return false;
+  for (const p of playing) {
+    if (t < p.a || t > p.z) continue;
+    const target = p.m2 != null && p.d > 0 ? p.m + (p.m2 - p.m) * Math.min(1, Math.max(0, (t - p.s) / p.d)) : p.m;
+    const diff = m - target;
+    const off = Math.abs(diff - 12 * Math.round(diff / 12)) * 100;
+    if (off <= SPEAKER_CENTS) return true;
+  }
+  return false;
 }
 
 export function summarize(steps) {

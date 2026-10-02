@@ -372,7 +372,9 @@ function voiceChord(ch, lowMelody) {
 
 // ---------- Backing for singing without headphones ----------
 // The phone's speaker and mic are a hand's width apart, so whatever the backing plays, the mic
-// hears too. A note at the pitch the child should be singing (or that pitch in another octave)
+// hears too. (The tune itself plays as well, softly: the player leaves out any reading that sits
+// machine-exactly on a note it is playing, see fromSpeaker in score.js. The chords still avoid
+// the sung note, so they never mask the child's voice on the very pitch being scored.) A note at the pitch the child should be singing (or that pitch in another octave)
 // would be read as their voice and scored. So each backing note leaves out the pitch class of
 // every melody note it overlaps, and the backing sits under the melody, played softly.
 const pcOf = (m) => ((Math.round(m) % 12) + 12) % 12;
@@ -400,7 +402,9 @@ export function backingVoicing(ch, avoid, low) {
 
 // speed: a share of the song's tempo (SPEEDS); everything (notes, backing, count-in, the lane and
 // the scoring) follows it, since they all work from the same times.
-export function buildSong(song, range, { mode = 'learn', headphones = false, speed = 1 } = {}) {
+// tune: without headphones, whether the player plays the tune while the child sings (only the
+// words of the intro depend on it here: the player turns the sung notes' guide into that tune).
+export function buildSong(song, range, { mode = 'learn', headphones = false, speed = 1, tune = true } = {}) {
   const data = songData(song);
   const { mel, chords } = data;
   const shift = fitShift(range, data.lo, data.hi);
@@ -548,7 +552,9 @@ export function buildSong(song, range, { mode = 'learn', headphones = false, spe
         ? 'Line by line: hear each part, then sing it back.'
         : headphones
           ? 'Sing the whole song with the piano and the guide melody.'
-          : 'Sing the whole song with a soft piano.',
+          : tune
+            ? 'Sing the whole song with the tune and a soft piano.'
+            : 'Sing the whole song with a soft piano.',
   });
   return [step];
 }
