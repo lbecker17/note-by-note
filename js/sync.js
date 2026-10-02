@@ -19,6 +19,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const RANGE_FROM = ['test', 'child', 'high', 'low'];
 const NAMES = ['letters', 'solfa'];
 const STRICT = ['relaxed', 'standard', 'strict'];
+const TUNE = ['off', 'soft', 'clear'];
 const isObj = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
 const num = (v, lo = -Infinity, hi = Infinity) => typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
 const isDay = (v) => typeof v === 'string' && DAY.test(v);
@@ -43,13 +44,14 @@ function cleanSpeeds(v) {
 }
 
 function cleanSettings(s) {
-  const out = { headphones: false, names: 'letters', strict: 'standard', warmupLock: true, speeds: {} };
+  const out = { headphones: false, names: 'letters', strict: 'standard', warmupLock: true, speeds: {}, tune: 'soft' };
   if (!isObj(s)) return out;
   out.speeds = cleanSpeeds(s.speeds);
   if (typeof s.headphones === 'boolean') out.headphones = s.headphones;
   if (NAMES.includes(s.names)) out.names = s.names;
   if (STRICT.includes(s.strict)) out.strict = s.strict;
   if (typeof s.warmupLock === 'boolean') out.warmupLock = s.warmupLock;
+  if (TUNE.includes(s.tune)) out.tune = s.tune;
   return out;
 }
 

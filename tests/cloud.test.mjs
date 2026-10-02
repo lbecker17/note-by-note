@@ -94,7 +94,7 @@ test('merge: a reset on one device is not undone by the other', () => {
 test('merge: damaged data from the server is cleaned, not trusted', () => {
   const bad = {
     range: { low: 'x', high: 70 },
-    settings: { headphones: 'yes', names: '<b>', strict: 'strict', extra: 1 },
+    settings: { headphones: 'yes', names: '<b>', strict: 'strict', tune: 'loud', extra: 1 },
     progress: { a: { best: 7, runs: 1 }, b: 'no', c: { best: 0.5, runs: -1, last: 'x' } },
     days: ['2026-10-01', '<img>', 5],
     warm: { day: 'today' },
@@ -102,7 +102,7 @@ test('merge: damaged data from the server is cleaned, not trusted', () => {
   };
   const c = clean(bad);
   assert.equal(c.range, null);
-  assert.deepEqual(c.settings, { headphones: false, names: 'letters', strict: 'strict', warmupLock: true, speeds: {} });
+  assert.deepEqual(c.settings, { headphones: false, names: 'letters', strict: 'strict', warmupLock: true, speeds: {}, tune: 'soft' });
   assert.deepEqual(c.progress, { c: { best: 0.5, runs: 0 } });
   assert.deepEqual(c.days, ['2026-10-01']);
   assert.equal(c.warm, null);

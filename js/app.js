@@ -1,9 +1,10 @@
-import { AudioEngine } from './audio.js';
+import { AudioEngine, savedLag, saveLag, LAG_MAX } from './audio.js';
+import { TIMING, clickTimes, lagFrom, onsets } from './timing.js';
 import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './lessons.js';
 import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer, SPEEDS, SPEED_LABEL, defaultSpeed } from './songs.js';
 import { Lane, drawOverview, drawSong } from './lane.js';
 import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, fitShift } from './music.js';
-import { STRICTNESS, scoreStep, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, speakerBleed, offWords } from './score.js';
+import { STRICTNESS, alignStep, fromSpeaker, sameAsRef, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, speakerBleed, offWords } from './score.js';
 import { store, today, week, warmedToday, songPassToday } from './store.js';
 import { findNotes, findKey, quantize, harmonize, arrange, describe, TEMPOS } from './tune.js';
 import { writeFamilySongFile, familySongFileName, validateSong, isFamilySongId, SONG_LIMITS, FAMILY_CREDIT } from './nbn.js';
@@ -344,6 +345,134 @@ function needRangeSheet() {
 // It stops a 4-to-7-year-old; a teenager can answer it, and the copy says so.
 const newGate = (err = false) => ({ a: 6 + Math.floor(Math.random() * 4), b: 6 + Math.floor(Math.random() * 4), err });
 
+// Songs without headphones: the tune's level while the child sings (Settings, Tune while you sing).
+const TUNE_LEVEL = { off: 0, soft: 0.07, clear: 0.13 };
+const TUNE_BLURB = {
+  off: 'Without headphones, you hear each line first, and Sing it through has a soft piano that never plays your note.',
+  soft: 'Without headphones, the tune plays quietly while you sing. I listen past it, so only your voice counts.',
+  clear: 'Without headphones, the tune plays clearly while you sing. I listen past it, so only your voice counts.',
+};
+
+// ---------- Timing check ----------
+// How late sound reaches the singer on this device (see AudioEngine.outputLag). Kept on this
+// device only, never synced: another iPad, or Bluetooth headphones, needs its own check.
+const ms = (s) => `${Math.round(s * 1000)} ms`;
+function lagText() {
+  const v = savedLag();
+  if (v) return `Measured on this device by ${v.how === 'sing' ? 'singing' : 'tapping'}: sound arrives ${ms(v.lag)} late. If notes feel early or late, check again (and after changing headphones or speakers).`;
+  return `Not checked yet. If notes on the screen feel early or late, tap or sing along to 8 clicks and I’ll match the screen to this device${audio.ctx ? ` (my guess now: ${ms(audio.guessLag())})` : ''}.`;
+}
+
+// phase: 'intro' | 'run' | 'done'; how: 'tap' | 'sing'; res: lagFrom() result.
+function timingSheet(phase = 'intro', how = 'tap', res = null) {
+  const back = () => {
+    settingsSheet();
+    focusIn('[data-act="timing"]');
+  };
+  if (phase === 'intro') {
+    const v = savedLag();
+    openSheet(
+      `<p class="eyebrow">For grown-ups</p>
+       <h2>Timing check</h2>
+       <p>Sound takes a moment to reach you, longer with Bluetooth. I’ll play ${TIMING.leadIn} clicks to get ready, then ${TIMING.count} more. Tap the big button on each click, or sing a short “dah” with each one.</p>
+       <p class="muted">Use the speaker or headphones you sing with. ${esc(v ? `Now: ${ms(v.lag)} (${v.how === 'sing' ? 'singing' : 'tapping'}).` : `My guess now: ${ms(audio.ctx ? audio.guessLag() : 0)}.`)}</p>
+       <div class="sheet-actions">
+         <button class="btn secondary" data-act="t-sing">Sing along</button>
+         <button class="btn primary" data-act="t-tap">Tap along</button>
+       </div>
+       ${v ? '<button class="btn text wide" data-act="t-clear">Forget it and use my guess</button>' : ''}
+       <button class="btn text wide" data-act="t-back">Back to Settings</button>`,
+      {
+        't-tap': () => {
+          audio.unlock();
+          timingSheet('run', 'tap');
+        },
+        't-sing': () => {
+          audio.unlock();
+          if (!audio.micOn) return micSheet(() => timingSheet('run', 'sing'));
+          timingSheet('run', 'sing');
+        },
+        't-clear': () => {
+          saveLag(null);
+          timingSheet();
+        },
+        't-back': back,
+      },
+      { label: 'Timing check', key: 'timing', cls: 'timing' }
+    );
+    return;
+  }
+  if (phase === 'done') {
+    const good = res && res.ok;
+    const why = res && res.why === 'uneven' ? 'Those were a bit uneven, so I didn’t keep them.' : 'I didn’t catch enough of them.';
+    openSheet(
+      `<p class="eyebrow">For grown-ups</p>
+       <h2>${good ? 'Timing saved' : 'Let’s try that again'}</h2>
+       <p>${good ? `Sound reaches you ${ms(res.lag)} after I play it on this device. The notes on the screen and the scoring now allow for that.` : `${why} Try again, in time with the clicks.`}</p>
+       <div class="sheet-actions">
+         <button class="btn secondary" data-act="t-again">Try again</button>
+         <button class="btn primary" data-act="t-back">Done</button>
+       </div>`,
+      { 't-again': () => timingSheet(), 't-back': back },
+      { label: 'Timing check', key: 'timing', cls: 'timing' }
+    );
+    return;
+  }
+  // The run: the clicks go out on the audio clock; taps and sung onsets come back on it too.
+  const ctx = audio.ctx;
+  if (!ctx) return timingSheet();
+  audio.openBus();
+  const start = ctx.currentTime + 0.8;
+  const { all, counted } = clickTimes(start);
+  all.forEach((t, i) => audio.click(t, i < TIMING.leadIn));
+  const answers = [];
+  const readings = [];
+  let live = true;
+  const end = all[all.length - 1] + TIMING.late + 0.2;
+  const bd = openSheet(
+    `<p class="eyebrow">For grown-ups</p>
+     <h2>${how === 'tap' ? 'Tap on each click' : 'Sing “dah” on each click'}</h2>
+     <p class="t-count" aria-live="polite">Get ready…</p>
+     ${how === 'tap' ? '<button class="btn primary big wide t-pad" data-act="t-noop">Tap</button>' : '<p class="muted">Short and clear, right on the click.</p>'}
+     <button class="btn text wide" data-act="t-stop">Stop</button>`,
+    {
+      't-noop': () => {},
+      't-stop': () => {
+        live = false;
+        audio.closeBus();
+        timingSheet();
+      },
+    },
+    { label: 'Timing check', key: 'timing', cls: 'timing', onClose: () => ((live = false), audio.closeBus()) }
+  );
+  const count = bd.querySelector('.t-count');
+  const pad = bd.querySelector('.t-pad');
+  if (pad)
+    pad.addEventListener('pointerdown', (e) => {
+      // The tap's own moment, on the audio clock (not when this handler got to run).
+      const ago = Math.max(0, Math.min(0.2, (performance.now() - e.timeStamp) / 1000)) || 0;
+      answers.push(ctx.currentTime - ago);
+    });
+  const clickM = [88.02, 92.98]; // the clicks (1320 and 1760 Hz), in case the mic hears them
+  const step = () => {
+    if (!live) return;
+    const now = ctx.currentTime;
+    if (how === 'sing' && audio.micOn) {
+      const r = audio.read();
+      if (r) readings.push({ t: r.t, m: r.m != null && fromSpeaker(r.m, r.t, clickM.map((m) => ({ a: -Infinity, z: Infinity, m }))) ? null : r.m });
+    }
+    const done = all.filter((t) => t + audio.outputLag() <= now).length;
+    setText(count, done <= TIMING.leadIn ? 'Get ready…' : `${Math.min(TIMING.count, done - TIMING.leadIn)} of ${TIMING.count}`);
+    if (now < end) return requestAnimationFrame(step);
+    live = false;
+    audio.closeBus();
+    const got = lagFrom(counted, how === 'tap' ? answers : onsets(readings));
+    if (got.ok) saveLag({ lag: Math.min(LAG_MAX, got.lag), how, at: Date.now() });
+    timingSheet('done', how, got);
+  };
+  requestAnimationFrame(step);
+}
+
 // gate: null, or the sum on show while a grown-up turns the lock off.
 function settingsSheet(gate = null) {
   const s = S();
@@ -363,9 +492,10 @@ function settingsSheet(gate = null) {
   const html = `
     <h2>Settings</h2>
     <div class="field">
-      <div><b>Headphones</b><p>Only switch this on when you’re wearing headphones. Then you hear the tune while you sing. With it off, you hear each part before you sing (in Sing it through, a soft piano that never plays your note), so the mic only hears you. Wired headphones work best: Bluetooth drops to call quality while the mic is on.</p></div>
+      <div><b>Headphones</b><p>Only switch this on when you’re wearing headphones. Then you hear the tune and the piano while you sing. With it off, songs play the tune from the speaker (as loud as you choose below) and I listen past it, so only your voice counts. Wired headphones work best: Bluetooth drops to call quality while the mic is on.</p></div>
       <button class="switch ${s.headphones ? 'on' : ''}" role="switch" aria-checked="${s.headphones}" aria-label="Headphones" data-act="set" data-k="headphones" data-v="${!s.headphones}"><i></i></button>
     </div>
+    <div class="field col"><b id="tune-h">Tune while you sing</b>${seg('tune', [['off', 'Off'], ['soft', 'Soft'], ['clear', 'Clear']]).replace('role="radiogroup"', 'role="radiogroup" aria-labelledby="tune-h"')}<p class="muted">${TUNE_BLURB[s.tune] || TUNE_BLURB.soft}</p></div>
     <div class="field col"><b>Note names</b>${seg('names', [['letters', 'C D E'], ['solfa', 'Do Re Mi']])}</div>
     <div class="field col"><b>How strict</b>${seg('strict', [['relaxed', 'Relaxed'], ['standard', 'Standard'], ['strict', 'Strict']])}<p class="muted">${STRICTNESS[s.strict].blurb}</p></div>
     <div class="field">
@@ -393,6 +523,10 @@ function settingsSheet(gate = null) {
         : ''
     }
     <p class="lock-note">This is a gentle nudge, not a real lock. I check that someone sang along with the warm-up, but I can’t be certain.</p>
+    <div class="field">
+      <div><b>Timing check</b><p>${esc(lagText())}</p></div>
+      <button class="btn small secondary" data-act="timing">Check</button>
+    </div>
     ${accountFieldHTML()}
     <div class="field">
       <div><b>Family songs</b><p>${familyState === 'unavailable' ? 'Can’t be saved in this browser window.' : `${familySongs.length || 'None'} ${onDevice()}. Songs you’ve bought, kept private.`}</p></div>
@@ -465,6 +599,7 @@ function settingsSheet(gate = null) {
         focusIn('[data-act="lock-switch"]');
       },
       gate: () => checkGate(),
+      timing: () => timingSheet(),
       'pin-change': () => changePin(),
       'acct-open': () => openAccount(),
     },
@@ -1214,7 +1349,7 @@ function buildPlan(kind, id, mode, speed = 'normal') {
   }
   if (kind === 'song') {
     const song = findSong(id);
-    return { id: 'song:' + id, title: song.title, song, speed, steps: buildSong(song, range, { mode, headphones: S().headphones, speed: SPEEDS[speed] || 1 }) };
+    return { id: 'song:' + id, title: song.title, song, speed, steps: buildSong(song, range, { mode, headphones: S().headphones, speed: SPEEDS[speed] || 1, tune: S().tune !== 'off' }) };
   }
   const L = LESSONS[id];
   return { id, title: L.title, steps: L.build(range) };
@@ -1331,8 +1466,18 @@ function playerCtrl({ kind, id }) {
   // The warm-up is always hear-then-sing, whatever the headphones setting: nothing plays while
   // the child sings, so sound from the phone's speaker can't count as their voice and open songs.
   const guideWhileSinging = () => kind !== 'warmup' && S().headphones;
-  // Whether this run played anything meant for headphones only, for the speaker check in finish().
+  // Whether this run played anything meant for headphones only, or the tune through the speaker,
+  // for the speaker check in finish().
   let hpPlayed = false;
+  // The heard clock: what the singer hears at audio time T0 + x is the music at x - lag (see
+  // AudioEngine.outputLag). The lane, the words, the cues, the scoring and the end of a step all
+  // run on it; only scheduling sound uses the audio clock itself. Fixed for each step.
+  let lag = 0;
+  // Songs without headphones: the notes the app is playing (heard clock), to tell the speaker
+  // from the child (fromSpeaker in score.js).
+  let playing = [];
+  const speakerMode = () => kind === 'song' && !S().headphones;
+  let lastTune = S().tune; // to rebuild when Settings changes it (the intro's words follow it)
   // The song a locked tap asked for, offered on the warm-up's done sheet.
   const forSong = kind === 'warmup' ? pendingSong : null;
   if (kind === 'warmup') pendingSong = null;
@@ -1541,6 +1686,10 @@ function playerCtrl({ kind, id }) {
     if (st.kind === 'move') return startMove(st);
     audio.openBus();
     audio.tracker.reset();
+    lag = audio.outputLag();
+    playing = [];
+    if (speakerMode()) audio.startRef(lag + audio.inLag);
+    else audio.stopRef();
     T0 = audio.now() + LEAD;
     state = 'running';
     el.player.dataset.state = 'running';
@@ -1641,6 +1790,7 @@ function playerCtrl({ kind, id }) {
   // keep: { results, at } to offer "Carry on" (warm-up only), else null.
   function stop(message, keep = null) {
     audio.closeBus();
+    audio.stopRef();
     releaseWake();
     results = [];
     kept = keep;
@@ -1653,11 +1803,18 @@ function playerCtrl({ kind, id }) {
     if (message) setCue(message, '');
   }
 
+  // t: the audio clock, from T0 (not the heard clock).
   function schedule(st, t, now) {
     const A = st.audio;
     while (ai < A.length && A[ai].t < t + 0.7) {
-      const a = A[ai++];
-      if (a.hp && !guideWhileSinging()) continue;
+      let a = A[ai++];
+      if (a.hp && !guideWhileSinging()) {
+        // Songs without headphones still play the tune while the child sings: softly, in a clean
+        // tone, as Settings says (Tune while you sing). The chords for headphones stay silent.
+        const level = speakerMode() && a.kind === 'guide' ? TUNE_LEVEL[S().tune] || 0 : 0;
+        if (!level) continue;
+        a = { ...a, kind: 'tune', level };
+      }
       // Backing for the speaker (songs without headphones) gives way to the guide and full chords.
       if (a.nohp && guideWhileSinging()) continue;
       if (a.hp) hpPlayed = true;
@@ -1677,6 +1834,15 @@ function playerCtrl({ kind, id }) {
         at = now + 0.005;
       }
       audio.play({ ...a, d, m }, at);
+      if (speakerMode()) {
+        // Heard clock, with room for the guess of the delay to be a little out and for the
+        // piano's ring after the note ends.
+        const s0 = at - T0;
+        const tail = a.kind === 'piano' || a.kind === 'chord' || a.kind === 'melody' || a.kind === 'bass' ? 0.45 : 0.2;
+        for (const pm of a.kind === 'chord' ? a.ms || [] : m != null ? [m] : []) {
+          playing.push({ s: s0, d, a: s0 - 0.08, z: s0 + d + tail, m: pm, m2: a.m2 != null ? a.m2 : null });
+        }
+      }
     }
   }
 
@@ -1795,7 +1961,9 @@ function playerCtrl({ kind, id }) {
 
   function endStep() {
     const st = step();
-    results.push({ step: st, notes: scoreStep(st, frames, tol), frames });
+    // A steady lag (or lead) across the whole step is lined up before scoring.
+    const { notes, shift } = alignStep(st, frames, tol);
+    results.push({ step: st, notes, frames, shift });
     if (stepIdx + 1 < plan.steps.length) {
       state = 'between';
       el.player.dataset.state = 'between';
@@ -1817,13 +1985,17 @@ function playerCtrl({ kind, id }) {
     state = 'done';
     el.player.dataset.state = 'done';
     audio.closeBus();
+    audio.stopRef();
     releaseWake();
     const sum = summarize(results);
     if (plan.id === 'warmup') return finishWarmup(sum);
     // A run the mic barely heard still shows its result, but doesn't count as practice.
     const heard = wasHeard(sum);
-    // Headphones on but not worn: the mic heard the guide from the speaker. Not counted either.
-    if (heard && hpPlayed && speakerBleed(results).bleed) {
+    // The mic heard the tune from the speaker, not a child: with Headphones on but not worn, or
+    // without headphones when nobody sang along. Speaker frames were already left out (fromSpeaker),
+    // so the check looks at the readings as heard. Not counted either.
+    const asHeard = results.map((x) => ({ step: x.step, frames: x.frames.map((f) => (f.skip ? { ...f, m: f.raw } : f)) }));
+    if (hpPlayed && speakerBleed(asHeard).bleed && (!heard || speakerBleed(results).bleed)) {
       setBtn(el.start, 'again');
       setCue(SPEAKER, '');
       setProgress(seg.n, 1, true);
@@ -1844,7 +2016,7 @@ function playerCtrl({ kind, id }) {
       `<p class="eyebrow">${esc(plan.title)}</p>
        ${hum('sing')}
        <h2>${SPEAKER}</h2>
-       <p>I think I heard the tune from the speaker, not you. Are your headphones in? If not, turn Headphones off in Settings.</p>
+       <p>${S().headphones ? 'I think I heard the tune from the speaker, not you. Are your headphones in? If not, turn Headphones off in Settings.' : 'I think I heard the tune from the speaker, not you. Sing along with it! If it’s too loud, set Tune while you sing to Soft or Off in Settings.'}</p>
        <p class="muted">This one won’t count toward your practice days or best score.</p>
        <div class="sheet-actions">
          <button class="btn secondary" data-act="again">Try again</button>
@@ -2139,7 +2311,7 @@ function playerCtrl({ kind, id }) {
         btn.classList.toggle('on', on);
         btn.setAttribute('aria-pressed', String(on));
         if (plan.song && state === 'ready') rebuild();
-        if (state === 'ready') setCue(on ? 'Headphones on: wear them, and you’ll hear the tune while you sing.' : 'Headphones off: you’ll hear each part first, then sing.', '');
+        if (state === 'ready') setCue(on ? 'Headphones on: wear them, and you’ll hear the tune while you sing.' : plan.song && S().tune !== 'off' ? 'Headphones off: the tune plays from the speaker while you sing.' : 'Headphones off: you’ll hear each part first, then sing.', '');
       },
       mode: (btn) => {
         if (state !== 'ready') return;
@@ -2173,10 +2345,21 @@ function playerCtrl({ kind, id }) {
       const now = audio.now();
       if (state === 'running') {
         const st = step();
-        const t = now - T0;
-        schedule(st, t, now);
+        const t = now - T0 - lag;
+        schedule(st, now - T0, now);
         if (r) {
-          const f = { t: r.t - T0, m: r.m };
+          const f = { t: r.t - T0 - lag, m: r.m };
+          if (playing.length) {
+            while (playing.length > 64 && playing[0].z < f.t - 2) playing.shift();
+            // The speaker, not the child: not heard, and not a miss (see fromSpeaker).
+            const ev = r.ref && r.ref.length && f.m != null ? st.events.find((e) => e.role === 'sing' && f.t >= e.t && f.t < e.t + e.d) : null;
+            const miss = !ev || Math.abs(foldDiff(f.m, targetAt(ev, f.t)).d) > 1;
+            if (fromSpeaker(f.m, f.t, playing) || sameAsRef(f.m, r.ref, miss)) {
+              f.raw = f.m;
+              f.m = null;
+              f.skip = true;
+            }
+          }
           decorate(st, f);
           frames.push(f);
           live = f;
@@ -2227,7 +2410,10 @@ function playerCtrl({ kind, id }) {
     refresh() {
       const on = !!S().headphones;
       const btn = root.querySelector('[data-act="hp"]');
-      if (!btn || btn.classList.contains('on') === on) return;
+      const tuneNow = S().tune;
+      const tuneChanged = tuneNow !== lastTune;
+      lastTune = tuneNow;
+      if (!btn || (btn.classList.contains('on') === on && !tuneChanged)) return;
       btn.classList.toggle('on', on);
       btn.setAttribute('aria-pressed', String(on));
       if (plan.song && state === 'ready') rebuild();
@@ -2235,13 +2421,15 @@ function playerCtrl({ kind, id }) {
     probe() {
       const st = step();
       if (state === 'moving') return { state, t: audio.now() - T0, step: stepIdx, card: cardIdx, role: null, target: null };
-      const t = audio.now() - T0;
+      // t: the heard clock (what the lane shows); lag: the output delay it allows for.
+      const t = audio.now() - T0 - lag;
       const cur = st.events.find((e) => t >= e.t && t < e.t + e.d);
-      return { state, t, step: stepIdx, role: cur ? cur.role : null, target: cur ? targetAt(cur, t) : null, mode, speed, bpm: st.bpm };
+      return { state, t, lag, step: stepIdx, role: cur ? cur.role : null, target: cur ? targetAt(cur, t) : null, mode, speed, bpm: st.bpm };
     },
     destroy() {
       if (state !== 'ready' && state !== 'done') {
         audio.closeBus();
+        audio.stopRef();
         releaseWake();
       }
       unwatch();
@@ -2915,7 +3103,7 @@ function freeCtrl() {
         }
         play.down = 0;
         // What is heard now left the app a moment ago (Bluetooth headphones add a lot).
-        const lag = Math.min(0.5, Math.max(0, audio.ctx.outputLatency || audio.ctx.baseLatency || 0));
+        const lag = audio.outputLag();
         if (now - lag >= play.h.end) return endPlay();
         const t = now - lag - play.h.at;
         const mel = play.mel;
@@ -3019,11 +3207,11 @@ const noticeAdd = () => (signedIn() ? NOTICE_ADD_FAMILY : NOTICE_ADD_LOCAL);
 const NOTICE_SEND = 'Only send songs to phones belonging to your own family. Song shops usually allow personal use only, and some don’t allow extra copies. Moving the song (not copying it) is the safest choice. Never post song files online or share them outside your family.';
 const LIBRARY_OFF = 'Family songs can’t be saved in this browser window. Private Browsing turns saving off: open Note by Note from the Home Screen, or in a normal Safari tab.';
 const FILE_MAX = 16 * 1024 * 1024; // bigger than any song file (the importers have their own limits)
-const PIECE_LINES = 16; // a part offered on its own: up to this many lines
 
 let familySongs = []; // library records, oldest first
 let familyState = 'loading'; // 'loading' | 'ready' | 'unavailable'
 let famInput = null; // the hidden file picker
+let famReplace = null; // the family song a re-import will replace (its id), or null for a new song
 
 const findSong = (id) => SONGS.find((s) => s.id === id) || (familySongs.find((r) => r.id === id) || {}).song || null;
 const findRecord = (id) => familySongs.find((r) => r.id === id) || null;
@@ -3415,7 +3603,9 @@ function addSheet(msg = '') {
 }
 
 // No accept filter: iOS greys out file types it doesn't know (.kar, .mxl, .nbn) when there is one.
-function pickFile() {
+// replace: a family song's id to bring in again from its file (keeping its scores), or null.
+function pickFile(replace = null) {
+  famReplace = replace;
   if (!famInput) {
     famInput = document.createElement('input');
     famInput.type = 'file';
@@ -3425,7 +3615,7 @@ function pickFile() {
     famInput.addEventListener('change', () => {
       const f = famInput.files && famInput.files[0];
       famInput.value = '';
-      if (f) readFamilyFile(f);
+      if (f) readFamilyFile(f, famReplace);
     });
     document.body.appendChild(famInput);
   }
@@ -3446,7 +3636,7 @@ function importMessage(e) {
   return 'I couldn’t read this file. It may be damaged: try downloading it again.';
 }
 
-async function readFamilyFile(file) {
+async function readFamilyFile(file, replace = null) {
   openSheet(`<h2>Reading the song…</h2><p class="muted">${esc(cleanName(file.name))}</p>`, {}, { label: 'Reading', key: 'fam-add', cls: 'fam', dismissable: false });
   try {
     if (!file.size) throw new Error('empty');
@@ -3460,29 +3650,14 @@ async function readFamilyFile(file) {
       return addSheet(e instanceof imp.ImportError ? e.message : importMessage(e));
     }
     if (!sheet || sheet.key !== 'fam-add') return; // closed meanwhile
-    previewSheet({ imp, bytes, name: file.name, result, viaNbn: isNbnBytes(bytes) });
+    const old = replace ? findRecord(replace) : null;
+    previewSheet({ imp, bytes, name: file.name, result, viaNbn: isNbnBytes(bytes), replace: old ? old.id : null, title: old ? old.song.title : null });
   } catch (e) {
     addSheet(file.size ? importMessage(e) : 'This file is empty.');
   }
 }
 
 const cleanName = (s) => String(s || '').replace(/[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, '').slice(0, 120);
-
-// The parts a grown-up can choose from a long song: each section, two sections in a row
-// (often a verse and its chorus) and, when it fits, the whole song.
-function pieceOptions(result) {
-  const { sections, fits, long } = result;
-  const lines = result.stats.lines;
-  if (fits && !long) return [{ from: 0, to: lines - 1, whole: true }];
-  const out = [];
-  if (fits) out.push({ from: 0, to: lines - 1, whole: true });
-  sections.forEach((s, i) => {
-    out.push({ from: s.from, to: s.to, sec: s });
-    const nx = sections[i + 1];
-    if (nx && nx.to - s.from + 1 <= PIECE_LINES) out.push({ from: s.from, to: nx.to, sec: s, end: nx, pair: true });
-  });
-  return out;
-}
 
 function pieceLabel(p) {
   if (p.whole) return 'The whole song';
@@ -3493,15 +3668,6 @@ function pieceLabel(p) {
   const last = (p.end || p.sec).lastBar;
   const bars = first && last ? ` (bars ${first}–${last})` : '';
   return `${lines}${bars}${p.sec.words ? `: “${p.sec.words}”` : ''}`;
-}
-
-// The first verse and chorus when there are sections to pair, or the first part.
-function defaultPiece(opts) {
-  if (opts.length === 1) return 0;
-  const pair = opts.findIndex((p) => p.pair && p.from === 0);
-  if (pair >= 0) return pair;
-  const first = opts.findIndex((p) => !p.whole);
-  return first >= 0 ? first : 0;
 }
 
 let preview = null; // the playing preview: { handle, timer }
@@ -3542,8 +3708,8 @@ function previewSheet(pv) {
   stopPreview();
   const { result } = pv;
   if (pv.title == null) pv.title = result.song.title;
-  const opts = pieceOptions(result);
-  if (pv.pick == null || pv.pick >= opts.length) pv.pick = defaultPiece(opts);
+  const opts = pv.imp.pieceOptions(result);
+  if (pv.pick == null || pv.pick >= opts.length) pv.pick = pv.imp.defaultPiece(opts);
   const opt = opts[pv.pick];
   let piece;
   try {
@@ -3551,6 +3717,8 @@ function previewSheet(pv) {
   } catch (e) {
     piece = { ...result.song };
   }
+  // Which lines were kept, for the song's menu (null: the whole song).
+  pv.part = opt.whole ? null : { from: opt.from, to: opt.to, of: result.stats.lines };
   const { stats } = pv.imp.songSections(piece);
   const lines = firstLines(piece);
   const choices = result.choices || [];
@@ -3589,16 +3757,21 @@ function previewSheet(pv) {
         ? `<div class="fam-field">
             <label for="fam-part">Part to learn</label>
             <select id="fam-part" class="select">${opts.map((p, i) => `<option value="${i}"${i === pv.pick ? ' selected' : ''}>${esc(pieceLabel(p))}</option>`).join('')}</select>
-            <p class="muted">${result.fits ? 'This is a long song. A verse and chorus is plenty to learn at once.' : 'This song is too long to keep whole. Pick a part, like a verse and chorus.'}</p>
+            <p class="muted">${result.fits ? 'A long song. Keep it whole: Line by line still learns it a part at a time. Or keep just a part, like a verse and chorus.' : 'This song is too long to keep whole. Pick a part, like a verse and chorus.'}</p>
           </div>`
         : ''
+    }
+    ${
+      opt.whole
+        ? ''
+        : `<p class="fam-part-note" role="note"><b>Only part of the song:</b> lines ${opt.from + 1}–${opt.to + 1} of ${result.stats.lines}. The song will stop after line ${opt.to + 1}${result.stats.seconds ? ` (the whole song is ${clock(result.stats.seconds)})` : ''}. You can add the rest later from the song’s menu, with the same file.</p>`
     }
     ${warnings.length ? `<div class="fam-warn"><h3>Good to know</h3><ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
     <p class="notice">${noticeAdd()}</p>
     ${pv.msg ? `<p class="err" role="alert">${esc(pv.msg)}</p>` : ''}
     <div class="sheet-actions">
       <button class="btn secondary" data-act="fam-cancel">Cancel</button>
-      <button class="btn primary" data-act="fam-save">Add song</button>
+      <button class="btn primary" data-act="fam-save">${pv.replace ? 'Replace song' : 'Add song'}</button>
     </div>`;
   const setPlayBtn = (btn, on) => {
     btn.setAttribute('aria-pressed', String(on));
@@ -3666,23 +3839,28 @@ async function saveFamily(pv, piece, btn) {
     previewSheet(pv);
     return focusIn('.err');
   }
-  if (findRecord(v.song.id)) {
+  const old = pv.replace ? findRecord(pv.replace) : null;
+  const dup = findRecord(v.song.id);
+  if (dup && (!old || dup.id !== old.id)) {
     pv.msg = 'This song is already in Family songs.';
     previewSheet(pv);
     return focusIn('.err');
   }
   btn.disabled = true;
-  const src = pv.result.source || null;
+  const src0 = pv.result.source || null;
+  const src = src0 || pv.part ? { ...(src0 || {}), part: pv.part || undefined } : null;
+  // Brought in again from its file: it keeps its id (so its scores) and when it was added.
+  const id = old ? old.id : v.song.id;
   const rec = {
-    id: v.song.id,
-    song: v.song,
+    id,
+    song: { ...v.song, id },
     source: src,
-    via: pv.viaNbn ? 'nbn' : (src && src.kind) || null,
-    addedAt: new Date().toISOString(),
+    via: pv.viaNbn ? 'nbn' : (src0 && src0.kind) || null,
+    addedAt: old ? old.addedAt : new Date().toISOString(),
   };
   try {
     const saved = await library.put(rec);
-    familySongs = [...familySongs.filter((r) => r.id !== saved.id), saved];
+    familySongs = old ? familySongs.map((r) => (r.id === saved.id ? saved : r)) : [...familySongs.filter((r) => r.id !== saved.id), saved];
     account.songPut(saved.id);
   } catch (e) {
     pv.msg = e && e.message ? e.message : 'I couldn’t save that. Try again.';
@@ -3699,8 +3877,8 @@ async function saveFamily(pv, piece, btn) {
   refreshHome();
   openSheet(
     `${hum('happy')}
-     <h2>Song added</h2>
-     <p>“${esc(v.song.title)}” is in Family songs now. It opens in each singer’s key, like the other songs.</p>
+     <h2>${old ? 'Song replaced' : 'Song added'}</h2>
+     <p>“${esc(v.song.title)}” is in Family songs now${pv.part ? ` (lines ${pv.part.from + 1}–${pv.part.to + 1} of ${pv.part.of})` : ''}. It opens in each singer’s key, like the other songs.</p>
      <button class="btn primary big wide" data-act="sheet-close">Done</button>`,
     {},
     { label: 'Song added', cls: 'centered' }
@@ -3719,22 +3897,50 @@ function songMenuSheet(id) {
   if (!rec) return closeSheet();
   const from = rec.via === 'nbn' ? 'from another family phone' : !rec.via && signedIn() ? '' : rec.source && rec.source.fileName ? `from “${cleanName(rec.source.fileName)}”` : '';
   const added = shortDate(rec.addedAt);
+  const part = rec.source && rec.source.part;
+  const mel = parseMelody(rec.song.melody);
+  const length = `${mel.phrases.length} ${mel.phrases.length === 1 ? 'line' : 'lines'}, ${clock(Math.round((mel.totalBeats * 60) / rec.song.bpm))}`;
   openSheet(
     `<p class="eyebrow">Family song</p>
      <h2>${esc(rec.song.title)}</h2>
      ${added || from ? `<p class="muted">${esc([added && `Added ${added}`, from].filter(Boolean).join(', '))}</p>` : ''}
+     <p class="muted">${part ? `<b>Only part of the song:</b> lines ${part.from + 1}–${part.to + 1} of ${part.of} (${esc(length)}).` : `${esc(length)}.`}</p>
      <div class="fam-menu">
+       <button class="field link-row" data-act="fam-again"><span><b>${part ? 'Add the whole song' : 'Bring in again from the file'}</b></span>${ICON.chev}</button>
        <button class="field link-row" data-act="fam-rename"><span><b>Rename</b></span>${ICON.chev}</button>
        ${signedIn() ? '' : `<button class="field link-row" data-act="fam-move"><span>${ICON_SEND}<b>Move to another family phone</b></span>${ICON.chev}</button>`}
        <button class="field link-row danger" data-act="fam-delete"><span><b>Delete</b></span>${ICON.chev}</button>
      </div>
      <button class="btn primary wide" data-act="sheet-close">Done</button>`,
     {
+      'fam-again': () => againSheet(id),
       'fam-rename': () => renameSheet(id),
       'fam-move': () => moveSheet(id),
       'fam-delete': () => deleteSheet(id),
     },
     { label: 'Family song', key: 'fam-menu', cls: 'fam' }
+  );
+}
+
+// Bring a family song in again from its file (the file is never kept, so a grown-up picks it
+// again): to keep the whole song after only a part, or a different part. Its scores stay.
+function againSheet(id) {
+  const rec = findRecord(id);
+  if (!rec) return closeSheet();
+  const name = rec.source && rec.source.fileName ? `“${cleanName(rec.source.fileName)}”` : 'the song file';
+  openSheet(
+    `<p class="eyebrow">Family song</p>
+     <h2>Bring in again</h2>
+     <p>Choose ${esc(name)} again. You can keep the whole song this time, or a different part. Its scores stay.</p>
+     <div class="sheet-actions">
+       <button class="btn secondary" data-act="fam-back">Cancel</button>
+       <button class="btn primary" data-act="fam-pick-again">${ICON_PLUS}Choose the file</button>
+     </div>`,
+    {
+      'fam-back': () => songMenuSheet(id),
+      'fam-pick-again': () => pickFile(id),
+    },
+    { label: 'Bring in again', key: 'fam-add', cls: 'fam' }
   );
 }
 

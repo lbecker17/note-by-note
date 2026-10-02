@@ -14,7 +14,7 @@
 
 import { createCloud } from './cloud.js';
 import { store } from './store.js';
-import { library } from './library.js';
+import { library, cleanSource } from './library.js';
 import { mergeState, sameState, clean, planSongs, summary as summarize } from './sync.js';
 import { validateSong, isFamilySongId } from './nbn.js';
 import { UNSAFE_CHARS_G } from './text.js';
@@ -454,11 +454,10 @@ export function recordOf(row) {
   if (!row || typeof row !== 'object' || !isFamilySongId(row.id)) return null;
   const v = validateSong(row.song);
   if (!v.ok) return null;
-  const src = row.source && typeof row.source === 'object' && !Array.isArray(row.source) ? row.source : null;
   return {
     id: row.id,
     song: { ...v.song, id: row.id },
-    source: src ? { kind: typeof src.kind === 'string' ? src.kind : undefined, fileName: typeof src.fileName === 'string' ? src.fileName : undefined, importedAt: typeof src.importedAt === 'string' ? src.importedAt : undefined } : null,
+    source: cleanSource(row.source),
     via: null,
     addedAt: typeof row.added_at === 'string' ? row.added_at : null,
   };
@@ -477,8 +476,9 @@ async function syncSongs() {
       if (rec) {
         const now = new Date().toISOString();
         const song = { ...rec.song };
-        // A rename changes the row; a new song is added (one already in the family stays as it is).
-        const out = await cloud.update('family_songs', { family_id: 'eq.' + fid, id: 'eq.' + id }, { title: song.title, song, updated_at: now });
+        // A rename or a song brought in again changes the row; a new song is added (one already in
+        // the family stays as it is).
+        const out = await cloud.update('family_songs', { family_id: 'eq.' + fid, id: 'eq.' + id }, { title: song.title, song, source: rec.source || null, updated_at: now });
         if (!Array.isArray(out) || !out.length) {
           await cloud.insert('family_songs', [{ family_id: fid, id, title: song.title, song, source: rec.source || null, added_by: cloud.userId(), added_at: rec.addedAt || now, updated_at: now }], { upsert: 'ignore', onConflict: 'family_id,id' });
         }

@@ -17,7 +17,8 @@ const DEFAULTS = () => ({
   rangeFrom: null, // 'test' | 'child' | 'high' | 'low'
   // warmupLock: songs open only after today's warm-up (the grown-ups' switch in Settings).
   // speeds: the speed each song was last sung at ({ songId: 'slow' | 'steady' | 'normal' }).
-  settings: { headphones: false, names: 'letters', strict: 'standard', warmupLock: true, speeds: {} },
+  // tune: songs without headphones, how loud the tune plays while the child sings ('off' | 'soft' | 'clear').
+  settings: { headphones: false, names: 'letters', strict: 'standard', warmupLock: true, speeds: {}, tune: 'soft' },
   progress: {},
   days: [],
   warm: null, // { day: 'YYYY-MM-DD', at: ms, heard: 0.86, ctl: 'bounce' }: the last warm-up that counted
