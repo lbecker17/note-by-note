@@ -272,6 +272,37 @@ export function warmupCheck(results) {
   return { ok: heard && follow.ok, heard, follow, coverage: heardShare(sum), perStep, missed };
 }
 
+// ---------- Was that the speaker? ----------
+// With Headphones on, the guide melody plays while the child sings. If no headphones are worn it
+// comes out of the speaker, the mic hears it and it would be scored as singing. A voice always
+// wobbles; the guide note sits on the target (the warm-up's MACHINE_CENTS test). So on long level
+// notes, if the median miss of the sung frames is under MACHINE_CENTS, the run was the speaker.
+// Synthetic voices with a few cents of jitter and a gentle vibrato sit 4 or more cents off;
+// the guide played back sits within a fraction of a cent.
+export const BLEED_MIN_FRAMES = 15;
+
+// results: [{ step, frames }]. Returns { bleed, exact, frames }.
+export function speakerBleed(results) {
+  const held = [];
+  for (const { step, frames } of results) {
+    let fi = 0;
+    for (const ev of step.events) {
+      if (ev.role !== 'sing') continue;
+      while (fi < frames.length && frames[fi].t < ev.t) fi++;
+      if (ev.d < 0.8 || ev.m2 != null) continue;
+      const a = ev.t + graceFor(ev);
+      for (let i = fi; i < frames.length && frames[i].t < ev.t + ev.d; i++) {
+        const f = frames[i];
+        if (f.m == null || f.t < a) continue;
+        held.push(Math.abs(foldDiff(f.m, ev.m).d) * 100);
+      }
+    }
+  }
+  if (held.length < BLEED_MIN_FRAMES) return { bleed: false, exact: null, frames: held.length };
+  const exact = median(held);
+  return { bleed: exact < MACHINE_CENTS, exact, frames: held.length };
+}
+
 export function verdict(score) {
   if (score >= 0.85) return 'Spot on';
   if (score >= 0.65) return 'Nicely done';

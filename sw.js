@@ -1,5 +1,7 @@
 // Network first, so updates show up straight away; the cache keeps the app working offline.
-const CACHE = 'note-by-note-v10';
+// Only the app's own files are cached: requests to the family account (Supabase) and anything
+// else from another origin go straight to the network and are never stored.
+const CACHE = 'note-by-note-v12';
 const ASSETS = [
   './',
   'index.html',
@@ -8,6 +10,8 @@ const ASSETS = [
   'js/app.js',
   'js/art.js',
   'js/audio.js',
+  'js/cloud.js',
+  'js/family.js',
   'js/import.js',
   'js/lane.js',
   'js/lessons.js',
@@ -21,6 +25,7 @@ const ASSETS = [
   'js/score.js',
   'js/songs.js',
   'js/store.js',
+  'js/sync.js',
   'js/text.js',
   'js/tune.js',
   'js/unzip.js',
@@ -49,6 +54,7 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
+  if (new URL(req.url).origin !== self.location.origin) return;
   e.respondWith(
     fetch(req)
       .then((res) => {

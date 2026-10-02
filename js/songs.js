@@ -230,6 +230,34 @@ function voiceChord(ch, lowMelody) {
   return notes;
 }
 
+// ---------- Backing for singing without headphones ----------
+// The phone's speaker and mic are a hand's width apart, so whatever the backing plays, the mic
+// hears too. A note at the pitch the child should be singing (or that pitch in another octave)
+// would be read as their voice and scored. So each backing note leaves out the pitch class of
+// every melody note it overlaps, and the backing sits under the melody, played softly.
+const pcOf = (m) => ((Math.round(m) % 12) + 12) % 12;
+
+// avoid: a Set of pitch classes to leave out. low: the lowest melody note (MIDI) as sung.
+// Returns { bass, chord }: a bass note (MIDI, or null if every chord tone is to be avoided) and the
+// chord tones still allowed, as a close voicing just under the melody. For a low voice the chords
+// stay at E3 or above (lower is a rumble on a phone), so they can reach into the melody's range,
+// but never onto the sung note's pitch class.
+export function backingVoicing(ch, avoid, low) {
+  const tones = chordTones(ch);
+  const top = Math.max(low - 1, 52);
+  const place = (pc, hi) => {
+    let m = hi;
+    while (pcOf(m) !== pc) m--;
+    return m;
+  };
+  const chord = tones.filter((pc) => !avoid.has(pc)).map((pc) => place(pc, top)).sort((a, b) => a - b);
+  // Root, else the fifth, else the third.
+  const bassPc = [tones[0], tones[2], tones[1]].find((pc) => !avoid.has(pc));
+  let bass = bassPc == null ? null : place(bassPc, top - 12);
+  if (bass != null && bass < 36) bass += 12;
+  return { bass, chord };
+}
+
 export function buildSong(song, range, { mode = 'learn', headphones = false } = {}) {
   const data = songData(song);
   const { mel, chords } = data;
@@ -238,6 +266,7 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
   const b = new Builder(song.bpm);
   const spb = b.spb;
   const phraseCount = mel.phrases.length;
+  const pulse = song.pulse || 1;
 
   const chordAudio = (fromBeat, toBeat, startT, hp, vel) => {
     for (const ch of chords) {
@@ -247,6 +276,37 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
       const moved = { ...ch, root: (((ch.root + shift) % 12) + 12) % 12 };
       for (const m of voiceChord(moved, low)) {
         b.audio.push({ t: startT + (a - fromBeat) * spb, d: (z - a) * spb, kind: 'piano', m, vel, hp });
+      }
+    }
+  };
+
+  // Pitch classes of the sung notes sounding between t0 and t1 (a little after, for the piano's ring).
+  const sungPcs = (t0, t1) => {
+    const out = new Set();
+    for (const ev of b.events) if (ev.role === 'sing' && ev.t < t1 + 0.15 && ev.t + ev.d > t0) out.add(pcOf(ev.m));
+    return out;
+  };
+
+  // Without headphones: a soft bass note on the strong beats and a chord on every beat (every
+  // dotted beat in 6/8), each leaving out whatever the child is singing at that moment.
+  // nohp: skipped if headphones are switched on mid-run (then the guide and the full chords play).
+  const backing = (fromBeat, toBeat, startT) => {
+    const bassEvery = song.meter >= 4 && song.meter % 2 === 0 ? song.meter / 2 : song.meter;
+    for (const ch of chords) {
+      const moved = { ...ch, root: (((ch.root + shift) % 12) + 12) % 12 };
+      for (let x = ch.beat; x < ch.beat + ch.beats - 1e-6; x += pulse) {
+        if (x < fromBeat - 1e-6 || x >= toBeat - 1e-6) continue;
+        const end = Math.min(ch.beat + ch.beats, toBeat);
+        const t = startT + (x - fromBeat) * spb;
+        const d = Math.min(pulse, end - x) * spb * 0.9;
+        for (const m of backingVoicing(moved, sungPcs(t, t + d), low).chord) {
+          b.audio.push({ t, d, kind: 'piano', m, vel: 0.028, nohp: true, backing: true });
+        }
+        if (Math.abs((x - ch.beat) % bassEvery) < 1e-6) {
+          const bd = Math.min(bassEvery, end - x) * spb * 0.9;
+          const { bass } = backingVoicing(moved, sungPcs(t, t + bd), low);
+          if (bass != null) b.audio.push({ t, d: bd, kind: 'piano', m: bass, vel: 0.05, nohp: true, backing: true });
+        }
       }
     }
   };
@@ -261,7 +321,6 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
   };
 
   const countIn = (beats) => {
-    const pulse = song.pulse || 1;
     for (let i = 0; i < beats; i += pulse) b.audio.push({ t: b.t + i * spb, kind: 'click', accent: i === 0 });
     b.t += beats * spb;
   };
@@ -278,7 +337,6 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
       chordAudio(from, to, listenAt, false, 0.05);
       b.t += (to - from) * spb;
       // A breath, with ticks that set up the beat for your turn.
-      const pulse = song.pulse || 1;
       const gap = Math.max(2, pulse * 2);
       for (let i = 0; i < gap; i += pulse) b.audio.push({ t: b.t + i * spb, kind: 'click', accent: i === 0 });
       b.t += gap * spb;
@@ -287,14 +345,32 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
       chordAudio(from, to, singAt, true, 0.05);
       b.t += (to - from) * spb + 1.5 * spb;
     });
-  } else {
+  } else if (headphones) {
     countIn(song.meter);
     const start = b.t;
     placeNotes(mel.notes, 'sing', start, 0);
-    // Without headphones the piano stays soft so the mic hears you, not the speaker.
-    chordAudio(0, mel.totalBeats, start, false, headphones ? 0.07 : 0.035);
+    // hp: if headphones are switched off mid-run these stop too (they can hold the sung note).
+    chordAudio(0, mel.totalBeats, start, true, 0.07);
     mel.phrases.forEach(([s], p) => b.cues.push({ t: start + mel.notes[s].beat * spb - 0.01, text: `Line ${p + 1} of ${phraseCount}` }));
     b.t = start + mel.totalBeats * spb + 1;
+  } else {
+    // Each line starts after a bar's rest: its first note plays just after the downbeat (not on top
+    // of the last note of the line before) so the child can find it, then ticks count them in.
+    // The note ends well before they sing.
+    const cueLen = Math.min(0.9, Math.max(0.5, pulse * spb));
+    mel.phrases.forEach(([s, e], p) => {
+      const from = mel.notes[s].beat;
+      const to = e < mel.notes.length ? mel.notes[e].beat : mel.totalBeats;
+      b.cue(`Line ${p + 1} of ${phraseCount}`);
+      b.audio.push({ t: b.t + 0.25, d: cueLen, kind: 'guide', m: mel.notes[s].m + shift, level: 0.2, nohp: true, cue: true });
+      for (let i = 0; i < song.meter; i += pulse) b.audio.push({ t: b.t + i * spb, kind: 'click', accent: i === 0 });
+      b.t += song.meter * spb;
+      const at = b.t;
+      placeNotes(mel.notes.slice(s, e), 'sing', at, from);
+      backing(from, to, at);
+      b.t += (to - from) * spb;
+    });
+    b.t += 1;
   }
 
   const step = b.build({
@@ -309,7 +385,7 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
         ? 'Line by line: hear each line, then sing it back.'
         : headphones
           ? 'Sing the whole song with the piano and the guide melody.'
-          : 'Sing the whole song with a soft piano. Headphones let you hear the melody too.',
+          : 'Sing the whole song with a soft piano. You’ll hear each line’s first note just before you sing it.',
   });
   return [step];
 }
