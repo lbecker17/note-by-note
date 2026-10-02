@@ -1,9 +1,9 @@
 import { AudioEngine, savedLag, saveLag, LAG_MAX } from './audio.js';
 import { TIMING, clickTimes, lagFrom, onsets } from './timing.js';
 import { LESSONS, UNITS, ORDER, WARMUP, CONTROL_TITLES, controlFor } from './lessons.js';
-import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer, SPEEDS, SPEED_LABEL, defaultSpeed } from './songs.js';
+import { SONGS, buildSong, difficulty, songGlyph, setHarmonizer, SPEEDS, SPEED_LABEL, defaultSpeed, tempoText, songData } from './songs.js';
 import { Lane, drawOverview, drawSong } from './lane.js';
-import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, fitShift } from './music.js';
+import { letterName, label, family, prefersFlats, pc, parseMelody, parseLyrics, fitShift, tempoMap } from './music.js';
 import { STRICTNESS, alignStep, fromSpeaker, sameAsRef, summarize, verdict, tip, reportText, targetAt, foldDiff, creditFor, keyOf, keyAt, wasHeard, warmupCheck, speakerBleed, offWords } from './score.js';
 import { store, today, week, warmedToday, songPassToday } from './store.js';
 import { findNotes, findKey, quantize, harmonize, arrange, describe, TEMPOS } from './tune.js';
@@ -1437,7 +1437,7 @@ function levelOf(r) {
 const SPEED_CUE = {
   slow: 'Slow: plenty of time for every note.',
   steady: 'Steady: a little slower than the song.',
-  normal: 'Normal: the song’s own speed.',
+  normal: 'Normal: the song’s own speed, the one in its file.',
 };
 
 function playerCtrl({ kind, id }) {
@@ -1510,7 +1510,7 @@ function playerCtrl({ kind, id }) {
               <button role="radio" data-act="mode" data-v="learn" class="on" aria-checked="true">Line by line</button>
               <button role="radio" data-act="mode" data-v="along" aria-checked="false">Sing it through</button>
             </div>
-            <div class="speed-row"><span class="seg-h" id="speed-h">Speed</span><div class="seg speed" role="radiogroup" aria-labelledby="speed-h">${Object.keys(SPEEDS)
+            <div class="speed-row"><span class="seg-h" id="speed-h">Speed<small class="speed-tempo">Normal: ${esc(tempoText(plan.song))}</small></span><div class="seg speed" role="radiogroup" aria-labelledby="speed-h">${Object.keys(SPEEDS)
               .map((k) => `<button role="radio" data-act="speed" data-v="${k}" class="${k === speed ? 'on' : ''}" aria-checked="${k === speed}">${SPEED_LABEL[k]}</button>`)
               .join('')}</div></div>`
           : ''
@@ -3686,18 +3686,12 @@ function stopPreview() {
 function playTune(song, onEnd) {
   stopPreview();
   if (!audio.unlock()) return false;
-  const mel = parseMelody(song.melody);
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (const n of mel.notes) {
-    lo = Math.min(lo, n.m);
-    hi = Math.max(hi, n.m);
-  }
+  // The notes as they are sung (songData leaves out notes no one sings), at the song's tempo.
+  const { mel, lo, hi, tempo } = songData(song);
   const range = store.data.range;
   const shift = range ? fitShift(range, lo, hi) : 0;
-  const spb = 60 / song.bpm;
-  const events = mel.notes.map((n) => ({ t: n.beat * spb, d: n.beats * spb, kind: 'melody', m: n.m + shift, vel: 0.9 }));
-  const duration = mel.totalBeats * spb + 0.6;
+  const events = mel.notes.map((n) => ({ t: tempo.sec(n.beat), d: tempo.sec(n.beat + n.beats) - tempo.sec(n.beat), kind: 'melody', m: n.m + shift, vel: 0.9 }));
+  const duration = tempo.sec(mel.totalBeats) + 0.6;
   const handle = audio.playSong({ events, duration });
   preview = { handle, timer: setTimeout(() => (stopPreview(), onEnd && onEnd()), duration * 1000 + 300) };
   return true;
@@ -3899,7 +3893,7 @@ function songMenuSheet(id) {
   const added = shortDate(rec.addedAt);
   const part = rec.source && rec.source.part;
   const mel = parseMelody(rec.song.melody);
-  const length = `${mel.phrases.length} ${mel.phrases.length === 1 ? 'line' : 'lines'}, ${clock(Math.round((mel.totalBeats * 60) / rec.song.bpm))}`;
+  const length = `${mel.phrases.length} ${mel.phrases.length === 1 ? 'line' : 'lines'}, ${clock(Math.round(tempoMap(rec.song).sec(mel.totalBeats)))}`;
   openSheet(
     `<p class="eyebrow">Family song</p>
      <h2>${esc(rec.song.title)}</h2>

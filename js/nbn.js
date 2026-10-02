@@ -27,6 +27,7 @@ export const SONG_LIMITS = {
   token: 48,
   totalBeats: 20000,
   bpm: [20, 400],
+  tempoChanges: 64,
   meter: [1, 24],
   pitch: [12, 120],
   fileName: 160,
@@ -37,6 +38,7 @@ const MELODY_TOKEN = /^(?:\||\/\/|(?:r|[A-G][#b]?-?\d)(?:\/(?:\d{1,4}(?:\.\d{1,6
 const CHORD_CHARS = /^[A-Gmaj#b0-9.\/|r\s-]*$/;
 const CHORD_TOKEN = /^(?:\||(?:-|r|[A-G][#b]?(?:m|7|m7|maj7)?)(?:\/(?:\d{1,4}(?:\.\d{1,6})?|\.\d{1,6}))?)$/;
 const KEY = /^[A-G][#b]?$/;
+const TEMPO_TOKEN = /^\d{1,5}(?:\.\d{1,4})?:\d{1,3}(?:\.\d{1,2})?$/;
 const ID = /^fam-[0-9a-z]{11}$/;
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
@@ -55,7 +57,10 @@ function hash53(str) {
 }
 
 export function songId(song) {
-  const key = JSON.stringify([song.title, song.key, song.bpm, song.meter, song.pulse || null, song.melody, song.lyrics || null, song.chords || null]);
+  const parts = [song.title, song.key, song.bpm, song.meter, song.pulse || null, song.melody, song.lyrics || null, song.chords || null];
+  // Tempo changes came later: a song without them keeps the id it always had.
+  if (song.tempos) parts.push(song.tempos);
+  const key = JSON.stringify(parts);
   return 'fam-' + hash53(key).toString(36).padStart(11, '0');
 }
 
@@ -67,7 +72,7 @@ const tokens = (s) => s.trim().split(/\s+/).filter(Boolean);
 export function validateSong(input) {
   if (!isObj(input)) return fail('The song is missing.');
   const L = SONG_LIMITS;
-  const { title, key, bpm, meter, pulse, melody, lyrics, chords } = input;
+  const { title, key, bpm, meter, pulse, melody, lyrics, chords, tempos } = input;
 
   if (typeof title !== 'string') return fail('The song has no title.');
   const t = title.trim();
@@ -128,6 +133,22 @@ export function validateSong(input) {
     }
   }
 
+  // Tempo changes: "136:118 276:124", beats in order inside the song, each tempo allowed.
+  let tempoStr = null;
+  if (tempos != null && !(typeof tempos === 'string' && !tempos.trim())) {
+    if (typeof tempos !== 'string' || tempos.length > 2000) return fail('The tempo changes are not valid.');
+    const toks = tokens(tempos);
+    if (toks.length > L.tempoChanges) return fail('The tempo changes are not valid.');
+    let last = 0;
+    for (const tok of toks) {
+      if (!TEMPO_TOKEN.test(tok)) return fail('The tempo changes are not valid.');
+      const [b, t] = tok.split(':').map(Number);
+      if (!(b > last) || b >= mel.totalBeats || t < L.bpm[0] || t > L.bpm[1]) return fail('The tempo changes are not valid.');
+      last = b;
+    }
+    tempoStr = toks.join(' ');
+  }
+
   const song = {
     id: '',
     title: t,
@@ -139,6 +160,7 @@ export function validateSong(input) {
     melody,
     lyrics: lyr ? lyrics : null,
     chords: chords != null && chords.trim() ? chords : null,
+    ...(tempoStr ? { tempos: tempoStr } : {}),
   };
   song.id = songId(song);
   return { ok: true, song };

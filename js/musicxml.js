@@ -5,10 +5,13 @@
 // already moved to concert pitch via <transpose>).
 //
 // musicxmlMelody(score) picks the singing line and lays it out in time:
-// - the part and voice with the most lyrics (near-ties go to a Voice or Soprano part over an
-//   Alto, Tenor or backing part, then to the higher line);
-// - chords in that voice keep their top note; grace and cue notes are skipped (a syllable on a
-//   grace note moves to the next note); ties join;
+// - the part, staff and voice with the most lyrics (near-ties go to a Voice or Soprano part
+//   over an Alto, Tenor or backing part, then to the higher line). A voice is one staff's: a
+//   piano's left hand is never mixed into a tune in its right hand, even when a file numbers
+//   both voice 1, and a file with no <voice> numbers takes each <backup> as a new voice;
+// - chords in that voice keep their top note; grace and cue notes (<cue/>, small "cue" size
+//   notes, and invisible ones) are skipped (a syllable on a grace note moves to the next
+//   note); ties join;
 // - repeats and first/second endings are played out, and each pass sings the next verse
 //   (pass 1 sings lyric number 1, pass 2 lyric number 2...). D.C., D.S., To Coda and Fine are
 //   followed, and the pass after a D.C. or D.S. sings the next verse too. Verses stacked under
@@ -151,6 +154,7 @@ function readPart(measureEls) {
     let pos = 0;
     let maxPos = 0;
     let lastStart = 0;
+    let layer = 1; // with no <voice> numbers, each <backup> starts another voice
     // <sound>: a tempo, and the jumps as they are played. Returns whether it had a jump.
     const readSound = (snd, at) => {
       if (!snd) return false;
@@ -198,7 +202,8 @@ function readPart(measureEls) {
           break;
         }
         case 'note': {
-          const voice = cleanText(txt(el, 'voice'), 12) || '1';
+          const voice = cleanText(txt(el, 'voice'), 12) || String(layer);
+          const staff = cleanText(txt(el, 'staff'), 4) || '1';
           if (kid(el, 'grace')) {
             const ls = kids(el, 'lyric').map(readLyric).filter(Boolean);
             if (ls.length) graceLyrics.set(voice, [...(graceLyrics.get(voice) || []), ...ls]);
@@ -212,7 +217,11 @@ function readPart(measureEls) {
             pos = r6(pos + dur);
             if (pos > maxPos) maxPos = pos;
           }
-          if (kid(el, 'cue')) break;
+          // Cue notes (another part's line, printed small) and invisible notes take time but
+          // aren't sung.
+          const typeEl = kid(el, 'type');
+          const size = typeEl ? typeEl.attrs.size : '';
+          if (kid(el, 'cue') || size === 'cue' || size === 'grace-cue' || el.attrs['print-object'] === 'no') break;
           const pitch = kid(el, 'pitch');
           let m = null;
           if (pitch && !kid(el, 'rest')) {
@@ -234,7 +243,7 @@ function readPart(measureEls) {
             m,
             chord,
             voice,
-            staff: txt(el, 'staff') || '1',
+            staff,
             tieStart: tieTypes.includes('start'),
             tieStop: tieTypes.includes('stop'),
             lyrics,
@@ -245,6 +254,7 @@ function readPart(measureEls) {
         }
         case 'backup':
           pos = Math.max(0, r6(pos - num(el, 'duration', 0) / divisions));
+          layer++;
           break;
         case 'forward':
           pos = r6(pos + num(el, 'duration', 0) / divisions);
@@ -253,6 +263,7 @@ function readPart(measureEls) {
         case 'direction': {
           const at = pos + num(el, 'offset', 0) / divisions;
           let metro = null;
+          let metroRaw = null; // the number written, and its beat in quarter notes
           let segno = false;
           let coda = false;
           let words = '';
@@ -262,7 +273,10 @@ function readPart(measureEls) {
               const unit = UNIT_Q[txt(met, 'beat-unit')];
               const dots = kids(met, 'beat-unit-dot').length;
               const pm = num(met, 'per-minute');
-              if (unit && pm > 0) metro = pm * unit * (2 - 0.5 ** dots);
+              if (unit && pm > 0) {
+                metro = pm * unit * (2 - 0.5 ** dots);
+                metroRaw = pm;
+              }
             }
             for (const r of kids(dt, 'rehearsal')) if (r.text.trim()) M.marks.push(r.text.trim());
             if (kid(dt, 'segno')) segno = true;
@@ -272,6 +286,13 @@ function readPart(measureEls) {
           const before = M.tempos.length;
           if (!readSound(kid(el, 'sound'), at)) readSigns(segno, coda, words);
           if (metro && M.tempos.length === before) M.tempos.push({ at, bpm: metro });
+          else if (metro && M.tempos.length > before) {
+            // <sound tempo> is in quarter notes a minute and is preferred. But some programs
+            // write the marking's own number there: "dotted quarter = 56" with tempo="56", or
+            // "eighth = 168" with tempo="168". Then the marking on the page is the tempo.
+            const t = M.tempos[M.tempos.length - 1];
+            if (Math.abs(t.bpm - metroRaw) < 0.01 * metroRaw && Math.abs(metro - metroRaw) > 0.04 * metroRaw) t.bpm = metro;
+          }
           break;
         }
         case 'sound':
@@ -469,6 +490,9 @@ function toSyl(ly, text = ly.text) {
 
 const VOCAL_PART = /(voice|vocal|vox|melod|lead|sing|sopran|canto|voz|stimme|gesang|chant)/i;
 const HARMONY_PART = /(alto|tenor|bass|bariton|backing|harmony|\bbvs?\b|b\.v\.)/i;
+// A piano (or guitar...) part with the words on it: the tune is in its top line, and its notes
+// with no words are often accompaniment, not a melisma.
+const INSTRUMENT_PART = /(piano|keyboard|keys|organ|guitar|harp|accordion|synth|pno|klavier)/i;
 
 // Where the tune could come from: every part and voice with notes, best first. The most
 // lyrics wins, but a part or voice with nearly as many (a duet, or an alto line with one
@@ -480,8 +504,9 @@ function rankChoices(score) {
     const per = new Map();
     for (const M of p.measures) {
       for (const n of M.notes) {
-        if (!per.has(n.voice)) per.set(n.voice, { notes: 0, lyrics: 0, pitches: [] });
-        const v = per.get(n.voice);
+        const k = `${n.staff}\n${n.voice}`;
+        if (!per.has(k)) per.set(k, { staff: n.staff, voice: n.voice, notes: 0, lyrics: 0, pitches: [] });
+        const v = per.get(k);
         if (n.m != null && !n.chord) {
           v.notes++;
           v.pitches.push(n.m);
@@ -492,16 +517,19 @@ function rankChoices(score) {
     const name = p.name || `Part ${pi + 1}`;
     const names = `${p.name} ${p.instrument}`;
     const sung = (VOCAL_PART.test(names) ? 1 : 0) - (HARMONY_PART.test(names) ? 1 : 0);
-    for (const [voice, v] of per) {
+    const staves = new Set([...per.values()].filter((v) => v.notes).map((v) => v.staff));
+    for (const v of per.values()) {
       if (!v.notes) continue;
+      const { staff, voice } = v;
       v.pitches.sort((a, b) => a - b);
-      const label = per.size > 1 ? `${name}, voice ${voice}` : name;
-      choices.push({ id: `p${pi + 1}v${voice}`, part: pi, voice, label, notes: v.notes, lyrics: v.lyrics, sung, median: v.pitches[v.pitches.length >> 1] });
+      const label = per.size > 1 ? `${name}, ${staves.size > 1 ? `staff ${staff}, ` : ''}voice ${voice}` : name;
+      const id = staff === '1' ? `p${pi + 1}v${voice}` : `p${pi + 1}s${staff}v${voice}`;
+      choices.push({ id, part: pi, staff, voice, label, notes: v.notes, lyrics: v.lyrics, sung, median: v.pitches[v.pitches.length >> 1] });
     }
   });
   const most = choices.reduce((x, c) => Math.max(x, c.lyrics), 0);
   const tied = (c) => (most > 0 && c.lyrics >= 0.85 * most ? 1 : 0);
-  choices.sort((a, b) => tied(b) - tied(a) || (tied(a) ? b.sung - a.sung || b.median - a.median : b.lyrics - a.lyrics) || a.part - b.part || numericOrder(a.voice, b.voice) || b.notes - a.notes);
+  choices.sort((a, b) => tied(b) - tied(a) || (tied(a) ? b.sung - a.sung || b.median - a.median : b.lyrics - a.lyrics) || a.part - b.part || numericOrder(a.staff, b.staff) || numericOrder(a.voice, b.voice) || b.notes - a.notes);
   return choices.slice(0, MAX_CHOICES);
 }
 
@@ -542,6 +570,8 @@ export function musicxmlMelody(score, opts = {}) {
   if (opts.melody) chosen = choices.find((c) => c.id === opts.melody) || chosen;
   const part = score.parts[chosen.part];
   const voice = chosen.voice;
+  const staff = chosen.staff;
+  const mine = (n) => n.voice === voice && n.staff === staff;
   const measures = part.measures;
   if (score.parts.length > 1 || choices.length > 1) warnings.push(`The tune is from ${chosen.label}.`);
 
@@ -552,7 +582,7 @@ export function musicxmlMelody(score, opts = {}) {
   const measVerses = measures.map((M) => {
     const s = new Set();
     for (const n of M.notes) {
-      if (n.voice !== voice || n.m == null) continue;
+      if (!mine(n) || n.m == null) continue;
       for (const l of n.lyrics) {
         if (!l.text) continue;
         s.add(l.number);
@@ -636,7 +666,7 @@ export function musicxmlMelody(score, opts = {}) {
     const hm = chordPart.measures[e.mi];
     if (hm) for (const h of hm.harmonies) chords.push({ q: r6(q + h.at), root: h.pc, quality: h.quality, none: h.none });
 
-    const groups = chordGroups(M.notes.filter((n) => n.voice === voice));
+    const groups = chordGroups(M.notes.filter(mine));
     const sung = verses.length ? lyricsFor(M, groups, e, seq[si - 1], seq[si + 1]) : groups.map(() => ({ ly: null }));
     let first = true;
     let pickup = false;
@@ -709,7 +739,7 @@ export function musicxmlMelody(score, opts = {}) {
   // second voice of the same staff that carries only that verse's words.
   function otherVoice(M, g, v) {
     const end = g.at + g.dur;
-    const span = M.notes.filter((x) => x.voice !== voice && x.staff === g.staff && x.m != null && !x.chord && x.at > g.at - 1e-6 && x.at < end - 1e-6).sort((a, b) => a.at - b.at);
+    const span = M.notes.filter((x) => !mine(x) && x.staff === g.staff && x.m != null && !x.chord && x.at > g.at - 1e-6 && x.at < end - 1e-6).sort((a, b) => a.at - b.at);
     if (!span.length || span[0].at > g.at + 1e-6) return null;
     const theirs = span.filter((x) => x.voice === span[0].voice);
     const onlyV = theirs.every((x) => x.lyrics.every((l) => !l.text || l.number === v));
@@ -739,10 +769,11 @@ export function musicxmlMelody(score, opts = {}) {
     tempos,
     keys,
     keyFromFile: keys.length > 0,
-    vocal: true,
+    // Sheet music for a voice: its notes are all sung unless rests cut them off (js/import.js).
+    vocal: !INSTRUMENT_PART.test(`${part.name} ${part.instrument}`) || VOCAL_PART.test(`${part.name} ${part.instrument}`),
     warnings,
     choices: choices.map(({ id, label, notes: count }) => ({ id, label, notes: count, chosen: id === chosen.id })),
-    info: { part: chosen.part, voice, verses: verses.length },
+    info: { part: chosen.part, staff, voice, verses: verses.length },
   };
 }
 

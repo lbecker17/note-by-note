@@ -152,3 +152,106 @@ export function fitShift(range, low, high) {
   const have = (low + high) / 2;
   return Math.round(want - have);
 }
+
+// ---------- Tempo changes ----------
+// A song plays at song.bpm, and a family song can change tempo on the way: song.tempos is
+// "136:118 276:124" (from beat 136 at 118 beats a minute, from beat 276 at 124...), in the
+// song's own beats. Returns the changes, in order, after beat 0.
+export function parseTempos(src) {
+  const out = [];
+  if (typeof src !== 'string') return out;
+  for (const tok of src.trim().split(/\s+/)) {
+    if (!tok) continue;
+    const [b, t] = tok.split(':').map(Number);
+    if (!(b > 0) || !(t > 0) || !Number.isFinite(b) || !Number.isFinite(t)) continue;
+    if (out.length && b <= out[out.length - 1].beat) continue;
+    out.push({ beat: b, bpm: t });
+  }
+  return out;
+}
+
+// Seconds from beat 0 to a beat, and the tempo at a beat, for a song (its bpm and tempos).
+export function tempoMap(song) {
+  const segs = [{ beat: 0, bpm: song.bpm, sec: 0 }];
+  for (const c of parseTempos(song.tempos)) {
+    const p = segs[segs.length - 1];
+    segs.push({ beat: c.beat, bpm: c.bpm, sec: p.sec + ((c.beat - p.beat) * 60) / p.bpm });
+  }
+  const seg = (beat) => {
+    let k = segs.length - 1;
+    while (k > 0 && segs[k].beat > beat + 1e-9) k--;
+    return segs[k];
+  };
+  const lo = Math.min(...segs.map((s) => s.bpm));
+  const hi = Math.max(...segs.map((s) => s.bpm));
+  return {
+    changes: segs.length > 1,
+    lo,
+    hi,
+    bpmAt: (beat) => seg(beat).bpm,
+    sec(beat) {
+      if (beat <= 0) return (beat * 60) / song.bpm;
+      const s = seg(beat);
+      return s.sec + ((beat - s.beat) * 60) / s.bpm;
+    },
+  };
+}
+
+// ---------- Notes with no words of their own ----------
+// In a song's words "~" holds the previous syllable over another note (a melisma). Sheet music
+// and karaoke files also have notes with no words that a singer doesn't sing: an instrumental
+// riff in the tune's part, or a piano's accompaniment note in a rest of the tune. A run of "~"
+// notes is sung only when it is
+// - short (at most 4 notes and 2 quarter notes long) and singable: no leap over a fifth, and at
+//   most one leap over a minor third, or
+// - a longer melisma that moves by step (nearly all moves of 2 semitones or less, none over a
+//   fourth), up to 24 notes and 4 bars of 4/4,
+// and in both cases stays within 4 semitones of the line's sung notes. Others are not sung.
+// notes: [{ m, beat, beats, hold }] (hold: no words of its own), phrases: [[start, end), ...],
+// quarter: quarter notes in a beat (0.5 in a 6/8 song counted in eighths).
+// Returns a Set of the note indexes not to sing (a line that loses all its notes is gone).
+export const MELISMA = { shortNotes: 4, shortQuarters: 2, longNotes: 24, longQuarters: 16, range: 4 };
+export function unsungHolds(notes, phrases, quarter = 1) {
+  const out = new Set();
+  // The range of each line's sung notes, and the line of each note.
+  const lineOf = new Int32Array(notes.length);
+  const ranges = phrases.map(([s, e], p) => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = s; i < e; i++) {
+      lineOf[i] = p;
+      if (notes[i].hold) continue;
+      lo = Math.min(lo, notes[i].m);
+      hi = Math.max(hi, notes[i].m);
+    }
+    return [lo, hi];
+  });
+  for (let i = 0; i < notes.length; i++) {
+    if (!notes[i].hold) continue;
+    let j = i;
+    while (j < notes.length && notes[j].hold) j++;
+    // The run holds the syllable before it, and is measured against that syllable's line (a
+    // hold can carry on over a line break).
+    const [lo, hi] = i > 0 ? ranges[lineOf[i - 1]] : [Infinity, -Infinity];
+    if (i === 0 || !melismaOk(notes, i, j, lo, hi, quarter)) for (let k = i; k < j; k++) out.add(k);
+    i = j - 1;
+  }
+  return out;
+}
+
+function melismaOk(notes, i, j, lo, hi, quarter) {
+  const M = MELISMA;
+  const count = j - i;
+  const quarters = (notes[j - 1].beat + notes[j - 1].beats - notes[i].beat) * quarter;
+  const moves = [];
+  for (let k = i; k < j; k++) moves.push(Math.abs(notes[k].m - notes[k - 1].m));
+  for (let k = i; k < j; k++) if (notes[k].m < lo - M.range || notes[k].m > hi + M.range) return false;
+  const big = Math.max(...moves);
+  if (count <= M.shortNotes && quarters <= M.shortQuarters + 1e-6) {
+    if (big <= 7 && moves.filter((x) => x > 3).length <= 1) return true;
+  }
+  if (count <= M.longNotes && quarters <= M.longQuarters + 1e-6 && big <= 5) {
+    return moves.filter((x) => x <= 2).length >= 0.85 * moves.length;
+  }
+  return false;
+}

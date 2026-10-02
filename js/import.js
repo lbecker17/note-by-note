@@ -26,7 +26,7 @@ import { looksLikeZip, ZipError } from './unzip.js';
 import { decodeXmlBytes, XmlError } from './xml.js';
 import { toBytes, cleanText, cutText, UNSAFE_CHARS_G } from './text.js';
 import { songId, validateSong, readFamilySongFile, makeSource, FAMILY_CREDIT, SONG_LIMITS } from './nbn.js';
-import { parseMelody, parseLyrics, paraStarts } from './music.js';
+import { parseMelody, parseLyrics, paraStarts, unsungHolds, tempoMap } from './music.js';
 
 export class ImportError extends Error {}
 
@@ -795,8 +795,9 @@ function squeezeGaps(notes, measures, chords, tempos, keys, warnings) {
     const k = cutAt(q);
     return k < cuts.length && q >= cuts[k].from - EPS;
   };
-  warnings.push(cuts.length === 1 ? 'A long break with no singing was shortened to one bar.' : `${cuts.length} long breaks with no singing were shortened to one bar each.`);
+  if (warnings) warnings.push(cuts.length === 1 ? 'A long break with no singing was shortened to one bar.' : `${cuts.length} long breaks with no singing were shortened to one bar each.`);
   return {
+    cut: cuts.length,
     notes: notes.map((n) => ({ ...n, q: map(n.q) })),
     measures: measures.filter((m) => !inCut(m.q)).map((m) => ({ ...m, q: map(m.q) })),
     chords: chords && chords.map((c) => ({ ...c, q: map(c.q) })),
@@ -836,6 +837,43 @@ function dominantTempo(tempos, q0, qEnd) {
   if (!best) return { bpm: ts[0].bpm, changes: false };
   const changes = [...w.keys()].some((k) => Math.abs(k - best[0]) > best[0] * 0.04);
   return { bpm: best[0], changes };
+}
+
+// The tempo at the song's first note and each change after it (in song beats from that note),
+// leaving out changes of less than 2%. null when there are more than SONG_LIMITS.tempoChanges.
+function tempoChanges(tempos, q0, qEnd, unit, toBpm) {
+  const ts = [...tempos].filter((t) => t.bpm > 0 && Number.isFinite(t.bpm)).sort((a, b) => a.q - b.q);
+  if (!ts.length) return null;
+  let k = 0;
+  while (k + 1 < ts.length && ts[k + 1].q <= q0 + EPS) k++;
+  const start = toBpm(ts[k].bpm);
+  const changes = [];
+  let cur = start;
+  for (let i = k + 1; i < ts.length && ts[i].q < qEnd - EPS; i++) {
+    if (ts[i].q <= q0 + EPS) continue;
+    const beat = round4((ts[i].q - q0) / unit);
+    const b = toBpm(ts[i].bpm);
+    const last = changes[changes.length - 1];
+    if (last && Math.abs(last.beat - beat) < EPS) {
+      // Two marks at one place: the later one.
+      last.bpm = b;
+      cur = b;
+      continue;
+    }
+    if (Math.abs(b - cur) < 0.02 * cur) continue;
+    changes.push({ beat, bpm: b });
+    cur = b;
+  }
+  // A change back to the tempo before it at the same place can leave a no-op behind.
+  const clean = [];
+  let prev = start;
+  for (const c of changes) {
+    if (c.bpm === prev) continue;
+    clean.push(c);
+    prev = c.bpm;
+  }
+  if (clean.length > SONG_LIMITS.tempoChanges) return null;
+  return { start, changes: clean };
 }
 
 // Krumhansl-Schmuckler key finding, duration weighted. Minor keys give their relative major,
@@ -1036,7 +1074,8 @@ function chordName(c, flats) {
 function finish(line, kind, opts) {
   const warnings = [...line.warnings];
   let notes = line.notes.filter((n) => n.m != null && n.d > 1e-4).map((n) => ({ ...n }));
-  notes.sort((a, b) => a.q - b.q);
+  // Two notes at once: the one with words, else the higher.
+  notes.sort((a, b) => a.q - b.q || (b.syl ? 1 : 0) - (a.syl ? 1 : 0) || b.m - a.m);
   const mono = [];
   for (const n of notes) {
     const last = mono[mono.length - 1];
@@ -1060,7 +1099,28 @@ function finish(line, kind, opts) {
   } else notes = keepSung(notes, measures, warnings, !!line.vocal);
 
   let { chords, tempos, keys } = line;
-  ({ notes, measures, chords, tempos, keys } = squeezeGaps(notes, measures, chords, tempos || [], keys || [], warnings));
+  tempos = tempos || [];
+  keys = keys || [];
+  // Lines, and the notes with no words that aren't sung after all (an instrumental riff, or
+  // an accompaniment note in a rest of the tune: see unsungHolds). Leaving notes out can make
+  // a long break, and new lines: until nothing changes.
+  let starts;
+  let cut = 0;
+  const unsung = [];
+  for (let pass = 0; ; pass++) {
+    const sq = squeezeGaps(notes, measures, chords, tempos, keys, null);
+    ({ notes, measures, chords, tempos, keys } = sq);
+    cut += sq.cut || 0;
+    starts = splitLines(notes, measures);
+    if (!hasLyrics || pass >= 4) break;
+    const phrases = starts.map((s, i) => [s, i + 1 < starts.length ? starts[i + 1] : notes.length]);
+    const drop = unsungHolds(notes.map((n) => ({ m: n.m, beat: n.q, beats: n.d, hold: !n.syl })), phrases, 1);
+    if (!drop.size) break;
+    unsung.push(...notes.filter((_, i) => drop.has(i)).map((n) => n.bar || barAt(measures, n.q).label));
+    notes = notes.filter((_, i) => !drop.has(i));
+  }
+  if (unsung.length) warnings.push(`Left out ${unsung.length} note${unsung.length === 1 ? '' : 's'} with no words that ${unsung.length === 1 ? 'doesn’t' : 'don’t'} look sung (a riff or accompaniment?), from bar ${unsung[0]}.`);
+  if (cut) warnings.push(cut === 1 ? 'A long break with no singing was shortened to one bar.' : `${cut} long breaks with no singing were shortened to one bar each.`);
   const q0 = notes[0].q;
   const lastNote = notes[notes.length - 1];
   const qEnd = lastNote.q + lastNote.d;
@@ -1072,8 +1132,20 @@ function finish(line, kind, opts) {
   if (ts.changes) warnings.push(`The time signature changes; the count-in uses ${ts.num}/${ts.den}.`);
 
   const tempo = dominantTempo(tempos, q0, qEnd) || { bpm: line.defaultTempo || 100, changes: false };
-  const bpm = Math.max(20, Math.min(400, Math.round(tempo.bpm / unit)));
-  if (tempo.changes) warnings.push(`The tempo changes in this file; the song is sung at ${bpm} beats a minute throughout.`);
+  const toBpm = (x) => Math.max(20, Math.min(400, Math.round(x / unit)));
+  let bpm = toBpm(tempo.bpm);
+  let tempoStr = null;
+  if (tempo.changes) {
+    // The song follows the file's tempo changes ("A tempo, faster", a slower ending), unless
+    // there are so many (a played performance) that one steady tempo is better to sing to.
+    const plan = tempoChanges(tempos, q0, qEnd, unit, toBpm);
+    if (plan && plan.changes.length) {
+      bpm = plan.start;
+      tempoStr = plan.changes.map((c) => `${fmt(c.beat)}:${c.bpm}`).join(' ');
+      const all = [plan.start, ...plan.changes.map((c) => c.bpm)];
+      warnings.push(`The tempo changes in this file (${Math.min(...all)} to ${Math.max(...all)} beats a minute); the song follows it.`);
+    } else warnings.push(`The tempo changes in this file; the song is sung at ${bpm} beats a minute throughout.`);
+  }
 
   let keyPc;
   if (line.keyFromFile && keys.length) {
@@ -1084,7 +1156,6 @@ function finish(line, kind, opts) {
   } else keyPc = estimateKey(notes);
   const flats = FLAT_KEYS.has(keyPc);
 
-  const starts = splitLines(notes, measures);
   const startSet = new Set(starts);
   const beat = (q) => round4((q - q0) / unit);
   const bars = measures.map((m) => beat(m.q)).filter((b) => b > EPS);
@@ -1120,7 +1191,7 @@ function finish(line, kind, opts) {
   }
 
   const title = cleanText(opts.title || line.title || titleFromFileName(opts.fileName) || '', SONG_LIMITS.title) || 'Family song';
-  const song = { id: '', title, credit: FAMILY_CREDIT, key: KEY_NAMES[keyPc], bpm, meter, ...(pulse ? { pulse } : {}), melody, lyrics, chords: chordStr };
+  const song = { id: '', title, credit: FAMILY_CREDIT, key: KEY_NAMES[keyPc], bpm, meter, ...(pulse ? { pulse } : {}), melody, lyrics, chords: chordStr, ...(tempoStr ? { tempos: tempoStr } : {}) };
   song.id = songId(song);
 
   const paras = new Set();
@@ -1163,7 +1234,7 @@ export function songSections(song, { paras = null, bars = null } = {}) {
   const mel = parseMelody(song.melody);
   if (!paras) paras = paraStarts(song.lyrics, mel.phrases);
   const lyr = song.lyrics ? parseLyrics(song.lyrics) : null;
-  const spb = 60 / song.bpm;
+  const tm = tempoMap(song);
   const lines = mel.phrases.map(([s, e]) => {
     const last = mel.notes[e - 1];
     return { s, e, beat: mel.notes[s].beat, end: last.beat + last.beats, words: lyr ? wordsOf(lyr.slice(s, e)) : '' };
@@ -1174,7 +1245,7 @@ export function songSections(song, { paras = null, bars = null } = {}) {
     low = Math.min(low, n.m);
     high = Math.max(high, n.m);
   }
-  const seconds = mel.totalBeats * spb;
+  const seconds = tm.sec(mel.totalBeats);
   const stats = { notes: mel.notes.length, lines: lines.length, seconds: Math.round(seconds), low, high };
   const long = lines.length > COMFORT.lines || mel.notes.length > COMFORT.notes || seconds > COMFORT.seconds;
   let groups = [[0, lines.length - 1]];
@@ -1210,7 +1281,7 @@ export function songSections(song, { paras = null, bars = null } = {}) {
     firstBar: bars && bars[a] ? bars[a][0] : null,
     lastBar: bars && bars[b] ? bars[b][1] : null,
     notes: lines[b].e - lines[a].s,
-    seconds: Math.round((lines[b].end - lines[a].beat) * spb),
+    seconds: Math.round(tm.sec(lines[b].end) - tm.sec(lines[a].beat)),
     words: lines[a].words,
   }));
   return { sections, stats, long };
@@ -1295,7 +1366,20 @@ export function sliceSong(song, from, to, opts = {}) {
     if (items.some((it) => it.sym !== '-')) chords = layout(items, bars, new Set(), 'chords');
   }
 
-  const piece = { id: '', title: opts.title || song.title, credit: song.credit, key: song.key, bpm: song.bpm, meter: song.meter, ...(song.pulse ? { pulse: song.pulse } : {}), melody, lyrics, chords };
+  // Tempo: the one in effect where the part starts, and the changes inside it.
+  const tm = tempoMap(song);
+  const changes = [];
+  if (tm.changes) {
+    let cur = tm.bpmAt(start);
+    for (const tok of String(song.tempos).trim().split(/\s+/)) {
+      const [b, t] = tok.split(':').map(Number);
+      if (b > start + EPS && b < end - EPS && t !== cur) {
+        changes.push(`${fmt(b - start)}:${t}`);
+        cur = t;
+      }
+    }
+  }
+  const piece = { id: '', title: opts.title || song.title, credit: song.credit, key: song.key, bpm: tm.bpmAt(start), meter: song.meter, ...(song.pulse ? { pulse: song.pulse } : {}), melody, lyrics, chords, ...(changes.length ? { tempos: changes.join(' ') } : {}) };
   piece.id = songId(piece);
   return piece;
 }
