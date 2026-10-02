@@ -4,7 +4,8 @@
 //   progress: best = max, runs = max, last (and when) from the newer side
 //   days:     union, the newest 120
 //   warm, songPass: the newer day
-//   range, settings: from the side changed more recently (stamps.range, stamps.settings)
+//   range, settings: from the side changed more recently (stamps.range, stamps.settings);
+//             but each song's chosen speed (settings.speeds) is kept from both sides
 //   nudge:    the newer day for each kind
 // "Reset progress" stamps stamps.reset; a side that hasn't seen that reset only keeps what it
 // sang after it, so a reset on one device isn't undone by another.
@@ -29,9 +30,22 @@ function cleanRange(r) {
   return { low: r.low, high: r.high };
 }
 
+const SPEED_KEYS = ['slow', 'steady', 'normal'];
+export const SPEEDS_KEPT = 300;
+
+// speeds: the speed last chosen for each song, { songId: 'slow' | 'steady' | 'normal' }.
+function cleanSpeeds(v) {
+  const out = {};
+  if (!isObj(v)) return out;
+  const ok = Object.entries(v).filter(([k, x]) => k.length > 0 && k.length <= 100 && SPEED_KEYS.includes(x));
+  for (const [k, x] of ok.slice(-SPEEDS_KEPT)) out[k] = x;
+  return out;
+}
+
 function cleanSettings(s) {
-  const out = { headphones: false, names: 'letters', strict: 'standard', warmupLock: true };
+  const out = { headphones: false, names: 'letters', strict: 'standard', warmupLock: true, speeds: {} };
   if (!isObj(s)) return out;
+  out.speeds = cleanSpeeds(s.speeds);
   if (typeof s.headphones === 'boolean') out.headphones = s.headphones;
   if (NAMES.includes(s.names)) out.names = s.names;
   if (STRICT.includes(s.strict)) out.strict = s.strict;
@@ -114,6 +128,16 @@ function newerDay(x, y) {
   return (Number(y.at) || 0) > (Number(x.at) || 0) ? y : x;
 }
 
+// Each song's speed: both sides' choices, the side whose settings changed last winning a clash.
+function mergeSpeeds(older, newer) {
+  const out = { ...older.settings.speeds };
+  for (const [k, v] of Object.entries(newer.settings.speeds)) {
+    delete out[k];
+    out[k] = v;
+  }
+  return cleanSpeeds(out);
+}
+
 // a: this device's copy, b: the family's. Ties go to a. Both are cleaned first.
 export function mergeState(aIn, bIn) {
   const a0 = clean(aIn);
@@ -149,7 +173,7 @@ export function mergeState(aIn, bIn) {
     rangeAt: rangeSide.rangeAt,
     rangePrev: rangeSide.rangePrev,
     rangeFrom: rangeSide.rangeFrom,
-    settings: { ...settingsSide.settings },
+    settings: { ...settingsSide.settings, speeds: mergeSpeeds(settingsSide === a ? b : a, settingsSide) },
     progress,
     days,
     warm: newerDay(a.warm, b.warm),

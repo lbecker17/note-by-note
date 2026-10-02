@@ -342,7 +342,8 @@ const RANGE_SOURCE = {
   low: 'a typical lower-voice range, not tested',
 };
 
-export function reportText({ title, sum, range, rangeFrom, strictKey, date, family = false }) {
+// speed: for songs, how fast it was sung (text), else null.
+export function reportText({ title, sum, range, rangeFrom, strictKey, date, family = false, speed = null }) {
   const tol = STRICTNESS[strictKey];
   const lines = [];
   lines.push('Note by Note practice results');
@@ -353,6 +354,7 @@ export function reportText({ title, sum, range, rangeFrom, strictKey, date, fami
     lines.push(`My comfortable range: ${letterName(range.low)} to ${letterName(range.high)}${src ? ` (${src})` : ''}`);
   }
   lines.push(`Strictness: ${tol.label} (in tune within ${tol.good} cents)`);
+  if (speed) lines.push(`Speed: ${speed}`);
   lines.push(`Score: ${Math.round(sum.score * 100)}% · ${sum.landed} of ${sum.total} notes landed`);
   if (sum.avgAbs != null) lines.push(`Average distance from the note: ${Math.round(sum.avgAbs)} cents · overall lean: ${Math.abs(Math.round(sum.tendency))} cents ${sum.tendency < 0 ? 'flat' : 'sharp'}`);
   lines.push(`The mic heard me for ${Math.round(sum.coverage * 100)}% of the singing time`);

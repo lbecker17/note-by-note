@@ -7,7 +7,7 @@
 // the phone. They may have chords: null (no piano chords, unless a harmonizer is set
 // with setHarmonizer) and lyrics: null (sung on "la").
 
-import { parseMelody, parseLyrics, parseChords, chordTones, parsePitch, fitShift } from './music.js';
+import { parseMelody, parseLyrics, parseChords, chordTones, parsePitch, fitShift, paraStarts } from './music.js';
 import { Builder } from './lessons.js';
 
 export const SONGS = [
@@ -201,9 +201,149 @@ export function songData(song) {
       }
     }
   });
-  const data = { mel, chords, lo, hi, span: hi - lo, tonic: parsePitch(song.key + '4') };
+  const data = { mel, lyr, chords, lo, hi, span: hi - lo, tonic: parsePitch(song.key + '4') };
   cache.set(song.id, data);
   return data;
+}
+
+// ---------- Learning chunks (line by line) ----------
+// A song's lines can be short (karaoke files often break every few words), and stopping there
+// cuts a sentence in half. Line by line groups whole lines into chunks that end where a singer
+// would naturally pause: the end of a sentence or clause (. ! ? , ;), a rest or a held note of
+// about a beat or more, or a new verse. Chunks aim for about 4 to 10 seconds and 6 to 16
+// syllables; a chunk never ends inside a word or on a pickup note leading into the next line,
+// and a line that is long on its own stays as it is. The built-in songs' lines are already
+// chunk-sized, so they come out unchanged.
+export const CHUNK = { minSecs: 4, maxSecs: 10, minSyl: 6, maxSyl: 16 };
+
+const END_STOP = /[.!?]["'’”»)\]]*$/;
+const END_PAUSE = /[,;]["'’”»)\]]*$/;
+const END_COLON = /[:—–]["'’”»)\]]*$/;
+
+// For each line of the song: where it starts and ends (beats), its syllables, and how good a
+// place its end is to stop: { natural, bonus, never }.
+function lineEnds(song, data) {
+  const { mel, lyr } = data;
+  const beat = song.pulse || 1;
+  const paras = paraStarts(song.lyrics, mel.phrases);
+  const P = mel.phrases.length;
+  // The last syllable sung in a line (skipping "~" holds), and its lyric token.
+  const lastSyl = ([s, e]) => {
+    let k = e - 1;
+    while (k > s && mel.notes[k].hold) k--;
+    return k;
+  };
+  const tokAt = (k) => (song.lyrics ? String(lyr[k] || '') : '');
+  // Words that mark their sentences: there, a line ending with no punctuation is more likely
+  // mid-sentence, so a rest or held note alone is a weaker place to stop (but still a natural one).
+  const marked = mel.phrases.filter((ph) => END_STOP.test(tokAt(lastSyl(ph))) || END_PAUSE.test(tokAt(lastSyl(ph)))).length;
+  const punctuated = marked >= Math.max(2, 0.3 * P);
+  return mel.phrases.map(([s, e], p) => {
+    const notes = mel.notes.slice(s, e);
+    const last = notes[notes.length - 1];
+    const a = notes[0].beat;
+    const z = last.beat + last.beats;
+    const syl = notes.filter((n) => !n.hold).length;
+    const info = { a, z, syl, natural: true, bonus: 0, never: false };
+    if (p === P - 1) return info;
+    // The last syllable sung, and how long it lasts (with any "~" holds).
+    const k = lastSyl([s, e]);
+    const tok = tokAt(k);
+    const held = z - mel.notes[k].beat;
+    const gap = mel.notes[e].beat - z;
+    const nextHold = mel.notes[e].hold;
+    // A word that carries on into the next line ("sun- / shine", or a "~" hold over the break).
+    if (/[-=]$/.test(tok) || nextHold) {
+      info.never = true;
+      info.natural = false;
+      return info;
+    }
+    let bonus = 0;
+    let natural = false;
+    const add = (b, nat = false) => {
+      bonus += b;
+      if (nat) natural = true;
+    };
+    const stop = END_STOP.test(tok) || END_PAUSE.test(tok);
+    if (END_STOP.test(tok)) add(4, true);
+    else if (END_PAUSE.test(tok)) add(3, true);
+    else if (END_COLON.test(tok)) add(2);
+    const w = punctuated && !stop ? 0.5 : 1;
+    if (gap >= 2 * beat - 1e-6) add(5 * w, true);
+    else if (gap >= 0.9 * beat) add(4 * w, true);
+    else if (gap >= 0.45 * beat) add(1.5 * w);
+    if (held >= 1.5 * beat - 1e-6) add(3 * w, true);
+    else if (held >= beat - 1e-6) add(1 * w);
+    if (paras.has(p + 1)) add(6, true);
+    // A short note running straight into the next line, with nothing to say it ends: a pickup.
+    const pickup = !natural && last.beats < 0.75 * beat && gap < 0.45 * beat;
+    info.natural = natural;
+    info.bonus = natural ? bonus - (w < 1 ? 1.5 : 0) : bonus - (pickup ? 12 : 4);
+    return info;
+  });
+}
+
+// lines: from lineEnds. spb: seconds per beat. Returns [[firstLine, lastLine], ...] (inclusive),
+// chosen to cost least: every chunk costs a little, too short or too long costs more, and each
+// place a chunk ends earns its bonus (or pays for a poor place to stop).
+export function chunkLines(lines, spb) {
+  const n = lines.length;
+  const C = CHUNK;
+  const cost = (i, j) => {
+    const secs = (lines[j].z - lines[i].a) * spb;
+    let syl = 0;
+    for (let k = i; k <= j; k++) syl += lines[k].syl;
+    let c = 1;
+    if (secs < C.minSecs) c += (C.minSecs - secs) * 2.5;
+    if (secs < 1.5) c += 8;
+    if (syl < C.minSyl) c += (C.minSyl - syl) * 0.6;
+    if (j > i) {
+      // Only lines put together can be too long: a long line on its own stays as it is.
+      if (secs > C.maxSecs) c += (secs - C.maxSecs) * 1.5;
+      if (syl > C.maxSyl) c += (syl - C.maxSyl) * 0.25;
+      if (secs > 2 * C.maxSecs) c += 40;
+    }
+    return c;
+  };
+  const best = new Float64Array(n + 1).fill(Infinity);
+  const from = new Int32Array(n + 1).fill(-1);
+  best[0] = 0;
+  for (let j = 1; j <= n; j++) {
+    // A chunk can end after line j-1 unless the word carries on (the last line always can).
+    if (j < n && lines[j - 1].never) continue;
+    const endBonus = j < n ? lines[j - 1].bonus : 0;
+    for (let i = j - 1; i >= 0 && j - i <= 24; i--) {
+      if (best[i] === Infinity) continue;
+      const v = best[i] + cost(i, j - 1) - endBonus;
+      if (v < best[j]) {
+        best[j] = v;
+        from[j] = i;
+      }
+    }
+  }
+  if (best[n] === Infinity) return [[0, n - 1]];
+  const out = [];
+  for (let j = n; j > 0; j = from[j]) out.push([from[j], j - 1]);
+  return out.reverse();
+}
+
+// The song's learning chunks as note ranges [[start, end), ...] (like mel.phrases).
+export function learnChunks(song) {
+  const data = songData(song);
+  if (data.chunks) return data.chunks;
+  const { mel } = data;
+  const lines = lineEnds(song, data);
+  data.chunks = chunkLines(lines, 60 / song.bpm).map(([i, j]) => [mel.phrases[i][0], mel.phrases[j][1]]);
+  return data.chunks;
+}
+
+// ---------- Speed ----------
+// The child picks how fast to sing a song: Slow, Steady or Normal (the song's own tempo).
+export const SPEEDS = { slow: 0.75, steady: 0.9, normal: 1 };
+export const SPEED_LABEL = { slow: 'Slow', steady: 'Steady', normal: 'Normal' };
+// Quick songs start at Steady. The pulse counts: "Row, Row" at 192 eighths is 64 dotted beats.
+export function defaultSpeed(song) {
+  return song.bpm / (song.pulse || 1) > 110 ? 'steady' : 'normal';
 }
 
 export function difficulty(song) {
@@ -258,12 +398,14 @@ export function backingVoicing(ch, avoid, low) {
   return { bass, chord };
 }
 
-export function buildSong(song, range, { mode = 'learn', headphones = false } = {}) {
+// speed: a share of the song's tempo (SPEEDS); everything (notes, backing, count-in, the lane and
+// the scoring) follows it, since they all work from the same times.
+export function buildSong(song, range, { mode = 'learn', headphones = false, speed = 1 } = {}) {
   const data = songData(song);
   const { mel, chords } = data;
   const shift = fitShift(range, data.lo, data.hi);
   const low = data.lo + shift;
-  const b = new Builder(song.bpm);
+  const b = new Builder(song.bpm * speed);
   const spb = b.spb;
   const phraseCount = mel.phrases.length;
   const pulse = song.pulse || 1;
@@ -311,29 +453,44 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
     }
   };
 
-  const placeNotes = (notes, role, startT, fromBeat) => {
+  // part: the line (or learning chunk) a note belongs to, for the words on screen and the
+  // progress strip. Syllables are numbered within it.
+  const placeNotes = (notes, role, startT, fromBeat, partOf) => {
+    let part = -1;
+    let si = -1;
     for (const n of notes) {
+      const p = partOf(n);
+      if (p !== part) {
+        part = p;
+        si = -1;
+      }
+      if (!n.hold || si < 0) si++;
       const t = startT + (n.beat - fromBeat) * spb;
       const d = n.beats * spb;
-      b.events.push({ t, d, m: n.m + shift, role, phrase: n.phrase, si: n.si, text: n.text, join: n.join, melisma: !!n.hold });
+      b.events.push({ t, d, m: n.m + shift, role, phrase: p, si, text: n.text, join: n.join, melisma: !!n.hold });
       b.audio.push({ t, d, kind: 'guide', m: n.m + shift, hp: role === 'sing', level: role === 'sing' ? 0.16 : 0.22 });
     }
   };
+  const byLine = (n) => n.phrase;
 
+  // One count-in, at the very start.
   const countIn = (beats) => {
     for (let i = 0; i < beats; i += pulse) b.audio.push({ t: b.t + i * spb, kind: 'click', accent: i === 0 });
     b.t += beats * spb;
   };
 
+  let parts = phraseCount;
   if (mode === 'learn') {
-    mel.phrases.forEach(([s, e], p) => {
+    const chunks = learnChunks(song);
+    parts = chunks.length;
+    chunks.forEach(([s, e], p) => {
       const notes = mel.notes.slice(s, e);
       const from = notes[0].beat;
       const last = notes[notes.length - 1];
       const to = last.beat + last.beats;
-      b.cue(`Line ${p + 1} of ${phraseCount}`);
+      b.cue(`Line ${p + 1} of ${parts}`);
       const listenAt = b.t;
-      placeNotes(notes, 'listen', listenAt, from);
+      placeNotes(notes, 'listen', listenAt, from, () => p);
       chordAudio(from, to, listenAt, false, 0.05);
       b.t += (to - from) * spb;
       // A breath, with ticks that set up the beat for your turn.
@@ -341,36 +498,41 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
       for (let i = 0; i < gap; i += pulse) b.audio.push({ t: b.t + i * spb, kind: 'click', accent: i === 0 });
       b.t += gap * spb;
       const singAt = b.t;
-      placeNotes(notes, 'sing', singAt, from);
+      placeNotes(notes, 'sing', singAt, from, () => p);
       chordAudio(from, to, singAt, true, 0.05);
       b.t += (to - from) * spb + 1.5 * spb;
     });
-  } else if (headphones) {
+  } else {
+    // Sing it through: the whole song in its own time, after one count-in.
     countIn(song.meter);
     const start = b.t;
-    placeNotes(mel.notes, 'sing', start, 0);
-    // hp: if headphones are switched off mid-run these stop too (they can hold the sung note).
-    chordAudio(0, mel.totalBeats, start, true, 0.07);
+    placeNotes(mel.notes, 'sing', start, 0, byLine);
     mel.phrases.forEach(([s], p) => b.cues.push({ t: start + mel.notes[s].beat * spb - 0.01, text: `Line ${p + 1} of ${phraseCount}` }));
+    if (headphones) {
+      // hp: if headphones are switched off mid-run these stop too (they can hold the sung note).
+      chordAudio(0, mel.totalBeats, start, true, 0.07);
+    } else {
+      backing(0, mel.totalBeats, start);
+      lineCues(start);
+    }
     b.t = start + mel.totalBeats * spb + 1;
-  } else {
-    // Each line starts after a bar's rest: its first note plays just after the downbeat (not on top
-    // of the last note of the line before) so the child can find it, then ticks count them in.
-    // The note ends well before they sing.
-    const cueLen = Math.min(0.9, Math.max(0.5, pulse * spb));
-    mel.phrases.forEach(([s, e], p) => {
-      const from = mel.notes[s].beat;
-      const to = e < mel.notes.length ? mel.notes[e].beat : mel.totalBeats;
-      b.cue(`Line ${p + 1} of ${phraseCount}`);
-      b.audio.push({ t: b.t + 0.25, d: cueLen, kind: 'guide', m: mel.notes[s].m + shift, level: 0.2, nohp: true, cue: true });
-      for (let i = 0; i < song.meter; i += pulse) b.audio.push({ t: b.t + i * spb, kind: 'click', accent: i === 0 });
-      b.t += song.meter * spb;
-      const at = b.t;
-      placeNotes(mel.notes.slice(s, e), 'sing', at, from);
-      backing(from, to, at);
-      b.t += (to - from) * spb;
-    });
-    b.t += 1;
+  }
+
+  // Without headphones, a line that starts after a real rest (a beat or more, and long enough in
+  // seconds) gets its first note played very softly in that rest, to help find it: no ticks, and
+  // it ends well before the line (and after the last line's note has died away).
+  function lineCues(start) {
+    for (let p = 1; p < phraseCount; p++) {
+      const s = mel.phrases[p][0];
+      const prev = mel.notes[s - 1];
+      const restBeats = mel.notes[s].beat - (prev.beat + prev.beats);
+      if (restBeats < pulse - 1e-6) continue;
+      const t0 = start + (prev.beat + prev.beats) * spb + 0.2;
+      const t1 = start + mel.notes[s].beat * spb - 0.45;
+      const d = Math.min(0.5, t1 - t0);
+      if (d < 0.25) continue;
+      b.audio.push({ t: t0, d, kind: 'guide', m: mel.notes[s].m + shift, level: 0.08, nohp: true, cue: true });
+    }
   }
 
   const step = b.build({
@@ -379,13 +541,14 @@ export function buildSong(song, range, { mode = 'learn', headphones = false } = 
     vowel: null,
     song: true,
     mode,
-    phrases: phraseCount,
+    speed,
+    phrases: parts,
     intro:
       mode === 'learn'
-        ? 'Line by line: hear each line, then sing it back.'
+        ? 'Line by line: hear each part, then sing it back.'
         : headphones
           ? 'Sing the whole song with the piano and the guide melody.'
-          : 'Sing the whole song with a soft piano. You’ll hear each line’s first note just before you sing it.',
+          : 'Sing the whole song with a soft piano.',
   });
   return [step];
 }

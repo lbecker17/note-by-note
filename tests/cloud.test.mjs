@@ -65,6 +65,19 @@ test('merge: range and settings come from whichever side changed them last', () 
   assert.deepEqual(mergeState({ range: null }, { range: { low: 50, high: 70 } }).range, { low: 50, high: 70 });
 });
 
+test('settings: each song\'s speed is cleaned, synced and merged', () => {
+  const c = clean({ settings: { speeds: { mary: 'slow', twinkle: 'fast', ['x'.repeat(101)]: 'slow', 'fam-1': 'steady', bad: 3 } } });
+  assert.deepEqual(c.settings.speeds, { mary: 'slow', 'fam-1': 'steady' });
+  assert.deepEqual(clean({ settings: { speeds: [] } }).settings.speeds, {});
+  const a = { settings: { strict: 'relaxed', speeds: { mary: 'slow', row: 'normal' } }, stamps: { settings: 900 } };
+  const b = { settings: { strict: 'strict', speeds: { mary: 'normal', ode: 'steady' } }, stamps: { settings: 200 } };
+  const m = mergeState(a, b);
+  assert.equal(m.settings.strict, 'relaxed');
+  assert.deepEqual(m.settings.speeds, { ode: 'steady', mary: 'slow', row: 'normal' });
+  assert.deepEqual(mergeState(b, a).settings.speeds, m.settings.speeds);
+  assert.ok(sameState(m, clean(m)));
+});
+
 test('merge: a reset on one device is not undone by the other', () => {
   const resetAt = Date.parse('2026-10-02T09:00:00');
   const a = { progress: {}, days: [], stamps: { reset: resetAt } };
@@ -89,7 +102,7 @@ test('merge: damaged data from the server is cleaned, not trusted', () => {
   };
   const c = clean(bad);
   assert.equal(c.range, null);
-  assert.deepEqual(c.settings, { headphones: false, names: 'letters', strict: 'strict', warmupLock: true });
+  assert.deepEqual(c.settings, { headphones: false, names: 'letters', strict: 'strict', warmupLock: true, speeds: {} });
   assert.deepEqual(c.progress, { c: { best: 0.5, runs: 0 } });
   assert.deepEqual(c.days, ['2026-10-01']);
   assert.equal(c.warm, null);

@@ -26,7 +26,7 @@ import { looksLikeZip, ZipError } from './unzip.js';
 import { decodeXmlBytes, XmlError } from './xml.js';
 import { toBytes, cleanText, cutText, UNSAFE_CHARS_G } from './text.js';
 import { songId, validateSong, readFamilySongFile, makeSource, FAMILY_CREDIT, SONG_LIMITS } from './nbn.js';
-import { parseMelody, parseLyrics } from './music.js';
+import { parseMelody, parseLyrics, paraStarts } from './music.js';
 
 export class ImportError extends Error {}
 
@@ -1008,6 +1008,9 @@ function emitLyrics(notes, starts) {
   starts.forEach((s, li) => {
     const e = li + 1 < starts.length ? starts[li + 1] : notes.length;
     const toks = [];
+    // A blank line before a new verse or section (a karaoke "\" paragraph), so the song
+    // player can tell where one ends (js/songs.js learnChunks).
+    if (li > 0 && (notes[s].para || notes[s].sect)) lines.push('');
     for (let i = s; i < e; i++) {
       const n = notes[i];
       if (n.hold || !n.syl) {
@@ -1156,8 +1159,9 @@ function wordsOf(tokens, max = 6) {
 
 // Line ranges a grown-up can choose from when a song is long. paras: line indexes that
 // start a verse or section in the file; bars: [first, last] bar label of each line.
-export function songSections(song, { paras = new Set(), bars = null } = {}) {
+export function songSections(song, { paras = null, bars = null } = {}) {
   const mel = parseMelody(song.melody);
+  if (!paras) paras = paraStarts(song.lyrics, mel.phrases);
   const lyr = song.lyrics ? parseLyrics(song.lyrics) : null;
   const spb = 60 / song.bpm;
   const lines = mel.phrases.map(([s, e]) => {
@@ -1255,9 +1259,10 @@ export function sliceSong(song, from, to, opts = {}) {
   let lyrics = null;
   if (song.lyrics) {
     const toks = parseLyrics(song.lyrics);
+    const paras = paraStarts(song.lyrics, mel.phrases);
     lyrics = mel.phrases
       .slice(from, to + 1)
-      .map(([a, z]) => toks.slice(a, z).join(' '))
+      .map(([a, z], k) => (k > 0 && paras.has(from + k) ? '\n' : '') + toks.slice(a, z).join(' '))
       .join('\n');
   }
 

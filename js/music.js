@@ -83,6 +83,25 @@ export function parseLyrics(src) {
   return src.trim().split(/\s+/);
 }
 
+// A blank line in the words starts a new verse or section (imported songs mark karaoke
+// paragraphs and sheet-music sections this way). Returns the indexes of the phrases
+// (mel.phrases) that start one, not counting the first.
+export function paraStarts(src, phrases) {
+  const out = new Set();
+  if (!src) return out;
+  const blocks = src.trim().split(/\r?\n[ \t\r]*\n/);
+  if (blocks.length < 2) return out;
+  const at = new Map(phrases.map(([s], p) => [s, p]));
+  let count = 0;
+  for (let k = 0; k < blocks.length - 1; k++) {
+    if (!blocks[k].trim()) continue;
+    count += parseLyrics(blocks[k]).length;
+    const p = at.get(count);
+    if (p > 0) out.add(p);
+  }
+  return out;
+}
+
 // Chords: "C/4 G/2 Am/2". Returns [{root, quality, beat, beats}]
 export function parseChords(src) {
   const out = [];
