@@ -112,8 +112,9 @@ export function createCloud({ url = SUPABASE_URL, key = SUPABASE_KEY, fetchFn, s
     const d = r.data || {};
     const what = String(d.error_code || d.code || d.error || '') + ' ' + String(d.msg || d.message || d.error_description || '');
     if (r.status === 429 || /rate.?limit/i.test(what)) return new CloudError('Too many tries. Wait a minute, then try again.', 'busy', r.status, d);
-    // The project only lets the family's own emails sign up.
-    if (/not allowed to sign ?up/i.test(what)) return new CloudError('That email isn’t on this family’s list. Ask the grown-up who set this up.', 'notallowed', r.status, d);
+    // The project only lets the family's own emails sign up. The database refuses the others,
+    // which the auth server reports as "Database error saving new user".
+    if (/not allowed to sign ?up/i.test(what) || (kind === 'signup' && /database error saving new user/i.test(what))) return new CloudError('That email isn’t on this family’s list. Ask the grown-up who set this up.', 'notallowed', r.status, d);
     if (r.status >= 500) return new CloudError('The family account isn’t answering. Try again in a minute.', 'server', r.status, d);
     if (/already.?(registered|exists)/i.test(what)) return new CloudError('There’s already a family account with this email. Sign in instead.', 'exists', r.status, d);
     if (/weak.?password|password should/i.test(what)) return new CloudError('Choose a longer password: at least 8 characters.', 'weak', r.status, d);
